@@ -1,0 +1,26 @@
+"""Ports that isolate the core from external products."""
+
+from collections.abc import Mapping, Sequence
+from typing import Protocol
+
+from workspace_orchestrator.models import Task, Workspace
+
+
+class TaskProvider(Protocol):
+    def list_tasks(self, requirement_id: str) -> Sequence[Task]: ...
+    def sync_workspace(self, workspace: Workspace) -> None: ...
+
+
+class AgentProvider(Protocol):
+    def current_session_id(self) -> str | None: ...
+    def build_context(self, workspace: Workspace) -> str: ...
+
+
+class GitProvider(Protocol):
+    def status(self) -> Mapping[str, object]: ...
+    def recent_commits(self, limit: int = 5) -> Sequence[str]: ...
+
+
+class KnowledgeProvider(Protocol):
+    def search(self, query: str) -> Sequence[str]: ...
+    def preserve(self, title: str, body: str, sources: Sequence[str]) -> str: ...

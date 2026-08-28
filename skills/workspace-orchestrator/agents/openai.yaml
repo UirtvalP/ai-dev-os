@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workspace Orchestrator"
+  short_description: "Resume and advance persistent requirement workspaces"
+  default_prompt: "Use $workspace-orchestrator to resume this requirement and choose the lightest safe workflow."
