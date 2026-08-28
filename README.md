@@ -48,7 +48,28 @@ pytest
 workspace --help
 ```
 
-当前仓库处于骨架阶段：领域模型、Provider 协议、模板和 Skill 已建立，CLI 生命周期实现列在 Roadmap 中。
+构建可安装 wheel：
+
+```bash
+python -m pip wheel . --no-deps --wheel-dir dist
+```
+
+当前仓库已经跑通 V1 的本地核心生命周期：
+
+```bash
+workspace new "Implement authentication" --acceptance "Valid users can log in"
+workspace current
+workspace status REQ-001
+workspace checkpoint REQ-001 --phase implementation --completed "Login endpoint" --next-action "Implement middleware"
+workspace handoff REQ-001 --current-state "Login works" --next-action "Implement middleware"
+workspace resume REQ-001
+workspace review REQ-001
+```
+
+`resume` 生成精简 Context Snapshot，并在存在 `CODEX_THREAD_ID` 时记录可替换 Session。
+Git 状态通过 Local Git Adapter 读取；dashi-taskboard 通过可选的 JSON `taskctl` Adapter 接入，
+用 `requirement:REQ-*` 标签保持 Requirement 与 Issue 的明确关联，并使用乐观 version 更新状态。
+未安装时不影响本地 Workspace。Review 只允许进入 `in_review`，不会自动标记 `done`。
 
 ## 设计原则
 

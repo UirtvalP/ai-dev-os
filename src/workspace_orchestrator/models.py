@@ -31,8 +31,19 @@ class Requirement:
 class Task:
     id: str
     title: str
+    raw_id: str | None = None
+    project_id: str | None = None
+    description: str = ""
     status: str = "todo"
+    priority: str | None = None
+    parent_id: str | None = None
     blocked_by: tuple[str, ...] = ()
+    blocks: tuple[str, ...] = ()
+    branch: str | None = None
+    worktree: str | None = None
+    session_ids: tuple[str, ...] = ()
+    labels: tuple[str, ...] = ()
+    version: int | None = None
 
 
 @dataclass(slots=True)
@@ -42,3 +53,15 @@ class Workspace:
     complexity: WorkflowComplexity = WorkflowComplexity.NORMAL
     tasks: list[Task] = field(default_factory=list)
     session_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """A replaceable agent session recorded without conversation history."""
+
+    id: str
+    agent: str
+    started_at: str
+    ended_at: str | None = None
+    task_ids: tuple[str, ...] = ()
+    result: str = "in_progress"
