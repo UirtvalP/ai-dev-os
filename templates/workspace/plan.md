@@ -1,3 +1,3 @@
-# Plan
+# 计划
 
-- [ ] Define the next concrete step
+- [ ] 定义下一项具体步骤

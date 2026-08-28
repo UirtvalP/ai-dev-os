@@ -1,13 +1,13 @@
-# Verification
+# 验证
 
-## Unit Tests
+## 单元测试
 
-Status: TODO
+状态：TODO
 
-## Type Check
+## 类型检查
 
-Status: TODO
+状态：TODO
 
-## Integration Tests
+## 集成测试
 
-Status: TODO
+状态：TODO

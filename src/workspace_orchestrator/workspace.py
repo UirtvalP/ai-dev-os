@@ -1,4 +1,4 @@
-"""Local-first persistence for human-readable requirement workspaces."""
+"""面向人类可读需求工作区的本地优先持久化。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from .models import RequirementStatus, WorkflowComplexity
 
 WORKSPACE_FILES = (
     "requirement.md",
+    "intent.md",
     "state.md",
     "plan.md",
     "decisions.md",
@@ -20,9 +21,42 @@ WORKSPACE_FILES = (
     "handoff.md",
 )
 
+SECTION_ALIASES = {
+    "目标": "Goal",
+    "目的": "Purpose",
+    "背景": "Background",
+    "范围": "Scope",
+    "非目标": "Non-goals",
+    "验收标准": "Acceptance Criteria",
+    "原因": "Why",
+    "期望结果": "Desired Outcome",
+    "不得演变成": "Must Not Become",
+    "设计方向": "Design Direction",
+    "约束": "Constraints",
+    "取舍优先级": "Trade-off Priorities",
+    "意图审查": "Intent Review",
+    "阶段": "Phase",
+    "已完成": "Completed",
+    "进行中": "In Progress",
+    "待处理": "Pending",
+    "已阻塞": "Blocked",
+    "下一步行动": "Next Action",
+    "单元测试": "Unit Tests",
+    "类型检查": "Type Check",
+    "集成测试": "Integration Tests",
+    "最新检查": "Latest Check",
+    "上次会话": "Last Session",
+    "已修改文件": "Files Changed",
+    "当前状态": "Current State",
+    "重要上下文": "Important Context",
+    "建议的下一步行动": "Next Recommended Action",
+    "已知问题": "Known Problems",
+}
+SECTION_LABELS = {canonical: chinese for chinese, canonical in SECTION_ALIASES.items()}
+
 
 class WorkspaceError(RuntimeError):
-    """Raised when persisted workspace state is missing or invalid."""
+    """持久化工作区状态缺失或无效时抛出。"""
 
 
 def now_iso() -> str:
@@ -30,25 +64,34 @@ def now_iso() -> str:
 
 
 def markdown_sections(text: str) -> dict[str, str]:
-    """Return level-two Markdown sections without imposing a schema."""
+    """返回二级 Markdown 章节，并兼容中英文标题。"""
 
     matches = list(re.finditer(r"(?m)^## ([^\r\n]+)\s*$", text))
     sections: dict[str, str] = {}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        sections[match.group(1).strip()] = text[match.end() : end].strip()
+        heading = match.group(1).strip()
+        body = text[match.end() : end].strip()
+        sections[SECTION_ALIASES.get(heading, heading)] = body
     return sections
 
 
 def replace_section(text: str, heading: str, body: str) -> str:
-    """Replace or append one level-two Markdown section."""
+    """替换或追加一个二级 Markdown 章节，同时保留原有标题语言。"""
 
+    labels = (heading, SECTION_LABELS.get(heading, heading))
+    alternatives = "|".join(re.escape(label) for label in dict.fromkeys(labels))
     pattern = re.compile(
-        rf"(?ms)^## {re.escape(heading)}\s*$.*?(?=^## |\Z)",
+        rf"(?ms)^## (?P<label>{alternatives})\s*$.*?(?=^## |\Z)",
     )
-    replacement = f"## {heading}\n\n{body.strip()}\n\n"
+    display_heading = SECTION_LABELS.get(heading, heading)
     if pattern.search(text):
-        return pattern.sub(replacement, text, count=1).rstrip() + "\n"
+        return pattern.sub(
+            lambda match: f"## {match.group('label')}\n\n{body.strip()}\n\n",
+            text,
+            count=1,
+        ).rstrip() + "\n"
+    replacement = f"## {display_heading}\n\n{body.strip()}\n\n"
     return text.rstrip() + "\n\n" + replacement
 
 
@@ -60,9 +103,32 @@ def bullets(value: str) -> list[str]:
     ]
 
 
+def initial_intent(title: str, goal: str | None = None, *, migrated: bool = False) -> str:
+    why = (
+        "迁移到意图层之前没有记录意图；请在审查前补充说明。"
+        if migrated
+        else "说明此需求为何重要。"
+    )
+    return (
+        "# 需求意图\n\n"
+        f"## 原因\n\n{why}\n\n"
+        f"## 期望结果\n\n{goal or title}\n\n"
+        "## 设计方向\n\n使用满足需求的最简单安全方案。\n\n"
+        "## 约束\n\n保留项目意图和用户意图。\n\n"
+        "## 非目标\n\n不得扩展到需求范围之外。\n\n"
+        "## 取舍优先级\n\n实用价值优先，其次是简单性，最后是可扩展性。\n\n"
+        "## 意图审查\n\n"
+        "- 用户原则：PARTIAL\n"
+        "- 项目意图：PARTIAL\n"
+        "- 需求意图：PARTIAL\n"
+        "- 不必要的复杂度：PARTIAL\n\n"
+        "证据：\n\n尚未审查。\n"
+    )
+
+
 @dataclass(slots=True)
 class WorkspaceStore:
-    """Filesystem repository for `.workspace/REQ-*` directories."""
+    """管理 `.workspace/REQ-*` 目录的文件系统仓库。"""
 
     project_root: Path
 
@@ -73,7 +139,7 @@ class WorkspaceStore:
     def path_for(self, requirement_id: str) -> Path:
         normalized = requirement_id.upper()
         if not re.fullmatch(r"REQ-\d{3,}", normalized):
-            raise WorkspaceError(f"Invalid requirement ID: {requirement_id}")
+            raise WorkspaceError(f"无效的需求 ID：{requirement_id}")
         return self.root / normalized
 
     def next_id(self) -> str:
@@ -86,7 +152,7 @@ class WorkspaceStore:
         return f"REQ-{max(existing, default=0) + 1:03d}"
 
     def current_id(self) -> str:
-        """Resolve the only active Requirement without silently guessing."""
+        """解析唯一的活动需求，不进行静默猜测。"""
 
         active: list[str] = []
         if self.root.exists():
@@ -97,10 +163,10 @@ class WorkspaceStore:
                 if meta_path.is_file() and self.read_json(meta_path).get("status") != "done":
                     active.append(path.name)
         if not active:
-            raise WorkspaceError("No active Requirement Workspace found")
+            raise WorkspaceError("未找到活动的需求工作区")
         if len(active) > 1:
             raise WorkspaceError(
-                "Multiple active Requirement Workspaces found; specify one: " + ", ".join(active)
+                "找到多个活动的需求工作区，请指定其中一个：" + ", ".join(active)
             )
         return active[0]
 
@@ -132,34 +198,35 @@ class WorkspaceStore:
             "git": {"branch": None, "worktree": None},
         }
         self.write_json(path / "meta.json", meta)
-        criteria = acceptance or ["Define acceptance criteria"]
+        criteria = acceptance or ["定义验收标准"]
         checked = "\n".join(f"- [ ] {item}" for item in criteria)
         self.write_text(
             path / "requirement.md",
-            "# Requirement\n\n"
-            f"## Goal\n\n{goal or title}\n\n"
-            "## Background\n\n\n\n## Scope\n\n\n\n## Non-goals\n\n\n\n"
-            f"## Acceptance Criteria\n\n{checked}\n",
+            "# 需求\n\n"
+            f"## 目标\n\n{goal or title}\n\n"
+            "## 背景\n\n\n\n## 范围\n\n\n\n## 非目标\n\n\n\n"
+            f"## 验收标准\n\n{checked}\n",
         )
+        self.write_text(path / "intent.md", initial_intent(title, goal))
         self.write_text(
             path / "state.md",
-            "# State\n\n## Phase\n\ndraft\n\n## Completed\n\nNone\n\n"
-            "## In Progress\n\nNone\n\n## Pending\n\n- Define scope and plan\n\n"
-            "## Blocked\n\nNone\n\n## Next Action\n\nDefine scope and acceptance criteria.\n",
+            "# 状态\n\n## 阶段\n\ndraft（草稿）\n\n## 已完成\n\n无\n\n"
+            "## 进行中\n\n无\n\n## 待处理\n\n- 定义范围和计划\n\n"
+            "## 已阻塞\n\n无\n\n## 下一步行动\n\n定义范围和验收标准。\n",
         )
-        self.write_text(path / "plan.md", "# Plan\n\n- [ ] Define scope and plan\n")
-        self.write_text(path / "decisions.md", "# Decisions\n\nNo decisions recorded.\n")
+        self.write_text(path / "plan.md", "# 计划\n\n- [ ] 定义范围和计划\n")
+        self.write_text(path / "decisions.md", "# 决策\n\n尚未记录决策。\n")
         self.write_text(
             path / "verification.md",
-            "# Verification\n\n## Unit Tests\n\nStatus: TODO\n\n"
-            "## Type Check\n\nStatus: TODO\n\n## Integration Tests\n\nStatus: TODO\n",
+            "# 验证\n\n## 单元测试\n\n状态：TODO\n\n"
+            "## 类型检查\n\n状态：TODO\n\n## 集成测试\n\n状态：TODO\n",
         )
         self.write_text(
             path / "handoff.md",
-            "# Handoff\n\n## Last Session\n\nNone\n\n## Completed\n\nNone\n\n"
-            "## Files Changed\n\nNone\n\n## Current State\n\nWorkspace created.\n\n"
-            "## Important Context\n\nNone\n\n## Next Recommended Action\n\n"
-            "Define scope and acceptance criteria.\n\n## Known Problems\n\nNone\n",
+            "# 交接\n\n## 上次会话\n\n无\n\n## 已完成\n\n无\n\n"
+            "## 已修改文件\n\n无\n\n## 当前状态\n\n工作区已创建。\n\n"
+            "## 重要上下文\n\n无\n\n## 建议的下一步行动\n\n"
+            "定义范围和验收标准。\n\n## 已知问题\n\n无\n",
         )
         self.write_json(path / "sessions.json", [])
         return requirement_id
@@ -167,10 +234,26 @@ class WorkspaceStore:
     def load(self, requirement_id: str) -> dict[str, Any]:
         path = self.path_for(requirement_id)
         if not path.is_dir():
-            raise WorkspaceError(f"Workspace not found: {requirement_id}")
-        missing = [name for name in ("meta.json", *WORKSPACE_FILES, "sessions.json") if not (path / name).is_file()]
+            raise WorkspaceError(f"未找到工作区：{requirement_id}")
+        legacy_files = tuple(name for name in WORKSPACE_FILES if name != "intent.md")
+        missing = [
+            name
+            for name in ("meta.json", *legacy_files, "sessions.json")
+            if not (path / name).is_file()
+        ]
         if missing:
-            raise WorkspaceError(f"Workspace {requirement_id} is incomplete: {', '.join(missing)}")
+            raise WorkspaceError(f"工作区 {requirement_id} 不完整：{', '.join(missing)}")
+        if not (path / "intent.md").is_file():
+            meta = self.read_json(path / "meta.json")
+            requirement = markdown_sections((path / "requirement.md").read_text(encoding="utf-8"))
+            self.write_text(
+                path / "intent.md",
+                initial_intent(
+                    str(meta.get("title") or requirement_id),
+                    requirement.get("Goal"),
+                    migrated=True,
+                ),
+            )
         return {
             "path": path,
             "meta": self.read_json(path / "meta.json"),
@@ -191,7 +274,7 @@ class WorkspaceStore:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise WorkspaceError(f"Cannot read {path}: {exc}") from exc
+            raise WorkspaceError(f"无法读取 {path}：{exc}") from exc
 
     @staticmethod
     def write_json(path: Path, value: object) -> None:

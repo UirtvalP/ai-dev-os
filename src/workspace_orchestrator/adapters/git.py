@@ -1,4 +1,4 @@
-"""Local Git adapter, isolated from the workspace core."""
+"""与工作区核心隔离的本地 Git 适配器。"""
 
 from __future__ import annotations
 
@@ -25,11 +25,11 @@ class LocalGitProvider:
                 check=False,
             )
         except OSError as exc:
-            raise GitError(f"Git is unavailable: {exc}") from exc
+            raise GitError(f"Git 不可用：{exc}") from exc
         if result.returncode != 0:
-            message = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+            message = result.stderr.strip() or result.stdout.strip() or "未知的 Git 错误"
             raise GitError(message)
-        return result.stdout.strip()
+        return result.stdout.rstrip("\r\n")
 
     def status(self) -> dict[str, object]:
         porcelain = self._run("status", "--porcelain")
@@ -55,3 +55,25 @@ class LocalGitProvider:
 
     def diff(self) -> str:
         return self._run("diff", "--no-ext-diff")
+
+    def changed_files(self) -> tuple[str, ...]:
+        """返回工作树报告的已跟踪与未跟踪路径。"""
+
+        output = self._run("status", "--porcelain=v1", "-z")
+        entries = output.split("\0") if output else []
+        paths: list[str] = []
+        index = 0
+        while index < len(entries):
+            entry = entries[index]
+            if not entry:
+                index += 1
+                continue
+            status = entry[:2]
+            path = entry[3:]
+            if "R" in status or "C" in status:
+                # 使用 -z 时，第一个路径是目标，后一个路径是来源。
+                index += 1
+            if path:
+                paths.append(path.replace("\\", "/"))
+            index += 1
+        return tuple(dict.fromkeys(paths))

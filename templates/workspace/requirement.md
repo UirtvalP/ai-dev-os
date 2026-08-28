@@ -1,13 +1,13 @@
-# Requirement
+# 需求
 
-## Goal
+## 目标
 
-## Background
+## 背景
 
-## Scope
+## 范围
 
-## Non-goals
+## 非目标
 
-## Acceptance Criteria
+## 验收标准
 
 - [ ]

@@ -1,55 +1,50 @@
 ---
 name: workspace-orchestrator
-description: Resume and advance persistent AI development requirement workspaces across replaceable Codex sessions. Use when creating, continuing, checkpointing, handing off, reviewing, or checking status for a named requirement; do not use for one-off work with no persistent workspace.
+description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发需求工作区。创建、继续、设置检查点、交接、审查或查看指定需求状态时使用；没有持久工作区的一次性任务不要使用。
 ---
 
-# Workspace Orchestrator
+# 工作区编排器
 
-Treat the Workspace as the source of truth and the current Thread as disposable.
+将工作区视为事实来源，将当前 Thread（线程）视为可替换对象。
+面向用户的回复和新编写的项目文档默认使用简体中文。代码标识符、CLI 命令、协议字段以及翻译后会降低清晰度或兼容性的既有技术术语保留原文。
 
-## Restore
+## 恢复
 
-1. Extract an exact `REQ-<digits>` identifier from the user's request when one is present. Never
-   derive or rewrite the identifier.
-2. Otherwise run `workspace current`. Continue only when it resolves exactly one active
-   Requirement; ask the user to choose if multiple active Requirements are reported.
-3. Run `workspace resume REQ-ID` before relying on conversation history. Treat its Context
-   Snapshot as the current source for requirement, state, handoff, plan, decisions, verification,
-   Dashi tasks, Git context, and next action.
-4. If no Workspace exists and the user is starting durable work, create one with `workspace new`.
-   Do not create persistent tracking for trivial one-off requests.
+1. 如果用户请求中包含准确的 `REQ-<数字>` 标识符，直接提取它，不得推导或改写。
+2. 否则运行 `workspace current`。只有在它恰好解析出一个活动需求时才继续；如果存在多个活动需求，请用户选择。
+3. 在依赖对话历史之前运行 `workspace resume REQ-ID`。将生成的上下文快照视为需求、状态、交接、计划、决策、验证、相关用户原则、项目意图、需求意图、Dashi 任务、Git 上下文和下一步行动的当前事实来源。
+4. 如果工作区不存在且用户正在开始需要长期维护的工作，使用 `workspace new` 创建。不要为琐碎的一次性请求创建持久化跟踪。
 
-## Execute
+## 执行
 
-- Follow the selected workflow in the Snapshot: tiny for an explicit local change, normal by
-  default, complex for evidenced cross-module or high-risk work, and research for investigation.
-- Prefer direct execution for tiny work. Do not create plans merely for process compliance.
-- Preserve Requirement scope. Record a changed request instead of silently rewriting its history.
-- Execute the next action, verify it, and keep external tools behind their configured Adapters.
+- 遵循快照选择的工作流：明确的局部修改使用 `tiny`（微型），默认使用 `normal`（常规），有证据表明跨模块或高风险时使用 `complex`（复杂），调查类工作使用 `research`（研究）。
+- 微型工作优先直接执行，不要仅为满足流程形式而创建计划。
+- 保持需求范围。请求发生变化时应记录变化，不要静默改写历史。
+- 验收标准是必要条件，但不是充分条件；全过程都必须保持意图一致。
+- 技术上正确但违反用户原则、项目意图或需求意图的结果仍属于失败。
+- 执行下一步行动并验证结果；外部工具必须置于已配置的 Adapter（适配器）之后。
 
-## Persist
+## 持久化
 
-After a meaningful stage, persist the facts that changed:
+完成一个有意义的阶段后，保存发生变化的事实：
 
 ```text
 workspace checkpoint REQ-ID --phase PHASE \
-  --completed "COMPLETED ITEM" \
-  --next-action "NEXT ACTION" \
-  --verification "Status: PASS - COMMAND OR EVIDENCE"
+  --completed "已完成事项" \
+  --next-action "下一步行动" \
+  --verification "状态：PASS - 验证命令或证据"
 ```
 
-When the current Thread can end, generate the replaceable-session boundary:
+当前 Thread 可以结束时，生成可替换会话的交接边界：
 
 ```text
 workspace handoff REQ-ID \
-  --completed "COMPLETED ITEM" \
-  --current-state "CURRENT STATE" \
-  --important-context "IMPORTANT CONTEXT" \
-  --next-action "NEXT ACTION"
+  --completed "已完成事项" \
+  --current-state "当前状态" \
+  --important-context "重要上下文" \
+  --next-action "下一步行动"
 ```
 
-Run `workspace review REQ-ID` only after acceptance criteria, verification, and configured Task
-state are review-ready. Never mark a Requirement or Dashi Issue `done` without explicit user
-approval.
+运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。未经用户明确批准，不得将需求或 Dashi Issue（事项）标记为 `done`。
 
-Core project rules and V1 scope live in `V1架构.md`. The workspace system owns persistent state; this Skill only follows and updates it.
+核心项目规则和 V1 范围记录在 `V1架构.md` 中。持久化状态由工作区系统负责；本 Skill 只负责遵循并更新这些状态。

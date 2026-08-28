@@ -12,4 +12,8 @@ def test_workspace_skill_keeps_restore_and_approval_contract() -> None:
     assert "workspace checkpoint REQ-ID" in skill
     assert "workspace handoff REQ-ID" in skill
     assert "workspace review REQ-ID" in skill
-    assert "Never mark a Requirement or Dashi Issue `done` without explicit user" in skill
+    assert "验收标准是必要条件，但不是充分条件" in skill
+    assert "技术上正确" in skill
+    assert "用户原则、项目意图或需求意图" in skill
+    assert "`PASS`、`PARTIAL` 或 `VIOLATION`" in skill
+    assert "未经用户明确批准" in skill

@@ -1,4 +1,4 @@
-"""Evidence-based workflow selection without a workflow DSL."""
+"""不依赖工作流 DSL、基于证据的工作流选择。"""
 
 from __future__ import annotations
 
@@ -31,20 +31,37 @@ def route_workflow(text: str) -> WorkflowDecision:
     tiny_terms = (
         "typo",
         "copy change",
+        "bug fix",
+        "fix bug",
+        "fix a bug",
+        "fix ",
+        "small fix",
+        "small change",
+        "minor change",
+        "quick fix",
+        "tweak",
         "null check",
         "small config",
         "文案",
         "错别字",
+        "修 bug",
+        "修复 bug",
+        "修复bug",
+        "修复",
+        "小型修改",
+        "小修改",
+        "小改",
+        "小修复",
         "空指针",
         "小配置",
     )
     if any(term in normalized for term in research_terms):
-        return WorkflowDecision(WorkflowComplexity.RESEARCH, "The request explicitly requires investigation.")
+        return WorkflowDecision(WorkflowComplexity.RESEARCH, "请求明确要求开展调查。")
     if any(term in normalized for term in complex_terms):
-        return WorkflowDecision(WorkflowComplexity.COMPLEX, "The request has cross-module or architectural risk.")
+        return WorkflowDecision(WorkflowComplexity.COMPLEX, "请求存在跨模块或架构风险。")
     if any(term in normalized for term in tiny_terms):
-        return WorkflowDecision(WorkflowComplexity.TINY, "The expected change is explicit and local.")
-    return WorkflowDecision(WorkflowComplexity.NORMAL, "Normal is the safe default without stronger evidence.")
+        return WorkflowDecision(WorkflowComplexity.TINY, "预期修改明确且局部。")
+    return WorkflowDecision(WorkflowComplexity.NORMAL, "没有更强证据时，常规工作流是安全的默认选择。")
 
 
 def upgrade_workflow(
@@ -54,7 +71,7 @@ def upgrade_workflow(
     reason: str,
 ) -> None:
     if not reason.strip():
-        raise WorkspaceError("Workflow upgrades require an evidence-based reason")
+        raise WorkspaceError("升级工作流必须提供有证据支持的原因")
     data = store.load(requirement_id)
     current = WorkflowComplexity(data["meta"]["workflow"])
     rank = {
@@ -63,9 +80,9 @@ def upgrade_workflow(
         WorkflowComplexity.COMPLEX: 2,
     }
     if current is WorkflowComplexity.RESEARCH or target is WorkflowComplexity.RESEARCH:
-        raise WorkspaceError("Research workflow must be selected explicitly at requirement creation")
+        raise WorkspaceError("研究工作流必须在创建需求时明确选择")
     if rank[target] <= rank[current]:
-        raise WorkspaceError(f"Workflow can only upgrade: {current.value} -> {target.value}")
+        raise WorkspaceError(f"工作流只能升级：{current.value} -> {target.value}")
     history = list(data["meta"].get("workflow_history", []))
     history.append(
         {"from": current.value, "to": target.value, "reason": reason.strip(), "at": now_iso()}

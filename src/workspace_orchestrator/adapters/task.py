@@ -1,4 +1,4 @@
-"""Optional dashi-taskboard adapter using its documented JSON CLI boundary."""
+"""通过公开 JSON CLI 边界接入的可选 dashi-taskboard 适配器。"""
 
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ def _default_runner(command: Sequence[str]) -> str:
             command, text=True, encoding="utf-8", capture_output=True, check=False
         )
     except OSError as exc:
-        raise TaskProviderError(f"taskctl is unavailable: {exc}") from exc
+        raise TaskProviderError(f"taskctl 不可用：{exc}") from exc
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown taskctl error"
+        message = result.stderr.strip() or result.stdout.strip() or "未知的 taskctl 错误"
         raise TaskProviderError(message)
     return result.stdout
 
@@ -83,7 +83,7 @@ def _default_executable() -> str:
 
 @dataclass(slots=True)
 class DashiTaskProvider:
-    """v1.1 JSON contract; unavailable dashi never corrupts Workspace state."""
+    """v1.1 JSON 契约；dashi 不可用时不得破坏工作区状态。"""
 
     project_id: str = "local"
     runner: CommandRunner = _default_runner
@@ -95,7 +95,7 @@ class DashiTaskProvider:
         try:
             return json.loads(output)
         except json.JSONDecodeError as exc:
-            raise TaskProviderError("taskctl returned invalid JSON") from exc
+            raise TaskProviderError("taskctl 返回了无效 JSON") from exc
 
     @staticmethod
     def _requirement_label(requirement_id: str) -> str:
@@ -120,7 +120,7 @@ class DashiTaskProvider:
             args.extend(("--priority", task.priority))
         if task.worktree:
             if not task.branch:
-                raise TaskProviderError("A worktree task requires its branch")
+                raise TaskProviderError("工作树任务必须指定分支")
             args.extend(("--worktree-path", task.worktree, "--worktree-branch", task.branch))
         elif task.branch:
             args.extend(("--git-branch", task.branch))
@@ -166,7 +166,7 @@ class DashiTaskProvider:
         ]
         binding = (codex_project_id, codex_project_kind, codex_host_id, workspace_path)
         if any(binding) and not all(binding):
-            raise TaskProviderError("A complete Codex task binding requires all four identity fields")
+            raise TaskProviderError("完整的 Codex 任务绑定必须包含全部四个身份字段")
         if all(binding):
             args.extend(
                 (
@@ -188,9 +188,9 @@ class DashiTaskProvider:
         self, task_id: str, branch: str | None = None, worktree: str | None = None
     ) -> None:
         if worktree and not branch:
-            raise TaskProviderError("A worktree binding requires its branch")
+            raise TaskProviderError("工作树绑定必须指定分支")
         if not branch:
-            raise TaskProviderError("Git context requires a branch or worktree")
+            raise TaskProviderError("Git 上下文必须包含分支或工作树")
         current = self.get_task(task_id)
         args = ["issue", "update", task_id]
         if worktree:

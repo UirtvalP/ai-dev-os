@@ -1,15 +1,15 @@
-# Handoff
+# 交接
 
-## Last Session
+## 上次会话
 
-## Completed
+## 已完成
 
-## Files Changed
+## 已修改文件
 
-## Current State
+## 当前状态
 
-## Important Context
+## 重要上下文
 
-## Next Recommended Action
+## 建议的下一步行动
 
-## Known Problems
+## 已知问题

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.context import build_snapshot, checkpoint, handoff
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
@@ -24,6 +25,7 @@ def test_create_initializes_complete_human_readable_workspace(tmp_path: Path) ->
     assert {path.name for path in data["path"].iterdir()} == {
         "meta.json",
         "requirement.md",
+        "intent.md",
         "state.md",
         "plan.md",
         "decisions.md",
@@ -38,8 +40,22 @@ def test_load_rejects_incomplete_workspace(tmp_path: Path) -> None:
     path = store.path_for("REQ-001")
     path.mkdir(parents=True)
 
-    with pytest.raises(WorkspaceError, match="incomplete"):
+    with pytest.raises(WorkspaceError, match="不完整"):
         store.load("REQ-001")
+
+
+def test_load_migrates_legacy_workspace_without_overwriting_files(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Legacy requirement", goal="Preserve old state")
+    intent_path = store.path_for(requirement_id) / "intent.md"
+    intent_path.unlink()
+
+    data = store.load(requirement_id)
+
+    assert intent_path.is_file()
+    assert "Preserve old state" in data["intent"]
+    assert "迁移到意图层之前" in data["intent"]
+    assert "- 需求意图：PARTIAL" in data["intent"]
 
 
 def test_current_id_resolves_only_active_workspace(tmp_path: Path) -> None:
@@ -54,7 +70,7 @@ def test_current_id_refuses_to_guess_between_active_workspaces(tmp_path: Path) -
     store.create("First")
     store.create("Second")
 
-    with pytest.raises(WorkspaceError, match="Multiple active"):
+    with pytest.raises(WorkspaceError, match="多个活动"):
         store.current_id()
 
 
@@ -64,6 +80,7 @@ def test_checkpoint_and_handoff_restore_across_sessions(
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Add authentication", goal="Implement JWT authentication")
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-a")
+    agent_provider = CodexAgentProvider()
 
     checkpoint(
         store,
@@ -72,6 +89,7 @@ def test_checkpoint_and_handoff_restore_across_sessions(
         completed=["Login endpoint"],
         next_action="Implement middleware",
         verification="pytest tests/auth: PASS",
+        agent_provider=agent_provider,
     )
     handoff(
         store,
@@ -81,11 +99,12 @@ def test_checkpoint_and_handoff_restore_across_sessions(
         current_state="Login works; middleware is pending.",
         important_context="Keep auth logic in the auth module.",
         next_action="Implement middleware",
+        agent_provider=agent_provider,
     )
 
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-b")
-    snapshot = build_snapshot(store, requirement_id)
-    checkpoint(store, requirement_id)
+    snapshot = build_snapshot(store, requirement_id, agent_provider=agent_provider)
+    checkpoint(store, requirement_id, agent_provider=agent_provider)
     data = store.load(requirement_id)
 
     assert "REQ-001 Add authentication" in snapshot
@@ -98,19 +117,47 @@ def test_checkpoint_and_handoff_restore_across_sessions(
     assert data["sessions"][0]["result"] == "completed"
 
 
+def test_resume_restores_concise_intent_summaries(tmp_path: Path) -> None:
+    (tmp_path / "USER_PRINCIPLES.md").write_text(
+        "# User Principles\n\n## Execute Small Work\n\n"
+        "Summary: Make local fixes directly.\n\n"
+        "This long explanation must not be copied into the snapshot.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "PROJECT_INTENT.md").write_text(
+        "# Project Intent\n\n## Purpose\n\n"
+        "Summary: Restore intent across sessions.\n\n"
+        "This project-level detail must not be copied into the snapshot.\n",
+        encoding="utf-8",
+    )
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Intent restore", goal="Keep the why")
+    data = store.load(requirement_id)
+    intent = data["intent"].replace("说明此需求为何重要。", "避免交接后重复分析。")
+    store.write_text(data["path"] / "intent.md", intent)
+
+    snapshot = build_snapshot(store, requirement_id)
+
+    assert "用户原则：\n- Execute Small Work：Make local fixes directly." in snapshot
+    assert "项目意图：\n- 目的：Restore intent across sessions." in snapshot
+    assert "需求意图：\n- 原因：避免交接后重复分析。" in snapshot
+    assert "long explanation" not in snapshot
+    assert "project-level detail" not in snapshot
+
+
 def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root_args = ["--root", str(tmp_path)]
     assert main([*root_args, "new", "CLI demo", "--acceptance", "Snapshot is concise"]) == 0
-    assert "Created REQ-001" in capsys.readouterr().out
+    assert "已创建 REQ-001" in capsys.readouterr().out
 
     assert main([*root_args, "checkpoint", "REQ-001", "--phase", "implementation"]) == 0
     assert main([*root_args, "resume", "REQ-001"]) == 0
     output = capsys.readouterr().out
-    assert "# Workspace Context" in output
-    assert "Current Phase:\nimplementation" in output
+    assert "# 工作区上下文" in output
+    assert "当前阶段：\nimplementation" in output
 
     assert main([*root_args, "status", "REQ-001"]) == 0
-    assert "Status: in_progress" in capsys.readouterr().out
+    assert "状态：in_progress" in capsys.readouterr().out
 
     assert main([*root_args, "current"]) == 0
     assert capsys.readouterr().out.strip() == "REQ-001"
@@ -147,3 +194,27 @@ def test_cli_can_configure_dashi_project(
     meta = WorkspaceStore(tmp_path).load("REQ-001")["meta"]
     assert meta["task_provider"] == "dashi"
     assert meta["task_project_id"] == "ai-dev-os"
+
+
+def test_cli_checkpoint_records_explicit_task_for_current_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Explicit task link")
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-cli")
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "checkpoint",
+                requirement_id,
+                "--task",
+                "TASK-007",
+            ]
+        )
+        == 0
+    )
+
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["TASK-007"]

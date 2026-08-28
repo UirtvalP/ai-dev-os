@@ -1,13 +1,13 @@
-# State
+# 状态
 
-## Phase
+## 阶段
 
-## Completed
+## 已完成
 
-## In Progress
+## 进行中
 
-## Pending
+## 待处理
 
-## Blocked
+## 已阻塞
 
-## Next Action
+## 下一步行动

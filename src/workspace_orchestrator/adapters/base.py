@@ -1,9 +1,9 @@
-"""Ports that isolate the core from external products."""
+"""用于隔离核心层与外部产品的端口协议。"""
 
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
-from workspace_orchestrator.models import Task, Workspace
+from workspace_orchestrator.models import Task
 
 
 class TaskProvider(Protocol):
@@ -28,8 +28,10 @@ class TaskProvider(Protocol):
 
 
 class AgentProvider(Protocol):
+    @property
+    def name(self) -> str: ...
+
     def current_session_id(self) -> str | None: ...
-    def build_context(self, workspace: Workspace) -> str: ...
 
 
 class GitProvider(Protocol):
@@ -39,6 +41,7 @@ class GitProvider(Protocol):
     def create_worktree(self, path: str, branch: str) -> None: ...
     def recent_commits(self, limit: int = 5) -> Sequence[str]: ...
     def diff(self) -> str: ...
+    def changed_files(self) -> Sequence[str]: ...
 
 
 class KnowledgeProvider(Protocol):

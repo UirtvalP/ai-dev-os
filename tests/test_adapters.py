@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.adapters.git import LocalGitProvider
 from workspace_orchestrator.adapters.task import DashiTaskProvider, TaskProviderError
-from workspace_orchestrator.context import build_snapshot
+from workspace_orchestrator.context import build_snapshot, handoff
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.workspace import WorkspaceStore
 
@@ -33,6 +34,113 @@ def test_local_git_provider_reports_repository_state(tmp_path: Path) -> None:
     assert len(commits) == 1
     assert commits[0].endswith(" initial")
     assert "changed" in provider.diff()
+
+
+def test_local_git_provider_reports_changed_and_untracked_files(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-m", "initial")
+    tracked.write_text("changed\n", encoding="utf-8")
+    (tmp_path / "new.txt").write_text("new\n", encoding="utf-8")
+
+    assert LocalGitProvider(tmp_path).changed_files() == ("tracked.txt", "new.txt")
+
+
+def test_codex_agent_provider_owns_thread_environment_lookup() -> None:
+    provider = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-123"})
+
+    assert provider.name == "codex"
+    assert provider.current_session_id() == "thread-123"
+
+
+def test_resume_prefers_requirement_bound_worktree_over_current_repo(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-m", "initial")
+    worktree = tmp_path / ".worktrees" / "REQ-001"
+    _git(tmp_path, "worktree", "add", "-b", "feature/REQ-001", str(worktree))
+    tracked.write_text("dirty root\n", encoding="utf-8")
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Bound worktree")
+    store.touch_meta(
+        requirement_id,
+        git={"branch": "feature/REQ-001", "worktree": ".worktrees/REQ-001"},
+    )
+
+    snapshot = build_snapshot(store, requirement_id)
+
+    assert "- 分支：feature/REQ-001" in snapshot
+    assert "- 工作树：.worktrees/REQ-001" in snapshot
+    assert "- 状态：干净" in snapshot
+    assert store.load(requirement_id)["meta"]["git"]["worktree"] == ".worktrees/REQ-001"
+
+
+def test_resume_never_replaces_unavailable_bound_worktree_with_repo_root(
+    tmp_path: Path,
+) -> None:
+    _git(tmp_path, "init")
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Missing bound worktree")
+    binding = {"branch": "feature/missing", "worktree": ".worktrees/missing"}
+    store.touch_meta(requirement_id, git=binding)
+
+    snapshot = build_snapshot(store, requirement_id)
+
+    assert "- 分支：feature/missing" in snapshot
+    assert "- 工作树：.worktrees/missing" in snapshot
+    assert "- 状态：不可用" in snapshot
+    assert store.load(requirement_id)["meta"]["git"] == binding
+
+
+def test_resume_links_active_task_to_session_on_both_sides(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Linked task")
+    links: list[tuple[str, str]] = []
+
+    class Tasks:
+        def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
+            return (Task(id="TASK-001", title="Fix bug", status="in_progress"),)
+
+        def link_session(self, task_id: str, session_id: str, **_: object) -> None:
+            links.append((task_id, session_id))
+
+    build_snapshot(
+        store,
+        requirement_id,
+        task_provider=Tasks(),  # type: ignore[arg-type]
+        agent_provider=CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"}),
+    )
+
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["TASK-001"]
+    assert links == [("TASK-001", "thread-a")]
+
+
+def test_handoff_collects_changed_files_from_requirement_git_context(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-m", "initial")
+    tracked.write_text("changed\n", encoding="utf-8")
+    (tmp_path / "new.txt").write_text("new\n", encoding="utf-8")
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Automatic handoff files")
+
+    handoff(store, requirement_id)
+
+    document = store.load(requirement_id)["handoff"]
+    assert "- tracked.txt" in document
+    assert "- new.txt" in document
 
 
 def test_dashi_adapter_uses_json_contract() -> None:
@@ -161,7 +269,7 @@ def test_dashi_status_update_uses_current_version() -> None:
 
 
 def test_dashi_adapter_rejects_non_json() -> None:
-    with pytest.raises(TaskProviderError, match="invalid JSON"):
+    with pytest.raises(TaskProviderError, match="无效 JSON"):
         DashiTaskProvider(runner=lambda _: "not-json").list_tasks("REQ-001")
 
 
@@ -175,4 +283,4 @@ def test_snapshot_degrades_when_task_provider_is_unavailable(tmp_path: Path) -> 
 
     snapshot = build_snapshot(store, requirement_id, task_provider=UnavailableProvider())  # type: ignore[arg-type]
 
-    assert "Tasks:\nUnavailable (offline)" in snapshot
+    assert "任务：\n不可用（offline）" in snapshot

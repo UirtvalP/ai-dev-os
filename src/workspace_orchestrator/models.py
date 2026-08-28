@@ -1,4 +1,4 @@
-"""Provider-neutral V1 domain models."""
+"""与 Provider 无关的 V1 领域模型。"""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -57,7 +57,7 @@ class Workspace:
 
 @dataclass(frozen=True, slots=True)
 class Session:
-    """A replaceable agent session recorded without conversation history."""
+    """不保存对话历史的可替换 Agent 会话记录。"""
 
     id: str
     agent: str

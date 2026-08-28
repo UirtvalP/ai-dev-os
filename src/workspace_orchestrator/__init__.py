@@ -1,4 +1,4 @@
-"""Persistent requirement workspaces for AI coding agents."""
+"""面向 AI 编码 Agent 的持久化需求工作区。"""
 
 from .models import Requirement, Session, Task, WorkflowComplexity, Workspace
 from .workspace import WorkspaceStore

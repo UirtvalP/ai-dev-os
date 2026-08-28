@@ -1,4 +1,4 @@
 interface:
   display_name: "Workspace Orchestrator"
-  short_description: "Resume and advance persistent requirement workspaces"
-  default_prompt: "Use $workspace-orchestrator to resume this requirement and choose the lightest safe workflow."
+  short_description: "恢复并推进持久化需求工作区"
+  default_prompt: "使用 $workspace-orchestrator 恢复此需求，并选择能够安全完成任务的最轻工作流。"

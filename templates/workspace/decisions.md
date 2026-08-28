@@ -1,3 +1,3 @@
-# Decisions
+# 决策
 
-No decisions recorded.
+尚未记录决策。
