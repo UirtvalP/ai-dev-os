@@ -5,7 +5,7 @@ import pytest
 
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.cli import main
-from workspace_orchestrator.context import build_snapshot, checkpoint, handoff
+from workspace_orchestrator.context import bootstrap_session, build_snapshot, checkpoint, handoff
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -72,6 +72,61 @@ def test_current_id_refuses_to_guess_between_active_workspaces(tmp_path: Path) -
 
     with pytest.raises(WorkspaceError, match="多个活动"):
         store.current_id()
+
+
+def test_bootstrap_explicitly_attaches_then_reuses_requirement(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    store.create("Second")
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+
+    first_snapshot = bootstrap_session(store, first, agent_provider=agent)
+    resumed_snapshot = bootstrap_session(store, agent_provider=agent)
+
+    assert "REQ-001 First" in first_snapshot
+    assert "REQ-001 First" in resumed_snapshot
+    assert store.attached_requirement_id("thread-a") == first
+    assert len(store.load(first)["sessions"]) == 1
+
+
+def test_bootstrap_refuses_to_guess_without_session_or_unique_requirement(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    store.create("First")
+    store.create("Second")
+
+    with pytest.raises(WorkspaceError, match="CODEX_THREAD_ID"):
+        bootstrap_session(store, agent_provider=CodexAgentProvider(environ={}))
+
+    with pytest.raises(WorkspaceError, match="多个活动"):
+        bootstrap_session(
+            store,
+            agent_provider=CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"}),
+        )
+
+
+def test_bootstrap_explicit_id_switches_without_leaving_ambiguous_attach(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+    bootstrap_session(store, first, agent_provider=agent)
+
+    snapshot = bootstrap_session(store, second, agent_provider=agent)
+
+    assert "REQ-002 Second" in snapshot
+    assert store.load(first)["sessions"][0]["result"] == "detached"
+    assert store.attached_requirement_id("thread-a") == second
+
+    bootstrap_session(store, first, agent_provider=agent)
+
+    first_session = store.load(first)["sessions"][0]
+    assert first_session["result"] == "in_progress"
+    assert first_session["ended_at"] is None
+    assert store.load(second)["sessions"][0]["result"] == "detached"
 
 
 def test_checkpoint_and_handoff_restore_across_sessions(
@@ -163,6 +218,19 @@ def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     assert capsys.readouterr().out.strip() == "REQ-001"
     assert main([*root_args, "resume"]) == 0
     assert "REQ-001 CLI demo" in capsys.readouterr().out
+
+
+def test_cli_bootstrap_auto_attaches_unique_requirement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    store.create("Bootstrap demo")
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-cli")
+
+    assert main(["--root", str(tmp_path), "bootstrap"]) == 0
+
+    assert "REQ-001 Bootstrap demo" in capsys.readouterr().out
+    assert store.attached_requirement_id("thread-cli") == "REQ-001"
 
 
 def test_persisted_json_is_utf8_and_readable(tmp_path: Path) -> None:

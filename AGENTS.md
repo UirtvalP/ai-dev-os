@@ -13,3 +13,7 @@
 - 保留现有用户文件以及人类可读的 Markdown/JSON 状态。
 - V1 不得添加数据库、Web UI、多 Agent 调度器或自动知识写入。
 - 技术上正确但违反已记录意图的修改不算完成。
+- 新 Codex Thread 在本项目的第一次执行中必须先运行
+  `.\.venv\Scripts\workspace.exe bootstrap`；用户请求含明确 `REQ-<数字>` 时传入该 ID。
+  将返回的 Context Snapshot 视为事实来源。
+  多个活动需求且当前 Thread 尚未绑定时，不得静默选择。

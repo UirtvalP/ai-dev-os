@@ -66,6 +66,7 @@ python -m pip wheel . --no-deps --wheel-dir dist
 
 ```bash
 workspace new "实现身份认证" --acceptance "有效用户可以登录"
+workspace bootstrap REQ-001
 workspace current
 workspace status REQ-001
 workspace checkpoint REQ-001 --phase implementation --task TASK-001 --completed "登录接口" --next-action "实现中间件"
@@ -73,6 +74,11 @@ workspace handoff REQ-001 --current-state "登录功能可用" --next-action "�
 workspace resume REQ-001
 workspace review REQ-001
 ```
+
+`bootstrap` 是新 Codex Thread 的首次执行入口。显式传入 Requirement ID 时接入该需求；
+无参数时先复用当前 Thread 已有绑定，否则只自动选择唯一活动 Requirement。
+多个活动需求时会要求显式选择，已绑定的 Thread 也不会被静默切换。
+显式传入另一个 ID 时，旧绑定会以 `detached` 保留历史，当前绑定再切换到新需求。
 
 `resume` 生成精简 Context Snapshot，其中只抽取相关的 User Principles、Project Intent 和
 Requirement Intent 摘要，不把三份原文全部塞入上下文。CLI 通过 `CodexAgentProvider` 发现当前 Thread；Core 不读取

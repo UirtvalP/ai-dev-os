@@ -170,6 +170,29 @@ class WorkspaceStore:
             )
         return active[0]
 
+    def attached_requirement_id(self, session_id: str) -> str | None:
+        """查找已与会话绑定的需求，不容忍一对多歧义。"""
+
+        attached: list[str] = []
+        if self.root.exists():
+            for path in sorted(self.root.iterdir()):
+                if not path.is_dir() or not re.fullmatch(r"REQ-\d{3,}", path.name):
+                    continue
+                sessions_path = path / "sessions.json"
+                if not sessions_path.is_file():
+                    continue
+                sessions = self.read_json(sessions_path)
+                if any(
+                    item.get("id") == session_id and item.get("result") == "in_progress"
+                    for item in sessions
+                ):
+                    attached.append(path.name)
+        if len(attached) > 1:
+            raise WorkspaceError(
+                f"会话 {session_id} 同时关联了多个需求：" + ", ".join(attached)
+            )
+        return attached[0] if attached else None
+
     def create(
         self,
         title: str,

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .adapters.agent import CodexAgentProvider
-from .context import build_snapshot, checkpoint, handoff
+from .context import bootstrap_session, build_snapshot, checkpoint, handoff
 from .models import WorkflowComplexity
 from .review import review_requirement
 from .workflow import route_workflow
@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume = commands.add_parser("resume", help="恢复精简的上下文快照")
     resume.add_argument("requirement_id", nargs="?")
     resume.add_argument("--task", dest="task_ids", action="append", default=[])
+
+    bootstrap = commands.add_parser("bootstrap", help="首次执行时自动接入需求")
+    bootstrap.add_argument("requirement_id", nargs="?")
+    bootstrap.add_argument("--task", dest="task_ids", action="append", default=[])
 
     checkpoint_parser = commands.add_parser("checkpoint", help="持久化当前进度")
     checkpoint_parser.add_argument("requirement_id")
@@ -129,6 +133,13 @@ def run(args: argparse.Namespace) -> str:
         return build_snapshot(
             store,
             args.requirement_id or store.current_id(),
+            agent_provider=agent_provider,
+            task_ids=args.task_ids,
+        ).rstrip()
+    if args.command == "bootstrap":
+        return bootstrap_session(
+            store,
+            args.requirement_id,
             agent_provider=agent_provider,
             task_ids=args.task_ids,
         ).rstrip()

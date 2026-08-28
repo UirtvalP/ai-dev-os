@@ -12,6 +12,7 @@ from .adapters.task import DashiTaskProvider, TaskProviderError
 from .intent import requirement_intent_summary, summarize_document
 from .workspace import (
     SECTION_LABELS,
+    WorkspaceError,
     WorkspaceStore,
     bullets,
     markdown_sections,
@@ -182,6 +183,54 @@ def build_snapshot(
     return "\n\n".join(parts).rstrip() + "\n"
 
 
+def bootstrap_session(
+    store: WorkspaceStore,
+    requirement_id: str | None = None,
+    *,
+    agent_provider: AgentProvider,
+    task_provider: TaskProvider | None = None,
+    task_ids: Sequence[str] = (),
+) -> str:
+    """首次执行时确定性接入需求，后续执行复用会话绑定。"""
+
+    session_id = agent_provider.current_session_id()
+    if not session_id:
+        raise WorkspaceError("未检测到 CODEX_THREAD_ID，无法自动接入当前 Codex Thread")
+    attached_id = store.attached_requirement_id(session_id)
+    requested_id = requirement_id.upper() if requirement_id else None
+    if attached_id and requested_id and requested_id != attached_id:
+        store.load(requested_id)
+        detach_session(store, attached_id, session_id)
+    selected_id = requested_id or attached_id or store.current_id()
+    return build_snapshot(
+        store,
+        selected_id,
+        task_provider=task_provider,
+        agent_provider=agent_provider,
+        task_ids=task_ids,
+    )
+
+
+def detach_session(store: WorkspaceStore, requirement_id: str, session_id: str) -> None:
+    """结束 Thread 的当前绑定，同时保留历史 Session 记录。"""
+
+    path = store.path_for(requirement_id) / "sessions.json"
+    sessions = store.read_json(path)
+    existing = next(
+        (
+            item
+            for item in sessions
+            if item.get("id") == session_id and item.get("result") == "in_progress"
+        ),
+        None,
+    )
+    if existing is None:
+        return
+    existing["ended_at"] = now_iso()
+    existing["result"] = "detached"
+    store.write_json(path, sessions)
+
+
 def record_session(
     store: WorkspaceStore,
     requirement_id: str,
@@ -199,11 +248,16 @@ def record_session(
     timestamp = now_iso()
     existing = next((item for item in sessions if item["id"] == session_id), None)
     normalized_task_ids = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+    newly_linked_task_ids = normalized_task_ids
     if existing:
-        existing["ended_at"] = timestamp if result != "in_progress" else existing.get("ended_at")
+        existing_task_ids = existing.get("task_ids", [])
+        newly_linked_task_ids = [
+            task_id for task_id in normalized_task_ids if task_id not in existing_task_ids
+        ]
+        existing["ended_at"] = timestamp if result != "in_progress" else None
         existing["result"] = result
         existing["task_ids"] = list(
-            dict.fromkeys([*existing.get("task_ids", []), *normalized_task_ids])
+            dict.fromkeys([*existing_task_ids, *normalized_task_ids])
         )
     else:
         sessions.append(
@@ -218,7 +272,7 @@ def record_session(
         )
     store.write_json(path, sessions)
     if task_provider is not None:
-        for task_id in normalized_task_ids:
+        for task_id in newly_linked_task_ids:
             try:
                 task_provider.link_session(task_id, session_id)
             except TaskProviderError:

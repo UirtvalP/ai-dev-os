@@ -23,7 +23,7 @@ def test_local_git_provider_reports_repository_state(tmp_path: Path) -> None:
     tracked = tmp_path / "tracked.txt"
     tracked.write_text("first\n", encoding="utf-8")
     _git(tmp_path, "add", "tracked.txt")
-    _git(tmp_path, "commit", "-m", "initial")
+    _git(tmp_path, "commit", "-m", "中文提交")
     tracked.write_text("changed\n", encoding="utf-8")
 
     provider = LocalGitProvider(tmp_path)
@@ -32,7 +32,7 @@ def test_local_git_provider_reports_repository_state(tmp_path: Path) -> None:
     assert provider.status()["clean"] is False
     commits = provider.recent_commits()
     assert len(commits) == 1
-    assert commits[0].endswith(" initial")
+    assert commits[0].endswith(" 中文提交")
     assert "changed" in provider.diff()
 
 
@@ -120,6 +120,31 @@ def test_resume_links_active_task_to_session_on_both_sides(tmp_path: Path) -> No
     )
 
     assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["TASK-001"]
+    assert links == [("TASK-001", "thread-a")]
+
+
+def test_repeated_resume_does_not_repeat_session_or_task_attach(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Idempotent attach")
+    links: list[tuple[str, str]] = []
+
+    class Tasks:
+        def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
+            return (Task(id="TASK-001", title="Fix bug", status="in_progress"),)
+
+        def link_session(self, task_id: str, session_id: str, **_: object) -> None:
+            links.append((task_id, session_id))
+
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+    for _ in range(2):
+        build_snapshot(
+            store,
+            requirement_id,
+            task_provider=Tasks(),  # type: ignore[arg-type]
+            agent_provider=agent,
+        )
+
+    assert len(store.load(requirement_id)["sessions"]) == 1
     assert links == [("TASK-001", "thread-a")]
 
 
