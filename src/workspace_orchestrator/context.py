@@ -10,6 +10,7 @@ from .adapters.base import AgentProvider, TaskProvider
 from .adapters.git import GitError, LocalGitProvider
 from .adapters.task import DashiTaskProvider, TaskProviderError
 from .intent import requirement_intent_summary, summarize_document
+from .models import Task
 from .workspace import (
     SECTION_LABELS,
     WorkspaceError,
@@ -105,11 +106,13 @@ def build_snapshot(
     git = _git_context(store.project_root, stored_git)
     task_lines = ["无"]
     tasks = ()
+    task_listing_available = False
     if task_provider is None:
         task_provider = _configured_task_provider(meta)
     if task_provider is not None:
         try:
             tasks = tuple(task_provider.list_tasks(requirement_id))
+            task_listing_available = True
             task_lines = [
                 f"- {task.id} [{_display_state(task.status)}] {task.title}" for task in tasks
             ] or ["无"]
@@ -141,13 +144,24 @@ def build_snapshot(
         git_status = f"不可用（{git['error']}）"
 
     session_id = agent_provider.current_session_id() if agent_provider else None
-    associated_task_ids = list(task_ids)
+    associated_task_ids = list(dict.fromkeys(task_ids))
     if session_id:
-        associated_task_ids.extend(
-            task.id
-            for task in tasks
-            if task.status == "in_progress" or session_id in task.session_ids
-        )
+        task_by_id = {task.id: task for task in tasks}
+        if associated_task_ids and task_listing_available:
+            unknown = [task_id for task_id in associated_task_ids if task_id not in task_by_id]
+            if unknown:
+                raise WorkspaceError(
+                    f"Task 不属于需求 {requirement_id}：" + ", ".join(unknown)
+                )
+        elif not associated_task_ids and task_listing_available:
+            active_tasks = [task for task in tasks if task.status == "in_progress"]
+            if len(active_tasks) > 1:
+                raise WorkspaceError(
+                    f"需求 {requirement_id} 存在多个 in_progress Task，请使用 --task 明确指定："
+                    + ", ".join(task.id for task in active_tasks)
+                )
+            if active_tasks:
+                associated_task_ids.append(active_tasks[0].id)
     record_session(
         store,
         requirement_id,
@@ -190,6 +204,7 @@ def bootstrap_session(
     agent_provider: AgentProvider,
     task_provider: TaskProvider | None = None,
     task_ids: Sequence[str] = (),
+    development_request: str | None = None,
 ) -> str:
     """首次执行时确定性接入需求，后续执行复用会话绑定。"""
 
@@ -198,20 +213,86 @@ def bootstrap_session(
         raise WorkspaceError("未检测到 CODEX_THREAD_ID，无法自动接入当前 Codex Thread")
     attached_id = store.attached_requirement_id(session_id)
     requested_id = requirement_id.upper() if requirement_id else None
-    if attached_id and requested_id and requested_id != attached_id:
-        store.load(requested_id)
-        detach_session(store, attached_id, session_id)
     selected_id = requested_id or attached_id or store.current_id()
+    data = store.load(selected_id)
+    provided_task_provider = task_provider
+    if task_provider is None:
+        task_provider = _configured_task_provider(data["meta"])
+
+    selected_task_ids = list(dict.fromkeys(task_ids))
+    if task_provider is not None:
+        try:
+            tasks = tuple(task_provider.list_tasks(selected_id))
+            task_by_id = {task.id: task for task in tasks}
+            if selected_task_ids:
+                unknown = [
+                    task_id for task_id in selected_task_ids if task_id not in task_by_id
+                ]
+                if unknown:
+                    raise WorkspaceError(
+                        f"Task 不属于需求 {selected_id}：" + ", ".join(unknown)
+                    )
+            else:
+                active_tasks = [task for task in tasks if task.status == "in_progress"]
+                if len(active_tasks) > 1:
+                    raise WorkspaceError(
+                        f"需求 {selected_id} 存在多个 in_progress Task，请使用 --task 明确指定："
+                        + ", ".join(task.id for task in active_tasks)
+                    )
+                if active_tasks:
+                    selected_task_ids.append(active_tasks[0].id)
+                elif development_request and development_request.strip():
+                    request_text = " ".join(development_request.split())
+                    title = (
+                        request_text
+                        if len(request_text) <= 120
+                        else request_text[:117] + "..."
+                    )
+                    created = task_provider.create_task(
+                        selected_id,
+                        Task(
+                            id="new",
+                            title=title,
+                            description=development_request.strip(),
+                            status="in_progress",
+                        ),
+                    )
+                    selected_task_ids.append(created.id)
+                else:
+                    raise WorkspaceError(
+                        f"需求 {selected_id} 没有可恢复的 in_progress Task；"
+                        "请使用 --task 指定 Task，或使用 --request 提供当前开发请求以创建 Task"
+                    )
+        except TaskProviderError as exc:
+            raise WorkspaceError(f"Task Bootstrap 失败：{exc}") from exc
+
+    if attached_id and requested_id and requested_id != attached_id:
+        old_data = store.load(attached_id)
+        old_task_provider = provided_task_provider or _configured_task_provider(
+            old_data["meta"]
+        )
+        detach_session(
+            store,
+            attached_id,
+            session_id,
+            task_provider=old_task_provider,
+        )
     return build_snapshot(
         store,
         selected_id,
         task_provider=task_provider,
         agent_provider=agent_provider,
-        task_ids=task_ids,
+        task_ids=selected_task_ids,
     )
 
 
-def detach_session(store: WorkspaceStore, requirement_id: str, session_id: str) -> None:
+def detach_session(
+    store: WorkspaceStore,
+    requirement_id: str,
+    session_id: str,
+    *,
+    task_provider: TaskProvider | None = None,
+) -> None:
     """结束 Thread 的当前绑定，同时保留历史 Session 记录。"""
 
     path = store.path_for(requirement_id) / "sessions.json"
@@ -226,6 +307,13 @@ def detach_session(store: WorkspaceStore, requirement_id: str, session_id: str) 
     )
     if existing is None:
         return
+    if task_provider is not None:
+        for task_id in existing.get("task_ids", []):
+            try:
+                task_provider.unlink_session(task_id, session_id)
+            except TaskProviderError:
+                # 外部任务板离线时仍结束本地活动绑定，避免 Requirement 一对多。
+                continue
     existing["ended_at"] = now_iso()
     existing["result"] = "detached"
     store.write_json(path, sessions)
@@ -251,9 +339,13 @@ def record_session(
     newly_linked_task_ids = normalized_task_ids
     if existing:
         existing_task_ids = existing.get("task_ids", [])
-        newly_linked_task_ids = [
-            task_id for task_id in normalized_task_ids if task_id not in existing_task_ids
-        ]
+        if existing.get("result") == "in_progress":
+            newly_linked_task_ids = [
+                task_id for task_id in normalized_task_ids if task_id not in existing_task_ids
+            ]
+        else:
+            # detached Session 再次接入时，外部当前绑定已清除，必须重新建立。
+            newly_linked_task_ids = normalized_task_ids
         existing["ended_at"] = timestamp if result != "in_progress" else None
         existing["result"] = result
         existing["task_ids"] = list(

@@ -293,6 +293,41 @@ def test_dashi_status_update_uses_current_version() -> None:
     )
 
 
+def test_dashi_unlink_clears_only_matching_current_thread_binding() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Login",
+                    "status": "in_progress",
+                    "threadId": "thread-a",
+                    "version": 4,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    provider.unlink_session("AID-1", "thread-a")
+
+    assert commands[-1] == (
+        "taskctl",
+        "issue",
+        "move",
+        "AID-1",
+        "--status",
+        "in_progress",
+        "--clear-binding-thread",
+        "--if-version",
+        "4",
+        "--json",
+    )
+
+
 def test_dashi_adapter_rejects_non_json() -> None:
     with pytest.raises(TaskProviderError, match="无效 JSON"):
         DashiTaskProvider(runner=lambda _: "not-json").list_tasks("REQ-001")

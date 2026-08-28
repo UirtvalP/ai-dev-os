@@ -10,7 +10,8 @@ def test_workspace_skill_keeps_restore_and_approval_contract() -> None:
     assert "workspace current" in skill
     assert "workspace resume REQ-ID" in skill
     assert "workspace bootstrap REQ-ID" in skill
-    assert "workspace bootstrap`" in skill
+    assert 'workspace bootstrap --request "用户当前开发请求"' in skill
+    assert "多个活动 Task" in skill
     assert "workspace checkpoint REQ-ID" in skill
     assert "workspace handoff REQ-ID" in skill
     assert "workspace review REQ-ID" in skill

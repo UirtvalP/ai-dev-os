@@ -6,6 +6,7 @@ import pytest
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.context import bootstrap_session, build_snapshot, checkpoint, handoff
+from workspace_orchestrator.models import Task
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -89,6 +90,22 @@ def test_bootstrap_explicitly_attaches_then_reuses_requirement(tmp_path: Path) -
     assert len(store.load(first)["sessions"]) == 1
 
 
+def test_snapshot_keeps_explicit_local_task_without_external_provider(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Local task")
+
+    build_snapshot(
+        store,
+        requirement_id,
+        agent_provider=CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"}),
+        task_ids=("LOCAL-TASK-1",),
+    )
+
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["LOCAL-TASK-1"]
+
+
 def test_bootstrap_refuses_to_guess_without_session_or_unique_requirement(
     tmp_path: Path,
 ) -> None:
@@ -127,6 +144,145 @@ def test_bootstrap_explicit_id_switches_without_leaving_ambiguous_attach(
     assert first_session["result"] == "in_progress"
     assert first_session["ended_at"] is None
     assert store.load(second)["sessions"][0]["result"] == "detached"
+
+
+class _BootstrapTasks:
+    def __init__(self, tasks: dict[str, list[Task]]) -> None:
+        self.tasks = tasks
+        self.created: list[tuple[str, Task]] = []
+        self.links: list[tuple[str, str]] = []
+        self.unlinks: list[tuple[str, str]] = []
+
+    def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
+        return tuple(self.tasks.get(requirement_id, []))
+
+    def create_task(self, requirement_id: str, task: Task) -> Task:
+        created = Task(
+            id=f"TASK-{len(self.created) + 1:03d}",
+            title=task.title,
+            description=task.description,
+            status=task.status,
+        )
+        self.created.append((requirement_id, task))
+        self.tasks.setdefault(requirement_id, []).append(created)
+        return created
+
+    def link_session(self, task_id: str, session_id: str, **_: object) -> None:
+        self.links.append((task_id, session_id))
+
+    def unlink_session(self, task_id: str, session_id: str) -> None:
+        self.unlinks.append((task_id, session_id))
+
+
+def test_bootstrap_creates_in_progress_task_from_development_request(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Task bootstrap")
+    tasks = _BootstrapTasks({})
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+
+    snapshot = bootstrap_session(
+        store,
+        requirement_id,
+        agent_provider=agent,
+        task_provider=tasks,  # type: ignore[arg-type]
+        development_request="修复 Bootstrap 的 Task 绑定语义",
+    )
+
+    assert tasks.created[0][0] == requirement_id
+    assert tasks.created[0][1].status == "in_progress"
+    assert tasks.links == [("TASK-001", "thread-a")]
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["TASK-001"]
+    assert "TASK-001 [in_progress" in snapshot
+
+
+def test_bootstrap_refuses_multiple_active_tasks_before_switching_requirement(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    tasks = _BootstrapTasks(
+        {
+            first: [Task(id="TASK-001", title="First", status="in_progress")],
+            second: [
+                Task(id="TASK-002", title="Second A", status="in_progress"),
+                Task(id="TASK-003", title="Second B", status="in_progress"),
+            ],
+        }
+    )
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+    bootstrap_session(store, first, agent_provider=agent, task_provider=tasks)  # type: ignore[arg-type]
+
+    with pytest.raises(WorkspaceError, match="多个 in_progress Task"):
+        bootstrap_session(
+            store,
+            second,
+            agent_provider=agent,
+            task_provider=tasks,  # type: ignore[arg-type]
+        )
+
+    assert store.attached_requirement_id("thread-a") == first
+    assert tasks.unlinks == []
+
+
+def test_bootstrap_switch_clears_old_current_task_binding_and_binds_new_task(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    tasks = _BootstrapTasks(
+        {
+            first: [Task(id="TASK-001", title="First", status="in_progress")],
+            second: [Task(id="TASK-002", title="Second", status="in_progress")],
+        }
+    )
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+    bootstrap_session(store, first, agent_provider=agent, task_provider=tasks)  # type: ignore[arg-type]
+
+    bootstrap_session(store, second, agent_provider=agent, task_provider=tasks)  # type: ignore[arg-type]
+
+    assert tasks.unlinks == [("TASK-001", "thread-a")]
+    assert tasks.links == [("TASK-001", "thread-a"), ("TASK-002", "thread-a")]
+    assert store.load(first)["sessions"][0]["result"] == "detached"
+    assert store.load(first)["sessions"][0]["task_ids"] == ["TASK-001"]
+    assert store.load(second)["sessions"][0]["task_ids"] == ["TASK-002"]
+
+    bootstrap_session(store, first, agent_provider=agent, task_provider=tasks)  # type: ignore[arg-type]
+
+    assert tasks.unlinks[-1] == ("TASK-002", "thread-a")
+    assert tasks.links[-1] == ("TASK-001", "thread-a")
+    assert store.load(first)["sessions"][0]["result"] == "in_progress"
+
+
+def test_bootstrap_validates_explicit_target_task_before_detaching_old_session(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    tasks = _BootstrapTasks(
+        {
+            first: [Task(id="TASK-001", title="First", status="in_progress")],
+            second: [Task(id="TASK-002", title="Second", status="todo")],
+        }
+    )
+    agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-a"})
+    bootstrap_session(store, first, agent_provider=agent, task_provider=tasks)  # type: ignore[arg-type]
+
+    with pytest.raises(WorkspaceError, match="不属于需求"):
+        bootstrap_session(
+            store,
+            second,
+            agent_provider=agent,
+            task_provider=tasks,  # type: ignore[arg-type]
+            task_ids=("TASK-999",),
+        )
+
+    assert store.attached_requirement_id("thread-a") == first
+    assert tasks.unlinks == []
 
 
 def test_checkpoint_and_handoff_restore_across_sessions(
@@ -262,6 +418,33 @@ def test_cli_can_configure_dashi_project(
     meta = WorkspaceStore(tmp_path).load("REQ-001")["meta"]
     assert meta["task_provider"] == "dashi"
     assert meta["task_project_id"] == "ai-dev-os"
+
+
+def test_cli_bootstrap_passes_current_development_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received: dict[str, object] = {}
+
+    def fake_bootstrap(*_: object, **kwargs: object) -> str:
+        received.update(kwargs)
+        return "snapshot"
+
+    monkeypatch.setattr("workspace_orchestrator.cli.bootstrap_session", fake_bootstrap)
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "bootstrap",
+                "REQ-004",
+                "--request",
+                "完善 Task Bootstrap",
+            ]
+        )
+        == 0
+    )
+    assert received["development_request"] == "完善 Task Bootstrap"
 
 
 def test_cli_checkpoint_records_explicit_task_for_current_session(

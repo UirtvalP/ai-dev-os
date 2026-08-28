@@ -66,7 +66,7 @@ python -m pip wheel . --no-deps --wheel-dir dist
 
 ```bash
 workspace new "实现身份认证" --acceptance "有效用户可以登录"
-workspace bootstrap REQ-001
+workspace bootstrap REQ-001 --request "实现登录接口"
 workspace current
 workspace status REQ-001
 workspace checkpoint REQ-001 --phase implementation --task TASK-001 --completed "登录接口" --next-action "实现中间件"
@@ -78,7 +78,12 @@ workspace review REQ-001
 `bootstrap` 是新 Codex Thread 的首次执行入口。显式传入 Requirement ID 时接入该需求；
 无参数时先复用当前 Thread 已有绑定，否则只自动选择唯一活动 Requirement。
 多个活动需求时会要求显式选择，已绑定的 Thread 也不会被静默切换。
-显式传入另一个 ID 时，旧绑定会以 `detached` 保留历史，当前绑定再切换到新需求。
+未传 `--task` 时，唯一的 `in_progress` Task 会被恢复；没有活动 Task 时根据 `--request`
+创建 Requirement 关联的 dashi Task、直接置为 `in_progress` 并绑定当前 Thread；多个活动 Task
+时要求用 `--task` 明确选择。显式切换到另一个 Requirement 前会先验证目标 Task，随后清除旧
+Task 的 dashi 当前 Thread 绑定并把旧 Session 记为 `detached`；历史 Task 归属保留在该
+Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Task。同一 Thread 切回
+旧 Requirement 时会重新建立 dashi 当前绑定。
 
 `resume` 生成精简 Context Snapshot，其中只抽取相关的 User Principles、Project Intent 和
 Requirement Intent 摘要，不把三份原文全部塞入上下文。CLI 通过 `CodexAgentProvider` 发现当前 Thread；Core 不读取

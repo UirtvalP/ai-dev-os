@@ -10,8 +10,8 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 
 ## 恢复
 
-1. 新 Thread 第一次执行时，如果用户请求中包含准确的 `REQ-<数字>` 标识符，直接提取它并运行 `workspace bootstrap REQ-ID`；不得推导或改写 ID。
-2. 否则运行 `workspace bootstrap`。它优先复用当前 Thread 已有绑定，仅在没有绑定时自动选择唯一活动需求；如果存在多个活动需求，请用户选择。
+1. 新 Thread 第一次执行时，如果用户请求中包含准确的 `REQ-<数字>` 标识符，直接提取它并运行 `workspace bootstrap REQ-ID --request "用户当前开发请求"`；不得推导或改写 ID。用户已明确 Task ID 时改用 `--task TASK-ID`。
+2. 否则运行 `workspace bootstrap --request "用户当前开发请求"`。它优先复用当前 Thread 已有绑定，仅在没有绑定时自动选择唯一活动需求；如果存在多个活动需求，请用户选择。未明确 Task 时只恢复唯一的 `in_progress` Task；没有活动 Task 时根据当前开发请求创建，存在多个活动 Task 时要求用户或上层调用明确选择。
 3. 将 Bootstrap 生成的上下文快照视为需求、状态、交接、计划、决策、验证、相关用户原则、项目意图、需求意图、Dashi 任务、Git 上下文和下一步行动的当前事实来源。`workspace current` 和 `workspace resume REQ-ID` 仍作为手动检查与恢复命令保留。
 4. 如果工作区不存在且用户正在开始需要长期维护的工作，使用 `workspace new` 创建。不要为琐碎的一次性请求创建持久化跟踪。
 

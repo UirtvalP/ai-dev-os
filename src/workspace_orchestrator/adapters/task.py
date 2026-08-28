@@ -42,6 +42,7 @@ def _relation_ids(values: Sequence[object]) -> tuple[str, ...]:
 
 def _task(data: dict[str, Any]) -> Task:
     development = data.get("developmentContext") or {}
+    thread_binding = data.get("threadBinding") or {}
     relations = data.get("relations") or {}
     refs = data.get("conversationRefs") or []
     session_ids = tuple(dict.fromkeys(str(ref["threadId"]) for ref in refs if ref.get("threadId")))
@@ -63,6 +64,11 @@ def _task(data: dict[str, Any]) -> Task:
         branch=development.get("branch"),
         worktree=development.get("path") if development.get("type") == "worktree" else None,
         session_ids=session_ids,
+        binding_session_id=(
+            thread_binding.get("threadId")
+            or data.get("threadId")
+            or data.get("legacyLocalThreadId")
+        ),
         labels=tuple(data.get("labels", ())),
         version=data.get("version"),
     )
@@ -180,6 +186,24 @@ class DashiTaskProvider:
                     str(workspace_path),
                 )
             )
+        if current.version is not None:
+            args.extend(("--if-version", str(current.version)))
+        self._json(*args)
+
+    def unlink_session(self, task_id: str, session_id: str) -> None:
+        """清除 dashi 的当前绑定；历史 Task 归属由 Workspace Session 保留。"""
+
+        current = self.get_task(task_id)
+        if current.binding_session_id != session_id:
+            return
+        args = [
+            "issue",
+            "move",
+            task_id,
+            "--status",
+            current.status,
+            "--clear-binding-thread",
+        ]
         if current.version is not None:
             args.extend(("--if-version", str(current.version)))
         self._json(*args)

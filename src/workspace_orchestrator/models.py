@@ -42,6 +42,7 @@ class Task:
     branch: str | None = None
     worktree: str | None = None
     session_ids: tuple[str, ...] = ()
+    binding_session_id: str | None = None
     labels: tuple[str, ...] = ()
     version: int | None = None
 

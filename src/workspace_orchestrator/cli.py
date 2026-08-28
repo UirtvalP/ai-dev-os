@@ -66,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap = commands.add_parser("bootstrap", help="首次执行时自动接入需求")
     bootstrap.add_argument("requirement_id", nargs="?")
     bootstrap.add_argument("--task", dest="task_ids", action="append", default=[])
+    bootstrap.add_argument("--request", dest="development_request")
 
     checkpoint_parser = commands.add_parser("checkpoint", help="持久化当前进度")
     checkpoint_parser.add_argument("requirement_id")
@@ -142,6 +143,7 @@ def run(args: argparse.Namespace) -> str:
             args.requirement_id,
             agent_provider=agent_provider,
             task_ids=args.task_ids,
+            development_request=args.development_request,
         ).rstrip()
     if args.command == "checkpoint":
         checkpoint(
