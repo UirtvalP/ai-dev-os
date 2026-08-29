@@ -28,6 +28,20 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ai-dev-os hook",
+            "commandWindows": "ai-dev-os hook",
+            "statusMessage": "检查已推送任务自动收尾",
+            "timeout": 30,
+            "async": true
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

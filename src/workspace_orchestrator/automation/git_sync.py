@@ -35,7 +35,7 @@ def collect_git_context(
     root, bound_worktree = git_root(project_root, stored_git, execution_root=execution_root)
     try:
         provider = LocalGitProvider(root)
-        status = provider.status()
+        status = provider.push_status()
         return {
             **status,
             "worktree": bound_worktree or status["worktree"],

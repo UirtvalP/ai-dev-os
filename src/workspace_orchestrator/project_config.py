@@ -12,6 +12,7 @@ from pathlib import Path
 from .workspace import WorkspaceError
 
 CONFIG_NAME = ".ai-dev-os.json"
+AUTO_FINISH_OPTION = "auto_finish_pushed_thread"
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +23,7 @@ class ProjectConfig:
     dispatcher_poll_seconds: float = 2.0
     codex_sandbox: str = "workspace-write"
     codex_model: str | None = None
+    auto_finish_pushed_thread: bool = True
 
 
 def default_task_project_id(root: Path) -> str:
@@ -68,6 +70,7 @@ def load_project_config(root: Path) -> ProjectConfig | None:
     poll_seconds = payload.get("dispatcher_poll_seconds", 2.0)
     codex_sandbox = payload.get("codex_sandbox", "workspace-write")
     codex_model = payload.get("codex_model")
+    automation = payload.get("automation", {})
     if provider is not None and (not isinstance(provider, str) or not provider.strip()):
         raise WorkspaceError(f"项目配置 task_provider 必须是非空字符串或 null：{path}")
     if provider not in {None, "dashi"}:
@@ -94,6 +97,13 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         not isinstance(codex_model, str) or not codex_model.strip()
     ):
         raise WorkspaceError(f"项目配置 codex_model 必须是非空字符串或 null：{path}")
+    if not isinstance(automation, dict):
+        raise WorkspaceError(f"项目配置 automation 必须是 JSON 对象：{path}")
+    auto_finish = automation.get(AUTO_FINISH_OPTION, True)
+    if not isinstance(auto_finish, bool):
+        raise WorkspaceError(
+            f"项目配置 automation.{AUTO_FINISH_OPTION} 必须是布尔值：{path}"
+        )
     return ProjectConfig(
         provider,
         project_id,
@@ -101,6 +111,7 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         dispatcher_poll_seconds=float(poll_seconds),
         codex_sandbox=codex_sandbox,
         codex_model=codex_model,
+        auto_finish_pushed_thread=auto_finish,
     )
 
 
@@ -114,4 +125,5 @@ def initialized_project_config(root: Path) -> dict[str, object]:
         "dispatcher_poll_seconds": default.dispatcher_poll_seconds,
         "codex_sandbox": default.codex_sandbox,
         "codex_model": default.codex_model,
+        "automation": {AUTO_FINISH_OPTION: default.auto_finish_pushed_thread},
     }

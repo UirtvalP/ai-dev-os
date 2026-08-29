@@ -17,3 +17,4 @@
   `.\.venv\Scripts\workspace.exe bootstrap --request "<当前开发请求>"`。将返回的 Context Snapshot 视为事实来源。多个活动需求且当前 Thread 尚未绑定时不得静默选择；多个 `in_progress` Task 时不得静默绑定。
 - 语义工作完成后只触发一次 `workspace finalize REQ-ID`；已知验证、checkpoint、Task `in_review`、handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
 - dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。
+- `.ai-dev-os.json` 默认开启已推送 Thread 自动收尾。只有当前 Thread 启动后产生新提交、工作树干净且 HEAD 与上游一致时，Runtime 才自动完成关联开发 Task 并归档 Thread；Requirement 不会自动完成。将 `automation.auto_finish_pushed_thread` 设为 `false` 可关闭。

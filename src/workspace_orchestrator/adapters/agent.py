@@ -148,6 +148,12 @@ class CodexAgentProvider:
         environ = self.environ if self.environ is not None else os.environ
         return environ.get("CODEX_THREAD_ID") or None
 
+    def archive_session(self, session_id: str) -> None:
+        """通过 Codex App Server 的公开契约归档 Thread。"""
+
+        runner = self.archive_runner or _archive_via_app_server
+        runner(session_id)
+
 
 @dataclass(slots=True)
 class CodexExecProvider:

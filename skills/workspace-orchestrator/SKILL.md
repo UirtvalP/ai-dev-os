@@ -51,7 +51,7 @@ workspace finalize REQ-ID \
   --next-action "下一步行动"
 ```
 
-Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。验证、Task 同步或 review gate 失败时，按 CLI 返回的具体 blockers 继续修复，不得描述为只等待用户确认。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。
+Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。验证、Task 同步或 review gate 失败时，按 CLI 返回的具体 blockers 继续修复，不得描述为只等待用户确认。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。项目配置 `automation.auto_finish_pushed_thread` 开启时，`Stop` Hook 会在当前 Thread 产生的新提交已完整推送后，确定性完成关联开发 Task 并归档 Thread；这不会自动完成 Requirement。
 
 `workspace handoff REQ-ID` 保留为显式中途交接兼容命令；完整实现结束优先使用 `finalize`。
 

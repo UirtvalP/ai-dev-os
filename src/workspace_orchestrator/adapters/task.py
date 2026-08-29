@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -74,84 +74,6 @@ def ensure_taskboard_service() -> None:
     if launcher is None:
         raise TaskProviderError(
             "dashi-taskboard 未运行，且未找到启动器；请安装启动器或设置 CODEX_TASKBOARD_LAUNCHER"
-        )
-    environment = os.environ.copy()
-    environment["CODEX_TASKBOARD_HOST"] = "127.0.0.1"
-    environment["CODEX_TASKBOARD_PORT"] = str(port)
-    if os.name == "nt":
-        command = (os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher))
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NO_WINDOW
-        )
-        subprocess.Popen(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-    else:
-        subprocess.Popen(
-            (str(launcher),),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if _service_is_listening(host, port):
-            return
-        time.sleep(0.1)
-    raise TaskProviderError(f"dashi-taskboard 启动超时：{host}:{port}")
-
-
-def _taskboard_endpoint() -> tuple[str, int]:
-    url = os.environ.get("CODEX_TASKBOARD_URL", "http://127.0.0.1:47823")
-    parsed = urlparse(url)
-    return parsed.hostname or "127.0.0.1", parsed.port or 47823
-
-
-def _service_is_listening(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.2):
-            return True
-    except OSError:
-        return False
-
-
-def _taskboard_launcher() -> Path | None:
-    configured = os.environ.get("CODEX_TASKBOARD_LAUNCHER")
-    if configured:
-        path = Path(configured).expanduser()
-        return path if path.is_file() else None
-    discovered = shutil.which("dashi-taskboard")
-    if discovered:
-        return Path(discovered)
-    suffix = ".cmd" if os.name == "nt" else ""
-    user_install = Path.home() / ".local" / "bin" / f"dashi-taskboard{suffix}"
-    return user_install if user_install.is_file() else None
-
-
-def ensure_taskboard_service() -> None:
-    """若本机 dashi 尚未运行，则以后台进程按需启动并等待端口就绪。"""
-
-    host, port = _taskboard_endpoint()
-    if _service_is_listening(host, port):
-        return
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise TaskProviderError(f"远程 dashi-taskboard 不可用：{host}:{port}")
-    launcher = _taskboard_launcher()
-    if launcher is None:
-        raise TaskProviderError(
-            "dashi-taskboard 未运行，且未找到启动器；"
-            "请安装启动器或设置 CODEX_TASKBOARD_LAUNCHER"
         )
     environment = os.environ.copy()
     environment["CODEX_TASKBOARD_HOST"] = "127.0.0.1"

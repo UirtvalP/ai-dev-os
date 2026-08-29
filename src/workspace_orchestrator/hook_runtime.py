@@ -34,6 +34,13 @@ def _block(reason: str) -> None:
     print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
 
 
+def _continue(*, system_message: str | None = None) -> None:
+    payload: dict[str, object] = {"continue": True}
+    if system_message:
+        payload["systemMessage"] = system_message
+    print(json.dumps(payload, ensure_ascii=False))
+
+
 def main() -> int:
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8")
@@ -55,6 +62,21 @@ def main() -> int:
             pass
     agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": session_id})
     runtime = AutomationRuntime(store, agent)
+
+    if event_name == "Stop":
+        try:
+            result = runtime.auto_finish_pushed_thread()
+        except WorkspaceError as exc:
+            _continue(system_message=f"AI Dev OS 自动收尾失败：{exc}")
+        else:
+            _continue(
+                system_message=(
+                    f"AI Dev OS 已自动完成 {', '.join(result.task_ids)} 并归档当前 Thread"
+                    if result.completed
+                    else None
+                )
+            )
+        return 0
 
     if event_name == "SessionEnd":
         attached = store.attached_requirement_id(session_id)

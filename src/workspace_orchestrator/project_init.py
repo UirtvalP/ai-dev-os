@@ -32,6 +32,9 @@ AGENTS_BLOCK = f"""{AGENTS_START}
   用户要求修改时使用 Review 卡新增留言并退回，或执行 `workspace request-changes`。
 - dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或
   恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。
+- `.ai-dev-os.json` 默认开启已推送 Thread 自动收尾。只有当前 Thread 启动后产生新提交、
+  工作树干净且 HEAD 与上游一致时，Runtime 才完成关联开发 Task 并归档 Thread；Requirement
+  不会自动完成。将 `automation.auto_finish_pushed_thread` 设为 `false` 可关闭。
 {AGENTS_END}
 """
 
@@ -79,7 +82,13 @@ def _hook_group(event_name: str) -> dict[str, object]:
         "command": HOOK_COMMAND,
         "commandWindows": HOOK_COMMAND,
     }
-    if event_name != "SessionEnd":
+    if event_name == "Stop":
+        hook.update(
+            statusMessage="检查已推送任务自动收尾",
+            timeout=30,
+        )
+        hook["async"] = True
+    elif event_name != "SessionEnd":
         hook.update(
             statusMessage="自动恢复 AI Dev OS Workspace",
             additionalContextLimit=5000,
@@ -146,7 +155,7 @@ def _ensure_hooks(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8")) if existed else {}
     hooks = payload.setdefault("hooks", {})
     changed = False
-    for event_name in ("SessionStart", "UserPromptSubmit", "SessionEnd"):
+    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         groups = hooks.setdefault(event_name, [])
         managed_index = next(
             (
@@ -198,6 +207,7 @@ def _ensure_project_config(root: Path) -> str:
         "dispatcher_poll_seconds",
         "codex_sandbox",
         "codex_model",
+        "automation",
     ):
         if key not in current:
             current[key] = desired[key]

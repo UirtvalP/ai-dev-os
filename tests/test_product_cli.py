@@ -29,6 +29,7 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
     assert config["dispatcher_poll_seconds"] == 2.0
     assert config["codex_sandbox"] == "workspace-write"
     assert config["codex_model"] is None
+    assert config["automation"]["auto_finish_pushed_thread"] is True
     assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert not (tmp_path / ".workspace").exists()
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
@@ -131,6 +132,7 @@ def test_init_upgrades_existing_project_config_with_dispatcher_defaults(
     assert config["dispatcher_poll_seconds"] == 2.0
     assert config["codex_sandbox"] == "workspace-write"
     assert config["codex_model"] is None
+    assert config["automation"]["auto_finish_pushed_thread"] is True
 
 
 def test_default_dashi_project_id_distinguishes_same_named_directories(
@@ -231,3 +233,27 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
     assert not (project / "src").exists()
     assert not (project / ".venv").exists()
     assert shutil.which("python", path=str(project)) is None
+
+
+def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path) -> None:
+    config_path = tmp_path / ".ai-dev-os.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_provider": None,
+                "task_project_id": None,
+                "automation": {"auto_finish_pushed_thread": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["automation"]["auto_finish_pushed_thread"] is False
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    stop_hook = hooks["hooks"]["Stop"][0]["hooks"][0]
+    assert stop_hook["async"] is True
+    assert stop_hook["timeout"] == 30

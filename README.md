@@ -91,7 +91,10 @@ Dispatcher 的默认配置写在 `.ai-dev-os.json`：
   "auto_execute_in_progress": true,
   "dispatcher_poll_seconds": 2.0,
   "codex_sandbox": "workspace-write",
-  "codex_model": null
+  "codex_model": null,
+  "automation": {
+    "auto_finish_pushed_thread": true
+  }
 }
 ```
 
