@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from workspace_orchestrator.adapters.agent import AgentProviderError
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider
+from workspace_orchestrator.project_config import load_project_config
 from workspace_orchestrator.review import review_requirement
-from workspace_orchestrator.workspace import WorkspaceStore
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 from .git_sync import collect_git_context, sync_task_git_context
 from .requirement_attach import select_requirement
@@ -22,6 +24,7 @@ from .state_sync import (
     verification_summary,
 )
 from .task_attach import (
+    complete_tasks,
     configured_task_provider,
     ensure_project_task_services,
     move_tasks_to_review,
@@ -35,6 +38,14 @@ class FinalizeResult:
     verification: str
     task_ids: tuple[str, ...]
     requirement_in_review: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AutoFinishResult:
+    completed: bool
+    reason: str
+    requirement_id: str | None = None
+    task_ids: tuple[str, ...] = ()
 
 
 class AutomationRuntime:
@@ -107,6 +118,7 @@ class AutomationRuntime:
             agent_name=self.agent_provider.name,
             task_provider=provider,
             task_ids=selection.task_ids,
+            head_commit=str(git["head"]) if git.get("head") else None,
         )
         return collect_snapshot(
             self.store,
@@ -126,6 +138,10 @@ class AutomationRuntime:
 
         provider = self._provider(requirement_id)
         tasks, task_error = list_tasks_safely(provider, requirement_id)
+        data = self.store.load(requirement_id)
+        git = collect_git_context(
+            self.store.project_root, dict(data["meta"].get("git") or {})
+        )
         if attach:
             session_id = self.agent_provider.current_session_id()
             if session_id:
@@ -148,9 +164,75 @@ class AutomationRuntime:
                     agent_name=self.agent_provider.name,
                     task_provider=provider,
                     task_ids=selected,
+                    head_commit=str(git["head"]) if git.get("head") else None,
                 )
         return collect_snapshot(
-            self.store, requirement_id, tasks=tasks, task_error=task_error
+            self.store, requirement_id, tasks=tasks, task_error=task_error, git=git
+        )
+
+    def auto_finish_pushed_thread(self) -> AutoFinishResult:
+        """在 Stop Hook 中按项目配置完成已推送 Task 并归档当前 Thread。"""
+
+        config = load_project_config(self.store.project_root)
+        if config is None:
+            return AutoFinishResult(False, "项目未通过 ai-dev-os init 接入")
+        if not config.auto_finish_pushed_thread:
+            return AutoFinishResult(False, "项目已关闭已推送 Thread 自动收尾")
+        session_id = require_session_id(self.agent_provider)
+        requirement_id = self.store.attached_requirement_id(session_id)
+        if not requirement_id:
+            return AutoFinishResult(False, "当前 Thread 未绑定 Requirement")
+        data = self.store.load(requirement_id)
+        session = next(
+            (
+                item
+                for item in data["sessions"]
+                if item.get("id") == session_id and item.get("result") == "in_progress"
+            ),
+            None,
+        )
+        if session is None:
+            return AutoFinishResult(False, "当前 Thread 已结束", requirement_id)
+        task_ids = tuple(dict.fromkeys(session.get("task_ids", ())))
+        if not task_ids:
+            return AutoFinishResult(False, "当前 Thread 未绑定开发 Task", requirement_id)
+        started_head = session.get("started_head")
+        git = collect_git_context(
+            self.store.project_root, dict(data["meta"].get("git") or {})
+        )
+        current_head = git.get("head")
+        if not started_head or not current_head or current_head == started_head:
+            return AutoFinishResult(
+                False, "当前 Thread 启动后没有产生新提交", requirement_id, task_ids
+            )
+        bound_branch = (data["meta"].get("git") or {}).get("branch")
+        if bound_branch and git.get("branch") != bound_branch:
+            return AutoFinishResult(
+                False, "当前分支与 Requirement 绑定分支不一致", requirement_id, task_ids
+            )
+        if not git.get("clean"):
+            return AutoFinishResult(False, "工作树仍有未提交变更", requirement_id, task_ids)
+        if not git.get("upstream"):
+            return AutoFinishResult(False, "当前分支没有上游", requirement_id, task_ids)
+        if not git.get("pushed"):
+            return AutoFinishResult(
+                False, "当前提交尚未与上游完全同步", requirement_id, task_ids
+            )
+        provider = self._provider(requirement_id)
+        complete_tasks(provider, task_ids)
+        try:
+            self.agent_provider.archive_session(session_id)
+        except AgentProviderError as exc:
+            raise WorkspaceError(f"Thread 自动归档失败：{exc}") from exc
+        end_session(
+            self.store,
+            requirement_id,
+            session_id,
+            result="completed",
+            task_provider=provider,
+        )
+        return AutoFinishResult(
+            True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids
         )
 
     def checkpoint(

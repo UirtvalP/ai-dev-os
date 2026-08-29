@@ -22,13 +22,20 @@ def test_init_onboards_existing_project_without_creating_workspace(
     assert (tmp_path / "PROJECT_INTENT.md").is_file()
     assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert set(hooks["hooks"]) == {"SessionStart", "UserPromptSubmit", "SessionEnd"}
+    assert set(hooks["hooks"]) == {
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "SessionEnd",
+    }
     assert all(
         "workspace_orchestrator.codex_hook" in group["hooks"][0]["command"]
         for groups in hooks["hooks"].values()
         for group in groups
     )
     assert not (tmp_path / ".workspace").exists()
+    config = json.loads((tmp_path / ".ai-dev-os.json").read_text(encoding="utf-8"))
+    assert config["automation"]["auto_finish_pushed_thread"] is True
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
 
 
@@ -116,3 +123,27 @@ def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> N
     assert "SessionStart" in content
     assert "workspace finalize REQ-ID" in content
     assert "旧的手工 bootstrap 指引" not in content
+
+
+def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path, capsys) -> None:
+    config = tmp_path / ".ai-dev-os.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "automation": {"auto_finish_pushed_thread": False},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    capsys.readouterr()
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["automation"]["auto_finish_pushed_thread"] is False
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    stop_hook = hooks["hooks"]["Stop"][0]["hooks"][0]
+    assert stop_hook["async"] is True
+    assert stop_hook["timeout"] == 30

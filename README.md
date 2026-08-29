@@ -77,7 +77,8 @@ cd existing-project
 ai-dev-os init
 ```
 
-该命令只补充项目级接入文件，并保留已有内容；重复执行不会重复写入。它不会创建
+该命令只补充项目级接入文件，并保留已有内容；重复执行不会重复写入。它会创建
+`.ai-dev-os.json`，其中 `automation.auto_finish_pushed_thread` 默认是 `true`。它不会创建
 Requirement Workspace，也不会改变 `workspace` 命令层级。接入完成后，再使用
 `workspace new` 创建首个 Requirement。
 
@@ -114,7 +115,10 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 
 当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 会幂等安装项目的
 `.codex/hooks.json`：`SessionStart` 尝试恢复已有绑定，`UserPromptSubmit` 读取结构化 hook
-事件中的用户 prompt 并自动执行完整 bootstrap，`SessionEnd` 自动 detach。项目配置了
+事件中的用户 prompt 并自动执行完整 bootstrap，`Stop` 检查已推送自动收尾，`SessionEnd`
+自动 detach。自动收尾只在当前 Thread 启动后产生新提交、工作树干净、HEAD 与上游完全一致，
+且 Thread 已绑定开发 Task 时触发；它把关联 Task 置为 `done`、归档 Thread，但不完成 Requirement。
+将 `.ai-dev-os.json` 中的 `automation.auto_finish_pushed_thread` 设为 `false` 即可关闭。项目配置了
 dashi Task Provider 时，Hook 会先检测本地任务面板端口；未运行则通过本机
 `dashi-taskboard` 启动器在后台按需拉起，已运行则直接复用。项目 Hook 第一次启用或内容
 变更后必须由用户在 Codex 中审查并信任；未受信任时 Skill 只作为一次 bootstrap 回退触发器。
@@ -142,7 +146,8 @@ Git 状态通过 Local Git Adapter 读取；Requirement 已绑定 worktree 时�
 dashi-taskboard 通过可选的 JSON `taskctl` Adapter 接入，
 用 `requirement:REQ-*` 标签保持 Requirement 与 Issue 的明确关联，并使用乐观 version 更新状态。
 未安装时不影响本地 Workspace。Review 会输出 Intent Alignment 的 `PASS / PARTIAL / VIOLATION`；
-只有四项 Intent 检查全部 PASS 才允许进入 `in_review`，且永远不会自动标记 `done`。
+只有四项 Intent 检查全部 PASS 才允许 Requirement 进入 `in_review`，Requirement 和专用 Review
+Issue 永远不会自动标记 `done`；开发 Task 仅可通过上述已推送自动收尾规则自动完成。
 
 ## 设计原则
 

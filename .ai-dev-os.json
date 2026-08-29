@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "automation": {
+    "auto_finish_pushed_thread": true
+  }
+}

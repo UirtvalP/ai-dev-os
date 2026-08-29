@@ -53,10 +53,15 @@ def test_local_git_provider_reports_changed_and_untracked_files(tmp_path: Path) 
 
 
 def test_codex_agent_provider_owns_thread_environment_lookup() -> None:
-    provider = CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-123"})
+    archived: list[str] = []
+    provider = CodexAgentProvider(
+        environ={"CODEX_THREAD_ID": "thread-123"}, archive_runner=archived.append
+    )
 
     assert provider.name == "codex"
     assert provider.current_session_id() == "thread-123"
+    provider.archive_session("thread-123")
+    assert archived == ["thread-123"]
 
 
 def test_resume_prefers_requirement_bound_worktree_over_current_repo(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .project_config import CONFIG_NAME, ensure_project_config, validate_project_config
 from .workspace import WorkspaceError
 
 AGENTS_START = "<!-- ai-dev-os:start -->"
@@ -28,6 +29,9 @@ AGENTS_BLOCK = f"""{AGENTS_START}
 - 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
 - 语义工作完成后只触发一次 `workspace finalize REQ-ID`；验证、checkpoint、Task review、
   handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
+- `.ai-dev-os.json` 默认开启已推送 Thread 自动收尾：仅当当前 Thread 启动后产生新提交、
+  工作树干净且 HEAD 与上游一致时，Runtime 才会把关联开发 Task 标记为 `done` 并归档 Thread。
+  Requirement 不会因此自动完成；可将 `automation.auto_finish_pushed_thread` 设为 `false` 关闭。
 {AGENTS_END}
 """
 
@@ -87,7 +91,11 @@ def _hook_entry(event_name: str) -> dict[str, object]:
         "command": command,
         "commandWindows": command_windows,
     }
-    if event_name != "SessionEnd":
+    if event_name == "Stop":
+        hook["statusMessage"] = "AI Dev OS 检查已推送任务自动收尾"
+        hook["timeout"] = 30
+        hook["async"] = True
+    elif event_name != "SessionEnd":
         hook["statusMessage"] = "AI Dev OS 自动恢复并同步任务面板"
         hook["additionalContextLimit"] = 5000
     else:
@@ -116,7 +124,7 @@ def _ensure_hooks(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8")) if existed else {}
     hooks = payload.setdefault("hooks", {})
     changed = False
-    for event_name in ("SessionStart", "UserPromptSubmit", "SessionEnd"):
+    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         groups = hooks.setdefault(event_name, [])
         installed = any(
             "workspace_orchestrator.codex_hook" in str(hook.get("command", ""))
@@ -228,6 +236,7 @@ def initialize_project(root: Path) -> InitResult:
     for name, markers in targets.items():
         _validate_file(resolved / name, *markers)
     _validate_hooks(resolved / ".codex" / "hooks.json")
+    validate_project_config(resolved / CONFIG_NAME)
 
     outcomes = {
         "AGENTS.md": _append_managed_block(
@@ -241,6 +250,7 @@ def initialize_project(root: Path) -> InitResult:
         ),
         ".gitignore": _ensure_gitignore(resolved / ".gitignore"),
         ".codex/hooks.json": _ensure_hooks(resolved / ".codex" / "hooks.json"),
+        CONFIG_NAME: ensure_project_config(resolved / CONFIG_NAME),
     }
     return InitResult(
         root=resolved,

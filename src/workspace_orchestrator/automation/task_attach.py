@@ -129,3 +129,17 @@ def move_tasks_to_review(task_provider: TaskProvider | None, task_ids: Sequence[
                 task_provider.update_status(task_id, "in_review")
         except TaskProviderError as exc:
             raise WorkspaceError(f"Task 状态同步失败：{exc}") from exc
+
+
+def complete_tasks(task_provider: TaskProvider | None, task_ids: Sequence[str]) -> None:
+    """在已推送自动收尾门禁通过后幂等完成关联开发 Task。"""
+
+    if task_provider is None:
+        raise WorkspaceError("当前 Requirement 未配置 Task Provider，无法自动完成任务")
+    for task_id in dict.fromkeys(task_ids):
+        try:
+            current = task_provider.get_task(task_id)
+            if current.status != "done":
+                task_provider.update_status(task_id, "done")
+        except TaskProviderError as exc:
+            raise WorkspaceError(f"Task 自动完成失败：{exc}") from exc

@@ -20,3 +20,5 @@ def test_workspace_skill_keeps_restore_and_approval_contract() -> None:
     assert "用户原则、项目意图或需求意图" in skill
     assert "`PASS`、`PARTIAL` 或 `VIOLATION`" in skill
     assert "未经用户明确批准" in skill
+    assert "auto_finish_pushed_thread" in skill
+    assert "不会自动完成 Requirement" in skill

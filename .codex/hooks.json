@@ -28,6 +28,20 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "statusMessage": "检查已推送任务自动收尾",
+            "timeout": 30,
+            "async": true
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

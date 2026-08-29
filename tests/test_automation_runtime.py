@@ -14,6 +14,7 @@ from workspace_orchestrator.automation.runtime import AutomationRuntime
 from workspace_orchestrator.automation.task_attach import configured_task_provider
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.models import Task
+from workspace_orchestrator.project_init import initialize_project
 from workspace_orchestrator.workspace import WorkspaceStore
 
 
@@ -28,6 +29,16 @@ def _init_git(path: Path) -> None:
     (path / "README.md").write_text("Example: hello\n", encoding="utf-8")
     _git(path, "add", "README.md")
     _git(path, "commit", "-m", "initial")
+
+
+def _add_remote_and_push(path: Path) -> Path:
+    remote = path.parent / f"{path.name}-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+    )
+    _git(path, "remote", "add", "origin", str(remote))
+    _git(path, "push", "-u", "origin", "HEAD")
+    return remote
 
 
 class FakeTasks:
@@ -163,6 +174,31 @@ def test_existing_session_task_binding_wins_over_later_explicit_task(tmp_path: P
     assert tasks.get_task("TASK-002").status == "todo"
 
 
+def test_bootstrap_backfills_missing_session_head_baseline(tmp_path: Path) -> None:
+    _init_git(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Backfill head")
+    tasks = FakeTasks()
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-baseline"}),
+        tasks,  # type: ignore[arg-type]
+    )
+    runtime.checkpoint(requirement_id)
+    assert store.load(requirement_id)["sessions"][0]["started_head"] is None
+
+    runtime.bootstrap(requirement_id, development_request="修改 README")
+
+    assert store.load(requirement_id)["sessions"][0]["started_head"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
 def test_black_box_c_multiple_requirements_returns_ambiguity_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -215,6 +251,82 @@ def test_finalize_runs_known_verification_and_automates_review_handoff_detach(
     assert data["meta"]["status"] != "done"
 
 
+def test_stop_auto_finishes_only_after_thread_commit_is_clean_and_pushed(
+    tmp_path: Path,
+) -> None:
+    _init_git(tmp_path)
+    initialize_project(tmp_path)
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "initialize ai dev os")
+    _add_remote_and_push(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Auto finish")
+    tasks = FakeTasks()
+    archived: list[str] = []
+    agent = CodexAgentProvider(
+        environ={"CODEX_THREAD_ID": "thread-pushed"},
+        archive_runner=archived.append,
+    )
+    runtime = AutomationRuntime(store, agent, tasks)  # type: ignore[arg-type]
+    runtime.bootstrap(requirement_id, development_request="修改 README")
+
+    unchanged = runtime.auto_finish_pushed_thread()
+    assert unchanged.completed is False
+    assert "没有产生新提交" in unchanged.reason
+
+    (tmp_path / "README.md").write_text("updated\n", encoding="utf-8")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "update readme")
+    unpushed = runtime.auto_finish_pushed_thread()
+    assert unpushed.completed is False
+    assert "上游完全同步" in unpushed.reason
+    assert tasks.get_task("TASK-001").status == "in_progress"
+
+    _git(tmp_path, "push")
+    completed = runtime.auto_finish_pushed_thread()
+
+    assert completed.completed is True
+    assert completed.task_ids == ("TASK-001",)
+    assert tasks.get_task("TASK-001").status == "done"
+    assert archived == ["thread-pushed"]
+    assert tasks.unlinks == [("TASK-001", "thread-pushed")]
+    assert store.load(requirement_id)["sessions"][0]["result"] == "completed"
+    assert store.load(requirement_id)["meta"]["status"] != "done"
+
+
+def test_stop_auto_finish_can_be_disabled(tmp_path: Path) -> None:
+    _init_git(tmp_path)
+    (tmp_path / ".ai-dev-os.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "automation": {"auto_finish_pushed_thread": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Disabled auto finish")
+    tasks = FakeTasks()
+    archived: list[str] = []
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(
+            environ={"CODEX_THREAD_ID": "thread-disabled"},
+            archive_runner=archived.append,
+        ),
+        tasks,  # type: ignore[arg-type]
+    )
+    runtime.bootstrap(requirement_id, development_request="修改 README")
+
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert "已关闭" in result.reason
+    assert tasks.get_task("TASK-001").status == "in_progress"
+    assert archived == []
+
+
 def test_project_discovery_walks_up_to_workspace(tmp_path: Path) -> None:
     WorkspaceStore(tmp_path).create("Discover")
     nested = tmp_path / "src" / "package"
@@ -226,7 +338,12 @@ def test_project_discovery_walks_up_to_workspace(tmp_path: Path) -> None:
 def test_repo_hook_config_and_script_drive_session_lifecycle(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     hook_config = json.loads((repo_root / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert set(hook_config["hooks"]) == {"SessionStart", "UserPromptSubmit", "SessionEnd"}
+    assert set(hook_config["hooks"]) == {
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "SessionEnd",
+    }
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Hook lifecycle")
     script = repo_root / ".codex" / "hooks" / "workspace_runtime.py"

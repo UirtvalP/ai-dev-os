@@ -45,6 +45,7 @@ def attach_session(
     agent_name: str,
     task_provider: TaskProvider | None = None,
     task_ids: Sequence[str] = (),
+    head_commit: str | None = None,
 ) -> None:
     """幂等注册 Session，并只建立尚不存在的外部 Task 绑定。"""
 
@@ -61,6 +62,8 @@ def attach_session(
         existing["ended_at"] = None
         existing["result"] = "in_progress"
         existing["task_ids"] = list(dict.fromkeys([*previous, *normalized]))
+        if head_commit and not existing.get("started_head"):
+            existing["started_head"] = head_commit
     else:
         sessions.append(
             {
@@ -69,6 +72,7 @@ def attach_session(
                 "started_at": timestamp,
                 "ended_at": None,
                 "task_ids": normalized,
+                "started_head": head_commit,
                 "result": "in_progress",
             }
         )

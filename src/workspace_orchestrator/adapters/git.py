@@ -45,6 +45,40 @@ class LocalGitProvider:
     def current_branch(self) -> str | None:
         return self._run("branch", "--show-current") or None
 
+    def push_status(self) -> dict[str, object]:
+        """返回判断当前提交是否完整推送所需的确定性事实。"""
+
+        status = self.status()
+        head = self._run("rev-parse", "HEAD")
+        result: dict[str, object] = {
+            **status,
+            "head": head,
+            "upstream": None,
+            "upstream_head": None,
+            "ahead": None,
+            "behind": None,
+            "pushed": False,
+        }
+        try:
+            upstream = self._run(
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
+            )
+            upstream_head = self._run("rev-parse", "@{upstream}")
+            counts = self._run("rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+            ahead_text, behind_text = counts.split()
+        except (GitError, ValueError):
+            return result
+        result.update(
+            {
+                "upstream": upstream,
+                "upstream_head": upstream_head,
+                "ahead": int(ahead_text),
+                "behind": int(behind_text),
+                "pushed": bool(status["clean"]) and head == upstream_head,
+            }
+        )
+        return result
+
     def create_branch(self, name: str) -> None:
         self._run("branch", name)
 

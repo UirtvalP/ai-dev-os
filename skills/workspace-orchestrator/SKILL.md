@@ -47,10 +47,10 @@ workspace finalize REQ-ID \
   --next-action "下一步行动"
 ```
 
-Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。
+Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。项目配置 `automation.auto_finish_pushed_thread` 开启时，`Stop` Hook 还会在当前 Thread 启动后产生新提交、工作树干净且 HEAD 与上游一致后，确定性地把关联开发 Task 标记为 `done` 并归档 Thread；这不会自动完成 Requirement。
 
 `workspace handoff REQ-ID` 保留为显式中途交接兼容命令；完整实现结束优先使用 `finalize`。
 
-运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。未经用户明确批准，不得将需求或 Dashi Issue（事项）标记为 `done`。
+运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。未经用户明确批准，不得将 Requirement 或专用 Review Issue 标记为 `done`；已推送自动收尾只适用于当前 Thread 绑定的开发 Task。
 
 核心项目规则和 V1 范围记录在 `V1架构.md` 中。持久化状态由工作区系统负责；本 Skill 只负责遵循并更新这些状态。
