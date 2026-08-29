@@ -87,11 +87,16 @@ cd existing-project
 ai-dev-os init
 ```
 
-该命令只补充项目级接入文件，并保留已有内容；重复执行不会重复写入。它会创建
-`.ai-dev-os.json`，默认配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，但不会创建
+该命令会幂等创建用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`，并只在项目中补充项目级接入文件；
+重复执行不会覆盖已有用户原则。旧项目根目录中的 `USER_PRINCIPLES.md` 会保留，并仅在用户级文件
+尚不存在时作为首次迁移来源，运行时此后只读取用户级文件。项目中会创建 `.ai-dev-os.json`，默认
+配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，但不会创建
 Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使用
 `workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
 `ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
+
+当前用户层只有固定位置的 `USER_PRINCIPLES.md`，没有需要持久化的用户级开关，因此不创建
+`~/.ai-dev-os/config.json`；未来只有出现真实用户级配置需求时才扩展该文件。
 
 只有版本说明明确指出项目持久格式发生变化时，才对相应项目执行迁移：
 
@@ -101,8 +106,8 @@ ai-dev-os migrate
 ai-dev-os migrate path/to/existing-project
 ```
 
-`migrate` 会在写入前预检所有目标，然后幂等更新 AGENTS 托管区块、Codex Hooks、项目配置和
-受控忽略规则。非托管用户内容、未知配置字段以及显式关闭项会保持不变；预检失败时返回可读错误，
+`migrate` 会在写入前预检所有目标，然后幂等更新用户级原则、AGENTS 托管区块、Codex Hooks、
+项目配置和受控忽略规则。非托管用户内容、未知配置字段以及显式关闭项会保持不变；预检失败时返回可读错误，
 不会留下部分迁移状态。普通 CLI 功能更新不需要运行此命令；未接入项目仍应先使用
 `ai-dev-os init`。
 

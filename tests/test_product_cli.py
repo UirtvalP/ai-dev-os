@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from workspace_orchestrator import product_cli
+from workspace_orchestrator import product_cli, user_config
 from workspace_orchestrator.adapters.package import ToolInstallerError, ToolUpgradeResult
 from workspace_orchestrator.product_cli import main
 from workspace_orchestrator.project_config import default_task_project_id
@@ -27,7 +27,9 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
     assert "AI Dev OS 已接入" in output
     assert "workspace new" in output
     assert (tmp_path / "AGENTS.md").is_file()
-    assert (tmp_path / "USER_PRINCIPLES.md").is_file()
+    assert not (tmp_path / "USER_PRINCIPLES.md").exists()
+    assert user_config.user_principles_path().is_file()
+    assert "跨项目、长期有效" in user_config.user_principles_path().read_text(encoding="utf-8")
     assert (tmp_path / "PROJECT_INTENT.md").is_file()
     config = json.loads((tmp_path / ".ai-dev-os.json").read_text(encoding="utf-8"))
     assert config["task_provider"] == "dashi"
@@ -44,10 +46,11 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
 
 def test_init_preserves_existing_content_and_is_idempotent(tmp_path: Path, capsys) -> None:
     agents = tmp_path / "AGENTS.md"
-    principles = tmp_path / "USER_PRINCIPLES.md"
+    principles = user_config.user_principles_path()
     intent = tmp_path / "PROJECT_INTENT.md"
     gitignore = tmp_path / ".gitignore"
     agents.write_text("# Existing instructions\n", encoding="utf-8")
+    principles.parent.mkdir(parents=True)
     principles.write_text("# My principles\n", encoding="utf-8")
     intent.write_text("# My intent\n", encoding="utf-8")
     gitignore.write_text(".env\n", encoding="utf-8")
@@ -73,7 +76,8 @@ def test_init_preserves_existing_content_and_is_idempotent(tmp_path: Path, capsy
     assert principles.read_text(encoding="utf-8") == "# My principles\n"
     assert intent.read_text(encoding="utf-8") == "# My intent\n"
     assert gitignore.read_text(encoding="utf-8").startswith(".env\n")
-    assert "已保留：AGENTS.md, USER_PRINCIPLES.md, PROJECT_INTENT.md, .gitignore" in second_output
+    assert "~/.ai-dev-os/USER_PRINCIPLES.md" in second_output
+    assert "已保留" in second_output
 
 
 def test_init_rejects_missing_directory(tmp_path: Path, capsys) -> None:
@@ -83,6 +87,40 @@ def test_init_rejects_missing_directory(tmp_path: Path, capsys) -> None:
 
     assert "项目目录不存在" in capsys.readouterr().err
     assert not missing.exists()
+
+
+def test_init_promotes_legacy_project_principles_once(tmp_path: Path) -> None:
+    legacy = tmp_path / "USER_PRINCIPLES.md"
+    legacy.write_text("# 我的跨项目原则\n", encoding="utf-8")
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    assert user_config.user_principles_path().read_text(encoding="utf-8") == "# 我的跨项目原则\n"
+    assert legacy.read_text(encoding="utf-8") == "# 我的跨项目原则\n"
+
+
+def test_init_never_overwrites_global_principles_from_project(tmp_path: Path) -> None:
+    global_principles = user_config.user_principles_path()
+    global_principles.parent.mkdir(parents=True)
+    global_principles.write_text("# 全局原则\n", encoding="utf-8")
+    (tmp_path / "USER_PRINCIPLES.md").write_text("# 旧项目原则\n", encoding="utf-8")
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    assert global_principles.read_text(encoding="utf-8") == "# 全局原则\n"
+
+
+def test_init_rejects_invalid_user_config_root_before_project_writes(
+    tmp_path: Path, capsys
+) -> None:
+    user_config.user_config_root().write_text("不是目录", encoding="utf-8")
+
+    assert main(["init", str(tmp_path)]) == 2
+
+    assert "用户级配置路径不是目录" in capsys.readouterr().err
+    assert user_config.user_config_root().read_text(encoding="utf-8") == "不是目录"
+    assert not (tmp_path / "AGENTS.md").exists()
+    assert not (tmp_path / "PROJECT_INTENT.md").exists()
 
 
 def test_init_rejects_incomplete_managed_block(tmp_path: Path, capsys) -> None:
@@ -183,6 +221,7 @@ def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> N
     assert "已更新：AGENTS.md" in output
     assert "全局安装的 `ai-dev-os hook`" in content
     assert "运行时契约" in content
+    assert "~/.ai-dev-os/USER_PRINCIPLES.md" in content
     assert "旧的手工 bootstrap 指引" not in content
 
 
@@ -213,7 +252,17 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
     ai_dev_os = scripts / ("ai-dev-os.exe" if os.name == "nt" else "ai-dev-os")
     workspace = scripts / ("workspace.exe" if os.name == "nt" else "workspace")
 
-    subprocess.run([str(ai_dev_os), "init", str(project)], check=True, capture_output=True)
+    isolated_home = tmp_path / "user-home"
+    isolated_home.mkdir()
+    subprocess_env = os.environ.copy()
+    subprocess_env["HOME"] = str(isolated_home)
+    subprocess_env["USERPROFILE"] = str(isolated_home)
+    subprocess.run(
+        [str(ai_dev_os), "init", str(project)],
+        check=True,
+        capture_output=True,
+        env=subprocess_env,
+    )
     subprocess.run(
         [str(workspace), "--root", str(project), "new", "Wheel hook"],
         check=True,
@@ -232,12 +281,16 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
         encoding="utf-8",
         capture_output=True,
         check=True,
+        env=subprocess_env,
     )
 
     hooks = json.loads((project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "REQ-001" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "AI Dev OS 运行时契约" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "~/.ai-dev-os/USER_PRINCIPLES.md" in result.stdout
     assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "ai-dev-os hook"
+    assert (isolated_home / ".ai-dev-os" / "USER_PRINCIPLES.md").is_file()
+    assert not (project / "USER_PRINCIPLES.md").exists()
     assert not (project / "src").exists()
     assert not (project / ".venv").exists()
     assert shutil.which("python", path=str(project)) is None
@@ -365,7 +418,8 @@ def test_migrate_updates_managed_content_and_preserves_user_configuration(
         if path.is_file()
     }
     assert first == second
-    assert "已保留：AGENTS.md" in second_output
+    assert "已保留" in second_output
+    assert "AGENTS.md" in second_output
 
 
 def test_migrate_preflight_failure_leaves_all_targets_unchanged(

@@ -378,7 +378,11 @@ def test_checkpoint_and_handoff_restore_across_sessions(
 
 
 def test_resume_restores_concise_intent_summaries(tmp_path: Path) -> None:
-    (tmp_path / "USER_PRINCIPLES.md").write_text(
+    from workspace_orchestrator.user_config import user_principles_path
+
+    principles = user_principles_path()
+    principles.parent.mkdir(parents=True)
+    principles.write_text(
         "# User Principles\n\n## Execute Small Work\n\n"
         "Summary: Make local fixes directly.\n\n"
         "This long explanation must not be copied into the snapshot.\n",
@@ -403,6 +407,28 @@ def test_resume_restores_concise_intent_summaries(tmp_path: Path) -> None:
     assert "需求意图：\n- 原因：避免交接后重复分析。" in snapshot
     assert "long explanation" not in snapshot
     assert "project-level detail" not in snapshot
+
+
+def test_resume_ignores_legacy_project_principles(tmp_path: Path) -> None:
+    from workspace_orchestrator.user_config import user_principles_path
+
+    principles = user_principles_path()
+    principles.parent.mkdir(parents=True)
+    principles.write_text(
+        "# User Principles\n\n## Global\n\nSummary: Use global principles.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "USER_PRINCIPLES.md").write_text(
+        "# User Principles\n\n## Legacy\n\nSummary: Use project principles.\n",
+        encoding="utf-8",
+    )
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Global principles")
+
+    snapshot = build_snapshot(store, requirement_id)
+
+    assert "Global：Use global principles." in snapshot
+    assert "project principles" not in snapshot
 
 
 def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

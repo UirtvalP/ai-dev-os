@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import user_config
 from .project_config import CONFIG_NAME, initialized_project_config, load_project_config
 from .workspace import WorkspaceError, WorkspaceStore
 
@@ -23,21 +24,9 @@ AGENTS_BLOCK = f"""{AGENTS_START}
   不要复制或固化特定版本的运行时步骤。
 - Hook 未启用或未受信任时，只回退执行一次 `workspace bootstrap --request "<当前开发请求>"`；
   请求包含明确的 `REQ-<数字>` 或 Task ID 时原样传入。
-- 必须阅读 `USER_PRINCIPLES.md`、`PROJECT_INTENT.md` 和当前需求的 `intent.md`。
+- 必须阅读用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`、项目级 `PROJECT_INTENT.md` 和当前需求的 `intent.md`。
 - 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
 {AGENTS_END}
-"""
-
-USER_PRINCIPLES = """# 用户原则
-
-记录适用于本项目所有需求的长期工作偏好。除非当前需求明确记录合理例外，否则这些原则均为强制约束。
-
-## 默认原则
-
-- 优先采用能够安全完成任务的最轻工作流。
-- 保留现有用户文件和人类可读的本地状态。
-- 避免未经需求证实的抽象、集成与自动化。
-- 技术正确但违反已记录意图的修改不算完成。
 """
 
 PROJECT_INTENT = """# 项目意图
@@ -264,6 +253,30 @@ def _create_if_missing(path: Path, content: str) -> str:
     return "created"
 
 
+def _validate_user_principles_path() -> None:
+    path = user_config.user_principles_path()
+    if path.parent.exists() and not path.parent.is_dir():
+        raise WorkspaceError(f"用户级配置路径不是目录：{path.parent}")
+    _validate_file(path)
+
+
+def _ensure_user_principles(project_root: Path) -> str:
+    """创建唯一用户级原则；旧项目文件仅作为首次迁移来源。"""
+
+    path = user_config.user_principles_path()
+    if path.exists():
+        return "preserved"
+    legacy_path = project_root / user_config.USER_PRINCIPLES_NAME
+    content = (
+        legacy_path.read_text(encoding="utf-8")
+        if legacy_path.is_file()
+        else user_config.DEFAULT_USER_PRINCIPLES
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    WorkspaceStore.write_text(path, content)
+    return "created"
+
+
 def _ensure_gitignore(path: Path) -> str:
     """仅补充缺少的本地状态规则，不复制项目已有规则。"""
 
@@ -295,7 +308,6 @@ def _apply_current_project_files(resolved: Path) -> InitResult:
 
     targets = {
         "AGENTS.md": (AGENTS_START, AGENTS_END),
-        "USER_PRINCIPLES.md": (None, None),
         "PROJECT_INTENT.md": (None, None),
         ".gitignore": (GITIGNORE_START, GITIGNORE_END),
     }
@@ -306,12 +318,13 @@ def _apply_current_project_files(resolved: Path) -> InitResult:
         raise WorkspaceError(f"目标不是目录：{codex_dir}")
     _validate_hooks(codex_dir / "hooks.json")
     _validate_project_config(resolved / CONFIG_NAME)
+    _validate_user_principles_path()
 
     outcomes = {
+        user_config.USER_PRINCIPLES_DISPLAY_PATH: _ensure_user_principles(resolved),
         "AGENTS.md": _append_managed_block(
             resolved / "AGENTS.md", AGENTS_BLOCK, AGENTS_START, AGENTS_END
         ),
-        "USER_PRINCIPLES.md": _create_if_missing(resolved / "USER_PRINCIPLES.md", USER_PRINCIPLES),
         "PROJECT_INTENT.md": _create_if_missing(resolved / "PROJECT_INTENT.md", PROJECT_INTENT),
         ".gitignore": _ensure_gitignore(resolved / ".gitignore"),
         ".codex/hooks.json": _ensure_hooks(codex_dir / "hooks.json"),

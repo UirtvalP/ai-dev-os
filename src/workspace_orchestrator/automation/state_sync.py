@@ -14,6 +14,7 @@ from typing import Any
 from workspace_orchestrator.adapters.base import TaskProvider
 from workspace_orchestrator.adapters.task import TaskProviderError
 from workspace_orchestrator.intent import requirement_intent_summary, summarize_document
+from workspace_orchestrator.user_config import user_principles_path
 from workspace_orchestrator.workspace import (
     SECTION_LABELS,
     WorkspaceError,
@@ -63,7 +64,7 @@ def collect_snapshot(
     data = store.load(requirement_id)
     meta = data["meta"]
     requirement = markdown_sections(data["requirement"])
-    user_principles = summarize_document(store.working_root / "USER_PRINCIPLES.md")
+    user_principles = summarize_document(user_principles_path())
     project_intent = summarize_document(
         store.working_root / "PROJECT_INTENT.md",
         headings=(

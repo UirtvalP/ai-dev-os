@@ -5,7 +5,7 @@
   必要时补充中文解释。
 - V1 保持本地优先（local-first），使用 Python 3.11+。
 - 将 `V1架构.md` 作为 V1 范围与验收标准的依据。
-- 必须阅读 `USER_PRINCIPLES.md`、`PROJECT_INTENT.md` 和当前需求的 `intent.md`，
+- 必须阅读用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`、项目级 `PROJECT_INTENT.md` 和当前需求的 `intent.md`，
   并将其视为强制意图约束，而不是可选背景资料。
 - 默认采用能够安全完成任务的最轻工作流。
 - 在外部集成之前，优先完成恢复（Restore）、检查点（Checkpoint）、交接（Handoff）和上下文快照（Context Snapshot）。
@@ -27,6 +27,6 @@
   不要复制或固化特定版本的运行时步骤。
 - Hook 未启用或未受信任时，只回退执行一次 `workspace bootstrap --request "<当前开发请求>"`；
   请求包含明确的 `REQ-<数字>` 或 Task ID 时原样传入。
-- 必须阅读 `USER_PRINCIPLES.md`、`PROJECT_INTENT.md` 和当前需求的 `intent.md`。
+- 必须阅读用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`、项目级 `PROJECT_INTENT.md` 和当前需求的 `intent.md`。
 - 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
 <!-- ai-dev-os:end -->
