@@ -18,14 +18,14 @@ from .automation.dispatcher import (
 )
 from .automation.requirement_attach import discover_project_root
 from .hook_runtime import main as hook_main
-from .project_init import InitResult, initialize_project
+from .project_init import InitResult, initialize_project, upgrade_project
 from .workspace import WorkspaceError, WorkspaceStore
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-dev-os",
-        description="将现有项目接入 AI Dev OS。",
+        description="接入或升级项目的 AI Dev OS 配置。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -36,6 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path.cwd(),
         help="项目目录（默认：当前目录）",
+    )
+    upgrade_parser = commands.add_parser("upgrade", help="升级已接入项目的 AI Dev OS 配置")
+    upgrade_parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=Path.cwd(),
+        help="已接入的项目目录（默认：当前目录）",
     )
     commands.add_parser("hook", help=argparse.SUPPRESS)
     dispatcher = commands.add_parser(
@@ -59,15 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_result(result: InitResult) -> str:
-    lines = [f"AI Dev OS 已接入：{result.root}"]
+def _format_result(result: InitResult, *, action: str) -> str:
+    lines = [f"AI Dev OS {action}：{result.root}"]
     labels = (
         ("已创建", result.created),
         ("已更新", result.updated),
         ("已保留", result.preserved),
     )
     lines.extend(f"{label}：{', '.join(paths)}" for label, paths in labels if paths)
-    lines.append("下一步：使用 workspace new 创建首个 Requirement。")
+    if action == "已接入":
+        lines.append("下一步：使用 workspace new 创建首个 Requirement。")
     return "\n".join(lines)
 
 
@@ -82,7 +91,9 @@ def run(args: argparse.Namespace) -> str:
             if status.get("running") or status.get("status") == "starting"
             else f"\nDispatcher：{status.get('status', '未启动')}。"
         )
-        return _format_result(result) + suffix
+        return _format_result(result, action="已接入") + suffix
+    if args.command == "upgrade":
+        return _format_result(upgrade_project(args.path), action="已升级")
     if args.command == "dispatcher":
         execution_root = args.root.expanduser().resolve()
         project_root = discover_project_root(execution_root)

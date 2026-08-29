@@ -8,7 +8,12 @@ from pathlib import Path
 
 from workspace_orchestrator.product_cli import main
 from workspace_orchestrator.project_config import default_task_project_id
-from workspace_orchestrator.project_init import AGENTS_START, GITIGNORE_START
+from workspace_orchestrator.project_init import (
+    AGENTS_END,
+    AGENTS_START,
+    GITIGNORE_START,
+    initialize_project,
+)
 
 
 def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Path, capsys) -> None:
@@ -257,3 +262,116 @@ def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path) -> None:
     stop_hook = hooks["hooks"]["Stop"][0]["hooks"][0]
     assert stop_hook["async"] is True
     assert stop_hook["timeout"] == 30
+
+
+def test_upgrade_requires_an_initialized_project(tmp_path: Path, capsys) -> None:
+    assert main(["upgrade", str(tmp_path)]) == 2
+
+    assert "尚未通过 ai-dev-os init 接入" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upgrade_updates_managed_content_and_preserves_user_configuration(
+    tmp_path: Path, capsys
+) -> None:
+    initialize_project(tmp_path)
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        agents.read_text(encoding="utf-8").replace(
+            f"{AGENTS_START}\n## AI Dev OS",
+            f"{AGENTS_START}\n旧版托管说明",
+        )
+        + "\n# 用户补充说明\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".ai-dev-os.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    del config["dispatcher_poll_seconds"]
+    config["auto_execute_in_progress"] = False
+    config["custom_option"] = {"keep": True}
+    config["automation"] = {
+        "auto_finish_pushed_thread": False,
+        "custom_automation": "keep",
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    hooks["hooks"]["UserPromptSubmit"].append(
+        {"hooks": [{"type": "command", "command": "user-hook"}]}
+    )
+    hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
+
+    assert main(["upgrade", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    upgraded_agents = agents.read_text(encoding="utf-8")
+    upgraded_config = json.loads(config_path.read_text(encoding="utf-8"))
+    upgraded_hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert "AI Dev OS 已升级" in output
+    assert "已更新：AGENTS.md" in output
+    assert upgraded_agents.count(AGENTS_START) == 1
+    assert "旧版托管说明" not in upgraded_agents
+    assert "# 用户补充说明" in upgraded_agents
+    assert upgraded_config["dispatcher_poll_seconds"] == 2.0
+    assert upgraded_config["auto_execute_in_progress"] is False
+    assert upgraded_config["automation"]["auto_finish_pushed_thread"] is False
+    assert upgraded_config["automation"]["custom_automation"] == "keep"
+    assert upgraded_config["custom_option"] == {"keep": True}
+    assert upgraded_hooks["hooks"]["UserPromptSubmit"][1]["hooks"][0]["command"] == "user-hook"
+
+    first = {
+        str(path.relative_to(tmp_path)): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert main(["upgrade", str(tmp_path)]) == 0
+    second_output = capsys.readouterr().out
+    second = {
+        str(path.relative_to(tmp_path)): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert first == second
+    assert "已保留：AGENTS.md" in second_output
+
+
+def test_upgrade_preflight_failure_leaves_all_targets_unchanged(
+    tmp_path: Path, capsys
+) -> None:
+    config_path = tmp_path / ".ai-dev-os.json"
+    original_config = {
+        "schema_version": 1,
+        "task_provider": None,
+        "task_project_id": None,
+        "custom_option": "keep",
+    }
+    config_path.write_text(json.dumps(original_config), encoding="utf-8")
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(f"# 用户内容\n\n{AGENTS_START}\n", encoding="utf-8")
+
+    assert main(["upgrade", str(tmp_path)]) == 2
+
+    assert "不完整的 AI Dev OS 托管区块" in capsys.readouterr().err
+    assert json.loads(config_path.read_text(encoding="utf-8")) == original_config
+    assert agents.read_text(encoding="utf-8") == f"# 用户内容\n\n{AGENTS_START}\n"
+    assert not (tmp_path / ".codex").exists()
+    assert not (tmp_path / "USER_PRINCIPLES.md").exists()
+    assert AGENTS_END not in agents.read_text(encoding="utf-8")
+
+
+def test_upgrade_adds_missing_nested_defaults_without_replacing_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    initialize_project(tmp_path)
+    config_path = tmp_path / ".ai-dev-os.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["automation"] = {"custom_automation": "keep"}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert main(["upgrade", str(tmp_path)]) == 0
+
+    upgraded = json.loads(config_path.read_text(encoding="utf-8"))
+    assert upgraded["automation"] == {
+        "custom_automation": "keep",
+        "auto_finish_pushed_thread": True,
+    }

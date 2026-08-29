@@ -84,6 +84,19 @@ Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使
 `workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
 `ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
 
+安装新版 AI Dev OS 后，在已接入项目中显式升级托管文件与配置：
+
+```bash
+ai-dev-os upgrade
+# 也可以指定项目目录
+ai-dev-os upgrade path/to/existing-project
+```
+
+`upgrade` 会在写入前预检所有目标，然后幂等更新 AGENTS 托管区块、Codex Hooks、项目配置和
+受控忽略规则。非托管用户内容、未知配置字段以及显式关闭项会保持不变；预检失败时返回可读错误，
+不会留下部分升级状态。该命令只升级项目接入内容，不更新 Python、Codex、dashi-taskboard 或
+AI Dev OS 安装包本身。未接入项目仍应先使用 `ai-dev-os init`。
+
 Dispatcher 的默认配置写在 `.ai-dev-os.json`：
 
 ```json

@@ -121,10 +121,14 @@ def _validate_file(path: Path, start: str | None = None, end: str | None = None)
     if start is None or end is None:
         return
     content = path.read_text(encoding="utf-8")
-    has_start = start in content
-    has_end = end in content
-    if has_start != has_end:
+    start_count = content.count(start)
+    end_count = content.count(end)
+    if start_count != end_count:
         raise WorkspaceError(f"检测到不完整的 AI Dev OS 托管区块：{path}")
+    if start_count > 1:
+        raise WorkspaceError(f"检测到重复的 AI Dev OS 托管区块：{path}")
+    if start_count == 1 and content.index(start) > content.index(end):
+        raise WorkspaceError(f"检测到顺序无效的 AI Dev OS 托管区块：{path}")
 
 
 def _validate_hooks(path: Path) -> None:
@@ -207,11 +211,20 @@ def _ensure_project_config(root: Path) -> str:
         "dispatcher_poll_seconds",
         "codex_sandbox",
         "codex_model",
-        "automation",
     ):
         if key not in current:
             current[key] = desired[key]
             changed = True
+    if "automation" not in current:
+        current["automation"] = desired["automation"]
+        changed = True
+    else:
+        current_automation = current["automation"]
+        desired_automation = desired["automation"]
+        for key, value in desired_automation.items():
+            if key not in current_automation:
+                current_automation[key] = value
+                changed = True
     if changed:
         WorkspaceStore.write_text(
             path,
@@ -278,14 +291,17 @@ def _ensure_gitignore(path: Path) -> str:
     return _append_managed_block(path, block, GITIGNORE_START, GITIGNORE_END)
 
 
-def initialize_project(root: Path) -> InitResult:
-    """在不创建 Requirement Workspace 的前提下接入一个现有项目。"""
-
+def _resolve_project_root(root: Path) -> Path:
     resolved = root.expanduser().resolve()
     if not resolved.exists():
         raise WorkspaceError(f"项目目录不存在：{resolved}")
     if not resolved.is_dir():
         raise WorkspaceError(f"项目路径不是目录：{resolved}")
+    return resolved
+
+
+def _apply_current_project_files(resolved: Path) -> InitResult:
+    """预检全部目标后，将受控接入内容更新到当前版本。"""
 
     targets = {
         "AGENTS.md": (AGENTS_START, AGENTS_END),
@@ -317,3 +333,20 @@ def initialize_project(root: Path) -> InitResult:
         updated=tuple(name for name, outcome in outcomes.items() if outcome == "updated"),
         preserved=tuple(name for name, outcome in outcomes.items() if outcome == "preserved"),
     )
+
+
+def initialize_project(root: Path) -> InitResult:
+    """在不创建 Requirement Workspace 的前提下接入一个现有项目。"""
+
+    return _apply_current_project_files(_resolve_project_root(root))
+
+
+def upgrade_project(root: Path) -> InitResult:
+    """将已接入项目的托管文件与配置安全升级到当前版本。"""
+
+    resolved = _resolve_project_root(root)
+    if not (resolved / CONFIG_NAME).exists():
+        raise WorkspaceError(
+            f"项目尚未通过 ai-dev-os init 接入，无法升级：{resolved}"
+        )
+    return _apply_current_project_files(resolved)
