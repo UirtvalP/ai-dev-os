@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .adapters.agent import CodexExecProvider
+from .adapters.package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
 from .automation.dispatcher import (
     AutoDispatcher,
     dispatcher_status,
@@ -18,14 +19,16 @@ from .automation.dispatcher import (
 )
 from .automation.requirement_attach import discover_project_root
 from .hook_runtime import main as hook_main
-from .project_init import InitResult, initialize_project, upgrade_project
+from .project_init import InitResult, initialize_project, migrate_project
 from .workspace import WorkspaceError, WorkspaceStore
+
+DEFAULT_UPGRADE_SOURCE = "git+https://github.com/UirtvalP/ai-dev-os.git"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-dev-os",
-        description="接入或升级项目的 AI Dev OS 配置。",
+        description="管理全局 AI Dev OS CLI 与项目接入。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -37,8 +40,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="项目目录（默认：当前目录）",
     )
-    upgrade_parser = commands.add_parser("upgrade", help="升级已接入项目的 AI Dev OS 配置")
+    upgrade_parser = commands.add_parser("upgrade", help="更新全局 AI Dev OS CLI")
     upgrade_parser.add_argument(
+        "--source",
+        default=DEFAULT_UPGRADE_SOURCE,
+        help="安装来源（默认：AI Dev OS 官方 Git 仓库）",
+    )
+    migrate_parser = commands.add_parser("migrate", help="迁移已接入项目的持久文件格式")
+    migrate_parser.add_argument(
         "path",
         nargs="?",
         type=Path,
@@ -80,6 +89,17 @@ def _format_result(result: InitResult, *, action: str) -> str:
     return "\n".join(lines)
 
 
+def _format_upgrade_result(result: ToolUpgradeResult) -> str:
+    state = "更新已安排" if result.scheduled else "已更新"
+    lines = [f"AI Dev OS 全局 CLI {state}。", f"来源：{result.source}"]
+    if result.details:
+        lines.append(result.details)
+    if result.result_path:
+        lines.append(f"结果日志：{result.result_path}")
+    lines.append("更新完成后，后续 ai-dev-os、workspace 与项目 Hook 调用将使用新版本能力。")
+    return "\n".join(lines)
+
+
 def run(args: argparse.Namespace) -> str:
     if args.command == "init":
         result = initialize_project(args.path)
@@ -93,7 +113,9 @@ def run(args: argparse.Namespace) -> str:
         )
         return _format_result(result, action="已接入") + suffix
     if args.command == "upgrade":
-        return _format_result(upgrade_project(args.path), action="已升级")
+        return _format_upgrade_result(UvToolInstaller().upgrade(args.source))
+    if args.command == "migrate":
+        return _format_result(migrate_project(args.path), action="项目格式已迁移")
     if args.command == "dispatcher":
         execution_root = args.root.expanduser().resolve()
         project_root = discover_project_root(execution_root)
@@ -122,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 WorkspaceStore(project_root, execution_root=execution_root)
             )
         output = run(args)
-    except (OSError, UnicodeError, WorkspaceError) as exc:
+    except (OSError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     print(output)

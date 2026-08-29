@@ -6,6 +6,7 @@ import pytest
 
 from workspace_orchestrator.adapters.agent import CodexAgentProvider, CodexExecProvider
 from workspace_orchestrator.adapters.git import LocalGitProvider
+from workspace_orchestrator.adapters.package import ToolInstallerError, UvToolInstaller
 from workspace_orchestrator.adapters.task import DashiTaskProvider, TaskProviderError
 from workspace_orchestrator.context import build_snapshot, handoff
 from workspace_orchestrator.models import Task
@@ -14,6 +15,53 @@ from workspace_orchestrator.workspace import WorkspaceStore
 
 def _git(path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+
+
+def test_uv_tool_installer_reinstalls_global_cli_from_explicit_source() -> None:
+    commands: list[list[str]] = []
+
+    def runner(command):
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="Installed ai-dev-os", stderr="")
+
+    result = UvToolInstaller(
+        executable="uv-test", runner=runner, platform="posix"
+    ).upgrade("local-source")
+
+    assert commands == [
+        ["uv-test", "tool", "install", "--force", "--refresh", "--", "local-source"]
+    ]
+    assert result.source == "local-source"
+    assert result.details == "Installed ai-dev-os"
+
+
+def test_uv_tool_installer_reports_command_failure() -> None:
+    def runner(command):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="source missing")
+
+    with pytest.raises(ToolInstallerError, match="source missing"):
+        UvToolInstaller(
+            executable="uv-test", runner=runner, platform="posix"
+        ).upgrade("broken-source")
+
+
+def test_uv_tool_installer_schedules_windows_update_after_cli_exit(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    result_path = tmp_path / "upgrade.log"
+
+    def scheduler(executable: str, source: str) -> Path:
+        calls.append((executable, source))
+        return result_path
+
+    result = UvToolInstaller(
+        executable="uv-test",
+        scheduler=scheduler,
+        platform="nt",
+    ).upgrade("local-source")
+
+    assert calls == [("uv-test", "local-source")]
+    assert result.scheduled is True
+    assert result.result_path == result_path
 
 
 def test_local_git_provider_reports_repository_state(tmp_path: Path) -> None:

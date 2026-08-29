@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from workspace_orchestrator import product_cli
+from workspace_orchestrator.adapters.package import ToolInstallerError, ToolUpgradeResult
 from workspace_orchestrator.product_cli import main
 from workspace_orchestrator.project_config import default_task_project_id
 from workspace_orchestrator.project_init import (
@@ -179,8 +181,8 @@ def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> N
     output = capsys.readouterr().out
     content = agents.read_text(encoding="utf-8")
     assert "已更新：AGENTS.md" in output
-    assert "SessionStart" in content
-    assert "workspace finalize REQ-ID" in content
+    assert "全局安装的 `ai-dev-os hook`" in content
+    assert "运行时契约" in content
     assert "旧的手工 bootstrap 指引" not in content
 
 
@@ -234,6 +236,7 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
 
     hooks = json.loads((project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "REQ-001" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "AI Dev OS 运行时契约" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "ai-dev-os hook"
     assert not (project / "src").exists()
     assert not (project / ".venv").exists()
@@ -264,14 +267,44 @@ def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path) -> None:
     assert stop_hook["timeout"] == 30
 
 
-def test_upgrade_requires_an_initialized_project(tmp_path: Path, capsys) -> None:
-    assert main(["upgrade", str(tmp_path)]) == 2
+def test_global_upgrade_uses_configured_source(monkeypatch, capsys) -> None:
+    calls: list[str] = []
+
+    class FakeInstaller:
+        def upgrade(self, source: str) -> ToolUpgradeResult:
+            calls.append(source)
+            return ToolUpgradeResult(source, "Resolved 1 package")
+
+    monkeypatch.setattr(product_cli, "UvToolInstaller", FakeInstaller)
+
+    assert main(["upgrade", "--source", "D:/releases/ai-dev-os.whl"]) == 0
+
+    output = capsys.readouterr().out
+    assert calls == ["D:/releases/ai-dev-os.whl"]
+    assert "AI Dev OS 全局 CLI 已更新" in output
+    assert "更新完成后，后续 ai-dev-os、workspace 与项目 Hook 调用将使用新版本能力" in output
+
+
+def test_global_upgrade_reports_installer_failure(monkeypatch, capsys) -> None:
+    class FailingInstaller:
+        def upgrade(self, source: str) -> ToolUpgradeResult:
+            raise ToolInstallerError(f"无法安装：{source}")
+
+    monkeypatch.setattr(product_cli, "UvToolInstaller", FailingInstaller)
+
+    assert main(["upgrade", "--source", "broken-source"]) == 2
+
+    assert "无法安装：broken-source" in capsys.readouterr().err
+
+
+def test_migrate_requires_an_initialized_project(tmp_path: Path, capsys) -> None:
+    assert main(["migrate", str(tmp_path)]) == 2
 
     assert "尚未通过 ai-dev-os init 接入" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
 
 
-def test_upgrade_updates_managed_content_and_preserves_user_configuration(
+def test_migrate_updates_managed_content_and_preserves_user_configuration(
     tmp_path: Path, capsys
 ) -> None:
     initialize_project(tmp_path)
@@ -301,13 +334,13 @@ def test_upgrade_updates_managed_content_and_preserves_user_configuration(
     )
     hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
 
-    assert main(["upgrade", str(tmp_path)]) == 0
+    assert main(["migrate", str(tmp_path)]) == 0
 
     output = capsys.readouterr().out
     upgraded_agents = agents.read_text(encoding="utf-8")
     upgraded_config = json.loads(config_path.read_text(encoding="utf-8"))
     upgraded_hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-    assert "AI Dev OS 已升级" in output
+    assert "AI Dev OS 项目格式已迁移" in output
     assert "已更新：AGENTS.md" in output
     assert upgraded_agents.count(AGENTS_START) == 1
     assert "旧版托管说明" not in upgraded_agents
@@ -324,7 +357,7 @@ def test_upgrade_updates_managed_content_and_preserves_user_configuration(
         for path in tmp_path.rglob("*")
         if path.is_file()
     }
-    assert main(["upgrade", str(tmp_path)]) == 0
+    assert main(["migrate", str(tmp_path)]) == 0
     second_output = capsys.readouterr().out
     second = {
         str(path.relative_to(tmp_path)): path.read_text(encoding="utf-8")
@@ -335,7 +368,7 @@ def test_upgrade_updates_managed_content_and_preserves_user_configuration(
     assert "已保留：AGENTS.md" in second_output
 
 
-def test_upgrade_preflight_failure_leaves_all_targets_unchanged(
+def test_migrate_preflight_failure_leaves_all_targets_unchanged(
     tmp_path: Path, capsys
 ) -> None:
     config_path = tmp_path / ".ai-dev-os.json"
@@ -349,7 +382,7 @@ def test_upgrade_preflight_failure_leaves_all_targets_unchanged(
     agents = tmp_path / "AGENTS.md"
     agents.write_text(f"# 用户内容\n\n{AGENTS_START}\n", encoding="utf-8")
 
-    assert main(["upgrade", str(tmp_path)]) == 2
+    assert main(["migrate", str(tmp_path)]) == 2
 
     assert "不完整的 AI Dev OS 托管区块" in capsys.readouterr().err
     assert json.loads(config_path.read_text(encoding="utf-8")) == original_config
@@ -359,7 +392,7 @@ def test_upgrade_preflight_failure_leaves_all_targets_unchanged(
     assert AGENTS_END not in agents.read_text(encoding="utf-8")
 
 
-def test_upgrade_adds_missing_nested_defaults_without_replacing_unknown_fields(
+def test_migrate_adds_missing_nested_defaults_without_replacing_unknown_fields(
     tmp_path: Path,
 ) -> None:
     initialize_project(tmp_path)
@@ -368,7 +401,7 @@ def test_upgrade_adds_missing_nested_defaults_without_replacing_unknown_fields(
     config["automation"] = {"custom_automation": "keep"}
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    assert main(["upgrade", str(tmp_path)]) == 0
+    assert main(["migrate", str(tmp_path)]) == 0
 
     upgraded = json.loads(config_path.read_text(encoding="utf-8"))
     assert upgraded["automation"] == {

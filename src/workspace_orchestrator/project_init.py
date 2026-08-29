@@ -18,23 +18,13 @@ HOOK_COMMAND = "ai-dev-os hook"
 AGENTS_BLOCK = f"""{AGENTS_START}
 ## AI Dev OS
 
-- 仓库级 Codex Hook 启用时，由 `SessionStart` / `UserPromptSubmit` 自动触发 bootstrap；
-  Agent 不得重复执行内部的 Session、Requirement、Task、dashi 或 Git 步骤。
-- Hook 未启用或未受信任时，只回退执行一次
-  `workspace bootstrap --request "<当前开发请求>"`。请求包含明确的 `REQ-<数字>` 或 Task ID
-  时，将它传给 bootstrap。
-- 将 Hook 或回退命令返回的 Context Snapshot 视为当前需求、状态、交接和下一步行动的事实来源。
+- `.codex/hooks.json` 调用全局安装的 `ai-dev-os hook`，更新一次 CLI 后运行时能力即全局生效。
+- Hook 动态注入的“AI Dev OS 运行时契约”和 Context Snapshot 是当前流程与状态的事实来源；
+  不要复制或固化特定版本的运行时步骤。
+- Hook 未启用或未受信任时，只回退执行一次 `workspace bootstrap --request "<当前开发请求>"`；
+  请求包含明确的 `REQ-<数字>` 或 Task ID 时原样传入。
 - 必须阅读 `USER_PRINCIPLES.md`、`PROJECT_INTENT.md` 和当前需求的 `intent.md`。
 - 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
-- 语义工作完成后只触发一次 `workspace finalize REQ-ID`；验证、checkpoint、Task review、
-  handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
-- 用户批准时使用 dashi 专用 Review 卡或 `workspace confirm REQ-ID --user-confirmed`；
-  用户要求修改时使用 Review 卡新增留言并退回，或执行 `workspace request-changes`。
-- dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或
-  恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。
-- `.ai-dev-os.json` 默认开启已推送 Thread 自动收尾。只有当前 Thread 启动后产生新提交、
-  工作树干净且 HEAD 与上游一致时，Runtime 才完成关联开发 Task 并归档 Thread；Requirement
-  不会自动完成。将 `automation.auto_finish_pushed_thread` 设为 `false` 可关闭。
 {AGENTS_END}
 """
 
@@ -341,12 +331,12 @@ def initialize_project(root: Path) -> InitResult:
     return _apply_current_project_files(_resolve_project_root(root))
 
 
-def upgrade_project(root: Path) -> InitResult:
-    """将已接入项目的托管文件与配置安全升级到当前版本。"""
+def migrate_project(root: Path) -> InitResult:
+    """只在持久格式确有变化时迁移已接入项目。"""
 
     resolved = _resolve_project_root(root)
     if not (resolved / CONFIG_NAME).exists():
         raise WorkspaceError(
-            f"项目尚未通过 ai-dev-os init 接入，无法升级：{resolved}"
+            f"项目尚未通过 ai-dev-os init 接入，无法迁移：{resolved}"
         )
     return _apply_current_project_files(resolved)

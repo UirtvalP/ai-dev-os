@@ -14,6 +14,7 @@ from .automation.requirement_attach import AutomationAmbiguity, discover_project
 from .automation.runtime import AutomationRuntime
 from .automation.session_runtime import end_session
 from .automation.task_attach import configured_task_provider
+from .runtime_contract import hook_context
 from .workspace import WorkspaceError, WorkspaceStore
 
 
@@ -116,5 +117,5 @@ def main() -> int:
         else:
             _emit(event_name, str(exc), system_message="Workspace 自动恢复未完成")
         return 0
-    _emit(event_name, snapshot)
+    _emit(event_name, hook_context(snapshot))
     return 0

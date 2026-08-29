@@ -22,7 +22,7 @@
             "type": "command",
             "command": "ai-dev-os hook",
             "commandWindows": "ai-dev-os hook",
-            "statusMessage": "自动绑定 Requirement、Task 与 Session",
+            "statusMessage": "自动恢复 AI Dev OS Workspace",
             "additionalContextLimit": 5000
           }
         ]

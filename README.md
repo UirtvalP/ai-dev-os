@@ -51,16 +51,25 @@ ROADMAP.md                    第一版实施路线图
 
 需要 Python 3.11+。
 
-从源码目录安装为用户级命令（推荐使用 `uv`）：
+从官方 Git 仓库安装为用户级命令（推荐使用 `uv`）：
 
 ```bash
-uv tool install .
+uv tool install "git+https://github.com/UirtvalP/ai-dev-os.git"
 ai-dev-os --version
 ```
 
 `uv` 会把 `ai-dev-os` 和 `workspace` 安装到用户 PATH 可发现的工具目录。安装后可以离开
 本仓库，在任意现有项目目录直接运行 `ai-dev-os init`。仅在项目虚拟环境中执行
 `pip install -e` 不会让其他目录自动找到该命令。
+
+更新一次全局 CLI，即可让所有通过稳定 Hook 入口接入的项目使用最新运行时能力：
+
+```bash
+ai-dev-os upgrade
+```
+
+`upgrade` 通过 uv 从官方 Git 来源重新安装全局工具，不扫描或改写项目。测试本地构建或离线包时，
+可用 `ai-dev-os upgrade --source <本地目录或 wheel>` 显式指定来源。
 
 开发本仓库时再使用 editable 环境：
 
@@ -84,18 +93,18 @@ Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使
 `workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
 `ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
 
-安装新版 AI Dev OS 后，在已接入项目中显式升级托管文件与配置：
+只有版本说明明确指出项目持久格式发生变化时，才对相应项目执行迁移：
 
 ```bash
-ai-dev-os upgrade
+ai-dev-os migrate
 # 也可以指定项目目录
-ai-dev-os upgrade path/to/existing-project
+ai-dev-os migrate path/to/existing-project
 ```
 
-`upgrade` 会在写入前预检所有目标，然后幂等更新 AGENTS 托管区块、Codex Hooks、项目配置和
+`migrate` 会在写入前预检所有目标，然后幂等更新 AGENTS 托管区块、Codex Hooks、项目配置和
 受控忽略规则。非托管用户内容、未知配置字段以及显式关闭项会保持不变；预检失败时返回可读错误，
-不会留下部分升级状态。该命令只升级项目接入内容，不更新 Python、Codex、dashi-taskboard 或
-AI Dev OS 安装包本身。未接入项目仍应先使用 `ai-dev-os init`。
+不会留下部分迁移状态。普通 CLI 功能更新不需要运行此命令；未接入项目仍应先使用
+`ai-dev-os init`。
 
 Dispatcher 的默认配置写在 `.ai-dev-os.json`：
 
@@ -130,7 +139,7 @@ ai-dev-os dispatcher run-once
 
 ```bash
 python -m pip wheel . --no-deps --wheel-dir dist
-uv tool install --force dist/ai_dev_os-0.1.0-py3-none-any.whl
+uv tool install --force dist/ai_dev_os-0.2.0-py3-none-any.whl
 ```
 
 当前仓库已经跑通 V1 的本地核心生命周期：

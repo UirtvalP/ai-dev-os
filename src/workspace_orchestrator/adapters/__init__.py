@@ -3,6 +3,7 @@
 from .agent import CodexAgentProvider, CodexExecProvider, CodexExecutionResult
 from .base import AgentProvider, GitProvider, KnowledgeProvider, TaskProvider
 from .git import GitError, LocalGitProvider
+from .package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
 from .task import DashiTaskProvider, TaskProviderError
 
 __all__ = [
@@ -17,4 +18,7 @@ __all__ = [
     "LocalGitProvider",
     "TaskProvider",
     "TaskProviderError",
+    "ToolInstallerError",
+    "ToolUpgradeResult",
+    "UvToolInstaller",
 ]

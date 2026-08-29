@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+from .runtime_contract import hook_context
+
 
 def _project_root(cwd: str) -> Path:
     current = Path(cwd).resolve()
@@ -116,7 +118,7 @@ def main() -> int:
         else:
             _emit(event_name, str(exc), system_message="Workspace 自动恢复未完成")
         return 0
-    _emit(event_name, snapshot)
+    _emit(event_name, hook_context(snapshot))
     return 0
 
 
