@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from . import __version__
+from .adapters.agent import CodexExecProvider
+from .automation.dispatcher import (
+    AutoDispatcher,
+    dispatcher_status,
+    serve_dispatcher,
+    start_dispatcher,
+    stop_dispatcher,
+)
+from .automation.requirement_attach import discover_project_root
+from .hook_runtime import main as hook_main
 from .project_init import InitResult, initialize_project
-from .workspace import WorkspaceError
+from .workspace import WorkspaceError, WorkspaceStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +37,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="项目目录（默认：当前目录）",
     )
+    commands.add_parser("hook", help=argparse.SUPPRESS)
+    dispatcher = commands.add_parser(
+        "dispatcher", help="管理 dashi → Codex 自动执行 Dispatcher"
+    )
+    dispatcher_commands = dispatcher.add_subparsers(dest="dispatcher_command", required=True)
+    for name, help_text in (
+        ("start", "启动后台 Dispatcher"),
+        ("stop", "停止后台 Dispatcher"),
+        ("status", "查看 Dispatcher 状态"),
+        ("run-once", "同步检查一次并处理至多一个 Task"),
+        ("serve", argparse.SUPPRESS),
+    ):
+        command = dispatcher_commands.add_parser(name, help=help_text)
+        command.add_argument(
+            "--root",
+            type=Path,
+            default=Path.cwd(),
+            help="项目或关联 worktree 目录（默认：当前目录）",
+        )
     return parser
 
 
@@ -43,13 +73,44 @@ def _format_result(result: InitResult) -> str:
 
 def run(args: argparse.Namespace) -> str:
     if args.command == "init":
-        return _format_result(initialize_project(args.path))
+        result = initialize_project(args.path)
+        status = start_dispatcher(
+            WorkspaceStore(result.root, execution_root=result.root)
+        )
+        suffix = (
+            "\nDispatcher：已启动，dashi Task 移到 in_progress 后会自动执行。"
+            if status.get("running") or status.get("status") == "starting"
+            else f"\nDispatcher：{status.get('status', '未启动')}。"
+        )
+        return _format_result(result) + suffix
+    if args.command == "dispatcher":
+        execution_root = args.root.expanduser().resolve()
+        project_root = discover_project_root(execution_root)
+        store = WorkspaceStore(project_root, execution_root=execution_root)
+        if args.dispatcher_command == "start":
+            return json.dumps(start_dispatcher(store, explicit=True), ensure_ascii=False, indent=2)
+        if args.dispatcher_command == "stop":
+            return json.dumps(stop_dispatcher(store), ensure_ascii=False, indent=2)
+        if args.dispatcher_command == "status":
+            return json.dumps(dispatcher_status(store), ensure_ascii=False, indent=2)
+        if args.dispatcher_command == "run-once":
+            return AutoDispatcher(store, CodexExecProvider()).run_once()
     raise AssertionError(f"未处理的命令：{args.command}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective = sys.argv[1:] if argv is None else argv
+    if effective == ["hook"]:
+        return hook_main()
     try:
-        output = run(build_parser().parse_args(argv))
+        args = build_parser().parse_args(effective)
+        if args.command == "dispatcher" and args.dispatcher_command == "serve":
+            execution_root = args.root.expanduser().resolve()
+            project_root = discover_project_root(execution_root)
+            return serve_dispatcher(
+                WorkspaceStore(project_root, execution_root=execution_root)
+            )
+        output = run(args)
     except (OSError, UnicodeError, WorkspaceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2

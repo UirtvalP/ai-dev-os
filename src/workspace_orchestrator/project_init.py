@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import json
-import shlex
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .project_config import CONFIG_NAME, ensure_project_config, validate_project_config
-from .workspace import WorkspaceError
+from .project_config import CONFIG_NAME, initialized_project_config, load_project_config
+from .workspace import WorkspaceError, WorkspaceStore
 
 AGENTS_START = "<!-- ai-dev-os:start -->"
 AGENTS_END = "<!-- ai-dev-os:end -->"
 GITIGNORE_START = "# ai-dev-os:start"
 GITIGNORE_END = "# ai-dev-os:end"
+HOOK_COMMAND = "ai-dev-os hook"
 
 AGENTS_BLOCK = f"""{AGENTS_START}
 ## AI Dev OS
@@ -29,9 +28,10 @@ AGENTS_BLOCK = f"""{AGENTS_START}
 - 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
 - 语义工作完成后只触发一次 `workspace finalize REQ-ID`；验证、checkpoint、Task review、
   handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
-- `.ai-dev-os.json` 默认开启已推送 Thread 自动收尾：仅当当前 Thread 启动后产生新提交、
-  工作树干净且 HEAD 与上游一致时，Runtime 才会把关联开发 Task 标记为 `done` 并归档 Thread。
-  Requirement 不会因此自动完成；可将 `automation.auto_finish_pushed_thread` 设为 `false` 关闭。
+- 用户批准时使用 dashi 专用 Review 卡或 `workspace confirm REQ-ID --user-confirmed`；
+  用户要求修改时使用 Review 卡新增留言并退回，或执行 `workspace request-changes`。
+- dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或
+  恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。
 {AGENTS_END}
 """
 
@@ -73,72 +73,23 @@ GITIGNORE_BLOCK = f"""{GITIGNORE_START}
 """
 
 
-def _hook_commands() -> tuple[str, str]:
-    executable = str(Path(sys.executable).resolve())
-    command = f"{shlex.quote(executable)} -m workspace_orchestrator.codex_hook"
-    powershell_executable = executable.replace("'", "''")
-    command_windows = (
-        "powershell -NoProfile -Command "
-        f'"& \'{powershell_executable}\' -m workspace_orchestrator.codex_hook"'
-    )
-    return command, command_windows
-
-
-def _hook_entry(event_name: str) -> dict[str, object]:
-    command, command_windows = _hook_commands()
+def _hook_group(event_name: str) -> dict[str, object]:
     hook: dict[str, object] = {
         "type": "command",
-        "command": command,
-        "commandWindows": command_windows,
+        "command": HOOK_COMMAND,
+        "commandWindows": HOOK_COMMAND,
     }
-    if event_name == "Stop":
-        hook["statusMessage"] = "AI Dev OS 检查已推送任务自动收尾"
-        hook["timeout"] = 30
-        hook["async"] = True
-    elif event_name != "SessionEnd":
-        hook["statusMessage"] = "AI Dev OS 自动恢复并同步任务面板"
-        hook["additionalContextLimit"] = 5000
+    if event_name != "SessionEnd":
+        hook.update(
+            statusMessage="自动恢复 AI Dev OS Workspace",
+            additionalContextLimit=5000,
+        )
     else:
         hook["timeout"] = 3
     group: dict[str, object] = {"hooks": [hook]}
     if event_name == "SessionStart":
         group["matcher"] = "startup|resume"
     return group
-
-
-def _validate_hooks(path: Path) -> None:
-    if not path.exists():
-        return
-    if not path.is_file():
-        raise WorkspaceError(f"目标不是普通文件：{path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise WorkspaceError(f"Codex Hook 配置不是有效 JSON：{path}") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("hooks", {}), dict):
-        raise WorkspaceError(f"Codex Hook 配置结构无效：{path}")
-
-
-def _ensure_hooks(path: Path) -> str:
-    existed = path.exists()
-    payload = json.loads(path.read_text(encoding="utf-8")) if existed else {}
-    hooks = payload.setdefault("hooks", {})
-    changed = False
-    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
-        groups = hooks.setdefault(event_name, [])
-        installed = any(
-            "workspace_orchestrator.codex_hook" in str(hook.get("command", ""))
-            for group in groups
-            for hook in group.get("hooks", [])
-        )
-        if not installed:
-            groups.append(_hook_entry(event_name))
-            changed = True
-    if not changed:
-        return "preserved"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return "updated" if existed else "created"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +118,99 @@ def _validate_file(path: Path, start: str | None = None, end: str | None = None)
         raise WorkspaceError(f"检测到不完整的 AI Dev OS 托管区块：{path}")
 
 
+def _validate_hooks(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise WorkspaceError(f"目标不是普通文件：{path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise WorkspaceError(f"Codex Hook 配置不是有效 JSON：{path}：{exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("hooks", {}), dict):
+        raise WorkspaceError(f"Codex Hook 配置必须包含对象类型 hooks：{path}")
+    for event_name, groups in payload.get("hooks", {}).items():
+        if not isinstance(groups, list):
+            raise WorkspaceError(f"Codex Hook 配置 {event_name} 必须是数组：{path}")
+        if any(
+            not isinstance(group, dict)
+            or not isinstance(group.get("hooks", []), list)
+            or any(not isinstance(hook, dict) for hook in group.get("hooks", []))
+            for group in groups
+        ):
+            raise WorkspaceError(f"Codex Hook 配置 {event_name} 的 hooks 结构无效：{path}")
+
+
+def _ensure_hooks(path: Path) -> str:
+    existed = path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8")) if existed else {}
+    hooks = payload.setdefault("hooks", {})
+    changed = False
+    for event_name in ("SessionStart", "UserPromptSubmit", "SessionEnd"):
+        groups = hooks.setdefault(event_name, [])
+        managed_index = next(
+            (
+                index
+                for index, group in enumerate(groups)
+                if any(
+                    "ai-dev-os hook" in str(hook.get("command", ""))
+                    or "workspace_runtime.py" in str(hook.get("command", ""))
+                    for hook in group.get("hooks", [])
+                )
+            ),
+            None,
+        )
+        desired = _hook_group(event_name)
+        if managed_index is None:
+            groups.append(desired)
+            changed = True
+        elif groups[managed_index] != desired:
+            groups[managed_index] = desired
+            changed = True
+    if not existed or changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        WorkspaceStore.write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return "created" if not existed else "updated"
+    return "preserved"
+
+
+def _validate_project_config(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise WorkspaceError(f"目标不是普通文件：{path}")
+    load_project_config(path.parent)
+
+
+def _ensure_project_config(root: Path) -> str:
+    path = root / CONFIG_NAME
+    desired = initialized_project_config(root)
+    if not path.exists():
+        WorkspaceStore.write_text(
+            path,
+            json.dumps(desired, ensure_ascii=False, indent=2),
+        )
+        return "created"
+    current = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for key in (
+        "auto_execute_in_progress",
+        "dispatcher_poll_seconds",
+        "codex_sandbox",
+        "codex_model",
+    ):
+        if key not in current:
+            current[key] = desired[key]
+            changed = True
+    if changed:
+        WorkspaceStore.write_text(
+            path,
+            json.dumps(current, ensure_ascii=False, indent=2),
+        )
+        return "updated"
+    return "preserved"
+
+
 def _append_managed_block(path: Path, block: str, start: str, end: str) -> str:
     """幂等追加已经过预检的托管区块。"""
 
@@ -189,7 +233,13 @@ def _append_managed_block(path: Path, block: str, start: str, end: str) -> str:
         )
         return "updated"
 
-    separator = "" if not content or content.endswith("\n\n") else "\n" if content.endswith("\n") else "\n\n"
+    separator = (
+        ""
+        if not content or content.endswith("\n\n")
+        else "\n"
+        if content.endswith("\n")
+        else "\n\n"
+    )
     path.write_text(f"{content}{separator}{block}", encoding="utf-8")
     return "updated"
 
@@ -235,22 +285,21 @@ def initialize_project(root: Path) -> InitResult:
     }
     for name, markers in targets.items():
         _validate_file(resolved / name, *markers)
-    _validate_hooks(resolved / ".codex" / "hooks.json")
-    validate_project_config(resolved / CONFIG_NAME)
+    codex_dir = resolved / ".codex"
+    if codex_dir.exists() and not codex_dir.is_dir():
+        raise WorkspaceError(f"目标不是目录：{codex_dir}")
+    _validate_hooks(codex_dir / "hooks.json")
+    _validate_project_config(resolved / CONFIG_NAME)
 
     outcomes = {
         "AGENTS.md": _append_managed_block(
             resolved / "AGENTS.md", AGENTS_BLOCK, AGENTS_START, AGENTS_END
         ),
-        "USER_PRINCIPLES.md": _create_if_missing(
-            resolved / "USER_PRINCIPLES.md", USER_PRINCIPLES
-        ),
-        "PROJECT_INTENT.md": _create_if_missing(
-            resolved / "PROJECT_INTENT.md", PROJECT_INTENT
-        ),
+        "USER_PRINCIPLES.md": _create_if_missing(resolved / "USER_PRINCIPLES.md", USER_PRINCIPLES),
+        "PROJECT_INTENT.md": _create_if_missing(resolved / "PROJECT_INTENT.md", PROJECT_INTENT),
         ".gitignore": _ensure_gitignore(resolved / ".gitignore"),
-        ".codex/hooks.json": _ensure_hooks(resolved / ".codex" / "hooks.json"),
-        CONFIG_NAME: ensure_project_config(resolved / CONFIG_NAME),
+        ".codex/hooks.json": _ensure_hooks(codex_dir / "hooks.json"),
+        CONFIG_NAME: _ensure_project_config(resolved),
     }
     return InitResult(
         root=resolved,

@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from workspace_orchestrator.adapters import task as task_adapter
-from workspace_orchestrator.adapters.agent import CodexAgentProvider
+from workspace_orchestrator.adapters.agent import CodexAgentProvider, CodexExecProvider
 from workspace_orchestrator.adapters.git import LocalGitProvider
 from workspace_orchestrator.adapters.task import DashiTaskProvider, TaskProviderError
 from workspace_orchestrator.context import build_snapshot, handoff
@@ -62,6 +61,74 @@ def test_codex_agent_provider_owns_thread_environment_lookup() -> None:
     assert provider.current_session_id() == "thread-123"
     provider.archive_session("thread-123")
     assert archived == ["thread-123"]
+
+
+def test_codex_exec_provider_uses_official_non_interactive_boundary(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], Path, dict[str, str], float]] = []
+
+    def runner(command, cwd, environ, timeout):
+        calls.append((tuple(command), cwd, dict(environ), timeout))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"type":"thread.started","thread_id":"thread-auto"}\n',
+            stderr="",
+        )
+
+    result = CodexExecProvider(
+        runner=runner, executable="codex", timeout_seconds=30
+    ).execute(
+        tmp_path,
+        "继续 REQ-001，处理 AID-1",
+        model="gpt-test",
+        bypass_hook_trust=True,
+    )
+
+    assert result.session_id == "thread-auto"
+    assert result.resumed is False
+    command, cwd, environ, timeout = calls[0]
+    assert command[:3] == ("codex", "exec", "--json")
+    assert ("--sandbox", "workspace-write") == (
+        command[command.index("--sandbox")],
+        command[command.index("--sandbox") + 1],
+    )
+    assert 'approval_policy="never"' in command
+    assert ("--model", "gpt-test") == (
+        command[command.index("--model")],
+        command[command.index("--model") + 1],
+    )
+    assert "--dangerously-bypass-hook-trust" in command
+    assert cwd == tmp_path
+    assert timeout == 30
+    assert "CODEX_THREAD_ID" not in environ
+
+
+def test_codex_exec_provider_falls_back_to_new_session_when_resume_fails(
+    tmp_path: Path,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command, cwd, environ, timeout):
+        commands.append(tuple(command))
+        if "resume" in command:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="not found")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"type":"thread.started","thread_id":"thread-new"}\n',
+            stderr="",
+        )
+
+    result = CodexExecProvider(runner=runner, executable="codex").execute(
+        tmp_path,
+        "继续",
+        resume_session_id="thread-old",
+    )
+
+    assert commands[0][:3] == ("codex", "exec", "resume")
+    assert commands[1][:2] == ("codex", "exec")
+    assert result.session_id == "thread-new"
+    assert result.resumed is False
 
 
 def test_resume_prefers_requirement_bound_worktree_over_current_repo(tmp_path: Path) -> None:
@@ -237,30 +304,37 @@ def test_dashi_adapter_starts_service_once_before_first_command() -> None:
     assert starts == ["started"]
 
 
-def test_taskboard_service_is_started_when_local_port_is_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_dashi_project_mapping_never_steals_same_id_from_another_workspace(
+    tmp_path: Path,
 ) -> None:
-    suffix = ".cmd" if os.name == "nt" else ""
-    launcher = tmp_path / f"dashi-taskboard{suffix}"
-    launcher.write_text("launcher", encoding="utf-8")
-    checks = iter((False, True))
-    launches: list[tuple[object, dict[str, object]]] = []
+    other = tmp_path / "other"
+    current = tmp_path / "current"
+    other.mkdir()
+    current.mkdir()
 
-    monkeypatch.setenv("CODEX_TASKBOARD_URL", "http://127.0.0.1:47999")
-    monkeypatch.setattr(task_adapter, "_taskboard_launcher", lambda: launcher)
-    monkeypatch.setattr(
-        task_adapter, "_service_is_listening", lambda host, port: next(checks)
+    def runner(command: tuple[str, ...]) -> str:
+        assert command[1:3] == ("project", "list")
+        return json.dumps(
+            {
+                "projects": [
+                    {
+                        "id": "same-project",
+                        "name": "same-project",
+                        "workspacePath": str(other),
+                    }
+                ]
+            }
+        )
+
+    provider = DashiTaskProvider(
+        project_id="same-project",
+        runner=runner,
+        executable="taskctl",
+        workspace_path=str(current),
     )
-    monkeypatch.setattr(
-        task_adapter.subprocess,
-        "Popen",
-        lambda command, **kwargs: launches.append((command, kwargs)),
-    )
 
-    task_adapter.ensure_taskboard_service()
-
-    assert len(launches) == 1
-    assert launches[0][1]["env"]["CODEX_TASKBOARD_PORT"] == "47999"
+    with pytest.raises(TaskProviderError, match="已映射到其他目录"):
+        provider.list_tasks("REQ-001")
 
 
 def test_dashi_adapter_creates_requirement_linked_issue() -> None:
@@ -342,6 +416,98 @@ def test_dashi_status_update_uses_current_version() -> None:
         "4",
         "--json",
     )
+
+
+def test_dashi_review_packet_uses_description_file_cas_and_is_idempotent() -> None:
+    commands: list[tuple[str, ...]] = []
+    uploaded: list[str] = []
+    current_description = "旧正文"
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal current_description
+        commands.append(tuple(command))
+        if "update" in command:
+            file_path = Path(command[command.index("--description-file") + 1])
+            uploaded.append(file_path.read_text(encoding="utf-8"))
+            current_description = uploaded[-1]
+            version = 5
+        else:
+            version = 4
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Review",
+                    "description": current_description,
+                    "status": "in_review",
+                    "version": version,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    content = "<!-- packet -->\n\n完整审查材料"
+    assert provider.publish_review("AID-1", content).description == content
+    assert provider.publish_review("AID-1", content).description == content
+    assert uploaded == [content]
+    update = next(command for command in commands if "update" in command)
+    assert update[-3:] == ("--if-version", "4", "--json")
+
+
+def test_dashi_review_approval_fact_uses_last_done_transition_actor() -> None:
+    provider = DashiTaskProvider(
+        runner=lambda _: "{}",
+        executable="taskctl",
+        activity_reader=lambda _: {
+            "activities": [
+                {
+                    "id": "change-1",
+                    "actorType": "user",
+                    "actorId": "alice",
+                    "actorName": "Alice",
+                    "createdAt": "2026-08-29T01:00:00Z",
+                    "changes": [{"field": "status", "before": "in_review", "after": "done"}],
+                },
+                {
+                    "id": "change-2",
+                    "actorType": "agent",
+                    "actorId": "codex-agent",
+                    "actorName": "Codex Agent",
+                    "createdAt": "2026-08-29T02:00:00Z",
+                    "changes": [{"field": "status", "before": "in_review", "after": "done"}],
+                },
+            ]
+        },
+    )
+
+    fact = provider.review_approval_fact("AID-7")
+
+    assert fact is not None
+    assert fact.activity_id == "change-2"
+    assert fact.actor_type == "agent"
+    assert fact.actor_id == "codex-agent"
+
+
+def test_dashi_adapter_lists_review_comments() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        return json.dumps(
+            {
+                "comments": [
+                    {"id": "comment-1", "body": "请补测试。"},
+                    {"id": "comment-2", "content": "请更新 README。"},
+                ],
+                "nextCursor": "2",
+            }
+        )
+
+    comments = DashiTaskProvider(runner=runner, executable="taskctl").list_comments("AID-1")
+
+    assert comments == ("请补测试。", "请更新 README。")
+    assert commands == [("taskctl", "comment", "list", "AID-1", "--json")]
 
 
 def test_dashi_unlink_clears_only_matching_current_thread_binding() -> None:

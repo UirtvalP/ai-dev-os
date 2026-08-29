@@ -15,14 +15,23 @@ class AutomationAmbiguity(WorkspaceError):
 
 
 def discover_project_root(start: Path) -> Path:
-    """从当前路径发现 Workspace 项目，优先最近的 `.workspace`。"""
+    """发现共享 Workspace；关联 worktree 回退到 Git 主工作树。"""
 
     resolved = start.resolve()
     for candidate in (resolved, *resolved.parents):
         if (candidate / ".workspace").is_dir():
             return candidate
     try:
-        result = subprocess.run(
+        common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=resolved,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        top = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=resolved,
             text=True,
@@ -33,7 +42,12 @@ def discover_project_root(start: Path) -> Path:
         )
     except OSError:
         return resolved
-    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else resolved
+    if common.returncode == 0:
+        common_dir = Path(common.stdout.strip()).resolve()
+        main_root = common_dir.parent if common_dir.name == ".git" else None
+        if main_root is not None and (main_root / ".workspace").is_dir():
+            return main_root
+    return Path(top.stdout.strip()).resolve() if top.returncode == 0 else resolved
 
 
 def select_requirement(

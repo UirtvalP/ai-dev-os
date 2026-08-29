@@ -51,9 +51,7 @@ def review_intent(intent_document: str) -> IntentReview:
     ):
         normalized_name = INTENT_CHECK_ALIASES.get(name.strip(), name.strip())
         parsed[normalized_name] = IntentStatus(status.upper())
-    checks = tuple(
-        (name, parsed.get(name, IntentStatus.PARTIAL)) for name in INTENT_CHECKS
-    )
+    checks = tuple((name, parsed.get(name, IntentStatus.PARTIAL)) for name in INTENT_CHECKS)
     statuses = {status for _, status in checks}
     if IntentStatus.VIOLATION in statuses:
         overall = IntentStatus.VIOLATION

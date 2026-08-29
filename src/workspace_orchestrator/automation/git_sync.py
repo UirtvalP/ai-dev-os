@@ -11,27 +11,38 @@ from workspace_orchestrator.adapters.git import GitError, LocalGitProvider
 from workspace_orchestrator.adapters.task import TaskProviderError
 
 
-def git_root(project_root: Path, stored_git: dict[str, Any]) -> tuple[Path, str | None]:
+def git_root(
+    project_root: Path,
+    stored_git: dict[str, Any],
+    *,
+    execution_root: Path | None = None,
+) -> tuple[Path, str | None]:
     bound_worktree = stored_git.get("worktree")
     if not bound_worktree:
-        return project_root, None
+        return execution_root or project_root, None
     path = Path(str(bound_worktree))
     if not path.is_absolute():
         path = project_root / path
     return path.resolve(), str(bound_worktree)
 
 
-def collect_git_context(project_root: Path, stored_git: dict[str, Any]) -> dict[str, Any]:
-    root, bound_worktree = git_root(project_root, stored_git)
+def collect_git_context(
+    project_root: Path,
+    stored_git: dict[str, Any],
+    *,
+    execution_root: Path | None = None,
+) -> dict[str, Any]:
+    root, bound_worktree = git_root(project_root, stored_git, execution_root=execution_root)
     try:
         provider = LocalGitProvider(root)
-        status = provider.push_status()
+        status = provider.status()
         return {
             **status,
             "worktree": bound_worktree or status["worktree"],
             "status": "\n".join(status["changes"]),
             "commits": provider.recent_commits(3),
             "changed_files": provider.changed_files(),
+            "diff": provider.diff(),
         }
     except GitError as exc:
         return {
@@ -40,6 +51,7 @@ def collect_git_context(project_root: Path, stored_git: dict[str, Any]) -> dict[
             "status": None,
             "commits": (),
             "changed_files": (),
+            "diff": "",
             "error": str(exc),
         }
 

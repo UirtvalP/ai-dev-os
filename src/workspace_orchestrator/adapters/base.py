@@ -3,7 +3,11 @@
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
-from workspace_orchestrator.models import Task
+from workspace_orchestrator.models import ReviewApprovalFact, Task
+
+
+class TaskProviderError(RuntimeError):
+    """Task Provider 的可降级外部故障。"""
 
 
 class TaskProvider(Protocol):
@@ -11,7 +15,10 @@ class TaskProvider(Protocol):
     def get_task(self, task_id: str) -> Task: ...
     def list_tasks(self, requirement_id: str) -> Sequence[Task]: ...
     def update_status(self, task_id: str, status: str) -> Task: ...
+    def publish_review(self, task_id: str, content: str) -> Task: ...
+    def review_approval_fact(self, task_id: str) -> ReviewApprovalFact | None: ...
     def add_comment(self, task_id: str, body: str) -> None: ...
+    def list_comments(self, task_id: str) -> Sequence[str]: ...
     def link_session(
         self,
         task_id: str,

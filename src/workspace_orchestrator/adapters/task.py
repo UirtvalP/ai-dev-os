@@ -7,21 +7,109 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import urlopen
 
-from workspace_orchestrator.models import Task
+from workspace_orchestrator.adapters.base import TaskProviderError
+from workspace_orchestrator.models import ReviewApprovalFact, Task
 
 CommandRunner = Callable[[Sequence[str]], str]
 ServiceStarter = Callable[[], None]
+ActivityReader = Callable[[str], Any]
 
 
-class TaskProviderError(RuntimeError):
-    pass
+def _taskboard_endpoint() -> tuple[str, int]:
+    url = os.environ.get("CODEX_TASKBOARD_URL", "http://127.0.0.1:47823")
+    parsed = urlparse(url)
+    return parsed.hostname or "127.0.0.1", parsed.port or 47823
+
+
+def _default_activity_reader(task_id: str) -> Any:
+    base_url = os.environ.get("CODEX_TASKBOARD_URL", "http://127.0.0.1:47823").rstrip("/")
+    url = f"{base_url}/api/tasks/{quote(task_id, safe='')}/activities"
+    try:
+        with urlopen(url, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, HTTPError, URLError, json.JSONDecodeError) as exc:
+        raise TaskProviderError(f"无法读取 dashi Review 活动事实：{exc}") from exc
+
+
+def _service_is_listening(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _taskboard_launcher() -> Path | None:
+    configured = os.environ.get("CODEX_TASKBOARD_LAUNCHER")
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    discovered = shutil.which("dashi-taskboard")
+    if discovered:
+        return Path(discovered)
+    suffix = ".cmd" if os.name == "nt" else ""
+    user_install = Path.home() / ".local" / "bin" / f"dashi-taskboard{suffix}"
+    return user_install if user_install.is_file() else None
+
+
+def ensure_taskboard_service() -> None:
+    """若本机 dashi 尚未运行，则以后台进程按需启动并等待端口就绪。"""
+
+    host, port = _taskboard_endpoint()
+    if _service_is_listening(host, port):
+        return
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise TaskProviderError(f"远程 dashi-taskboard 不可用：{host}:{port}")
+    launcher = _taskboard_launcher()
+    if launcher is None:
+        raise TaskProviderError(
+            "dashi-taskboard 未运行，且未找到启动器；请安装启动器或设置 CODEX_TASKBOARD_LAUNCHER"
+        )
+    environment = os.environ.copy()
+    environment["CODEX_TASKBOARD_HOST"] = "127.0.0.1"
+    environment["CODEX_TASKBOARD_PORT"] = str(port)
+    if os.name == "nt":
+        command = (os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher))
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW
+        )
+        subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    else:
+        subprocess.Popen(
+            (str(launcher),),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _service_is_listening(host, port):
+            return
+        time.sleep(0.1)
+    raise TaskProviderError(f"dashi-taskboard 启动超时：{host}:{port}")
 
 
 def _taskboard_endpoint() -> tuple[str, int]:
@@ -131,7 +219,11 @@ def _task(data: dict[str, Any]) -> Task:
     parent = relations.get("parent")
     parent_id = None
     if parent:
-        parent_id = str(parent.get("identifier") or parent.get("id")) if isinstance(parent, dict) else str(parent)
+        parent_id = (
+            str(parent.get("identifier") or parent.get("id"))
+            if isinstance(parent, dict)
+            else str(parent)
+        )
     return Task(
         id=str(data.get("identifier") or data["id"]),
         raw_id=str(data["id"]),
@@ -151,8 +243,13 @@ def _task(data: dict[str, Any]) -> Task:
             or data.get("threadId")
             or data.get("legacyLocalThreadId")
         ),
+        binding_codex_project_id=thread_binding.get("codexProjectId"),
+        binding_codex_project_kind=thread_binding.get("codexProjectKind"),
+        binding_codex_host_id=thread_binding.get("codexHostId"),
+        binding_workspace_path=thread_binding.get("workspacePath"),
         labels=tuple(data.get("labels", ())),
         version=data.get("version"),
+        activity_updated_at=data.get("activityUpdatedAt") or data.get("updatedAt"),
     )
 
 
@@ -177,18 +274,64 @@ class DashiTaskProvider:
     runner: CommandRunner = _default_runner
     executable: str | None = None
     service_starter: ServiceStarter | None = None
-    _service_ready: bool = field(default=False, init=False, repr=False)
+    project_name: str | None = None
+    workspace_path: str | None = None
+    activity_reader: ActivityReader = _default_activity_reader
+    _service_ready: bool = False
+    _project_ready: bool = False
 
-    def _json(self, *args: str) -> Any:
+    def _json(self, *args: str, ensure_project: bool = True) -> Any:
         if self.service_starter is not None and not self._service_ready:
             self.service_starter()
             self._service_ready = True
+        if ensure_project and args and args[0] != "project" and self.workspace_path:
+            self.ensure_project()
         command = (self.executable or _default_executable(), *args, "--json")
         output = self.runner(command)
         try:
             return json.loads(output)
         except json.JSONDecodeError as exc:
             raise TaskProviderError("taskctl 返回了无效 JSON") from exc
+
+    def ensure_project(self) -> None:
+        """幂等创建或映射当前 Workspace 对应的 dashi 项目。"""
+
+        if self._project_ready or not self.workspace_path:
+            return
+        payload = self._json("project", "list", ensure_project=False)
+        projects = payload.get("projects", ())
+        current = next(
+            (item for item in projects if str(item.get("id")) == self.project_id),
+            None,
+        )
+        if current is None:
+            self._json(
+                "project",
+                "create",
+                "--name",
+                self.project_name or self.project_id,
+                "--id",
+                self.project_id,
+                "--workspace-path",
+                self.workspace_path,
+                ensure_project=False,
+            )
+        elif current.get("workspacePath") is None:
+            self._json(
+                "project",
+                "map",
+                self.project_id,
+                "--workspace-path",
+                self.workspace_path,
+                ensure_project=False,
+            )
+        elif os.path.normcase(os.path.abspath(str(current["workspacePath"]))) != os.path.normcase(
+            os.path.abspath(self.workspace_path)
+        ):
+            raise TaskProviderError(
+                f"dashi 项目 ID {self.project_id} 已映射到其他目录：{current['workspacePath']}"
+            )
+        self._project_ready = True
 
     @staticmethod
     def _requirement_label(requirement_id: str) -> str:
@@ -225,7 +368,9 @@ class DashiTaskProvider:
     def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
         payload = self._json("issue", "list", "--project", self.project_id)
         required_label = self._requirement_label(requirement_id)
-        return tuple(_task(item) for item in payload["tasks"] if required_label in item.get("labels", ()))
+        return tuple(
+            _task(item) for item in payload["tasks"] if required_label in item.get("labels", ())
+        )
 
     def update_status(self, task_id: str, status: str) -> Task:
         current = self.get_task(task_id)
@@ -234,8 +379,78 @@ class DashiTaskProvider:
             args.extend(("--if-version", str(current.version)))
         return _task(self._json(*args)["task"])
 
+    def publish_review(self, task_id: str, content: str) -> Task:
+        """用卡片正文幂等投影 Review Packet，并通过 version 做 CAS。"""
+
+        for _ in range(2):
+            current = self.get_task(task_id)
+            if current.description == content:
+                return current
+            descriptor, name = tempfile.mkstemp(suffix=".md")
+            path = Path(name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                    stream.write(content)
+                args = ["issue", "update", task_id, "--description-file", str(path)]
+                if current.version is not None:
+                    args.extend(("--if-version", str(current.version)))
+                try:
+                    return _task(self._json(*args)["task"])
+                except TaskProviderError:
+                    refreshed = self.get_task(task_id)
+                    if refreshed.description == content:
+                        return refreshed
+                    if refreshed.version == current.version:
+                        raise
+            finally:
+                path.unlink(missing_ok=True)
+        raise TaskProviderError(f"Review Packet 并发更新未收敛：{task_id}")
+
+    def review_approval_fact(self, task_id: str) -> ReviewApprovalFact | None:
+        """读取最后一次进入 done 的结构化 actor；缺失事实绝不猜测。"""
+
+        if self.service_starter is not None and not self._service_ready:
+            self.service_starter()
+            self._service_ready = True
+        payload = self.activity_reader(task_id)
+        activities = payload.get("activities", ()) if isinstance(payload, dict) else ()
+        for activity in reversed(tuple(activities)):
+            if not isinstance(activity, dict):
+                continue
+            changes = activity.get("changes", ())
+            entered_done = any(
+                isinstance(change, dict)
+                and change.get("field") == "status"
+                and change.get("after") == "done"
+                for change in changes
+            )
+            if not entered_done:
+                continue
+            activity_id = str(activity.get("id") or "").strip()
+            actor_type = str(activity.get("actorType") or "").strip()
+            changed_at = str(activity.get("createdAt") or "").strip()
+            if not activity_id or not actor_type or not changed_at:
+                return None
+            return ReviewApprovalFact(
+                activity_id=activity_id,
+                actor_type=actor_type,
+                actor_id=str(activity.get("actorId") or "").strip(),
+                actor_name=str(activity.get("actorName") or "").strip(),
+                changed_at=changed_at,
+            )
+        return None
+
     def add_comment(self, task_id: str, body: str) -> None:
         self._json("comment", "add", task_id, "--body", body)
+
+    def list_comments(self, task_id: str) -> tuple[str, ...]:
+        payload = self._json("comment", "list", task_id)
+        comments = payload.get("comments", ())
+        return tuple(
+            str(item.get("body") or item.get("content") or "").strip()
+            for item in comments
+            if isinstance(item, dict) and str(item.get("body") or item.get("content") or "").strip()
+        )
 
     def link_session(
         self,

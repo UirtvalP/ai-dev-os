@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from workspace_orchestrator.adapters.task import TaskProviderError
 from workspace_orchestrator.intent import requirement_intent_summary, summarize_document
 from workspace_orchestrator.workspace import (
     SECTION_LABELS,
+    WorkspaceError,
     WorkspaceStore,
     bullets,
     markdown_sections,
@@ -61,9 +63,9 @@ def collect_snapshot(
     data = store.load(requirement_id)
     meta = data["meta"]
     requirement = markdown_sections(data["requirement"])
-    user_principles = summarize_document(store.project_root / "USER_PRINCIPLES.md")
+    user_principles = summarize_document(store.working_root / "USER_PRINCIPLES.md")
     project_intent = summarize_document(
-        store.project_root / "PROJECT_INTENT.md",
+        store.working_root / "PROJECT_INTENT.md",
         headings=(
             "Purpose",
             "Desired Outcome",
@@ -77,7 +79,9 @@ def collect_snapshot(
     handoff = markdown_sections(data["handoff"])
     verification = markdown_sections(data["verification"])
     stored_git = dict(meta.get("git") or {})
-    git = git or collect_git_context(store.project_root, stored_git)
+    git = git or collect_git_context(
+        store.project_root, stored_git, execution_root=store.working_root
+    )
     stored_git.update({key: git[key] for key in ("branch", "worktree") if git.get(key)})
     if stored_git != meta.get("git"):
         meta = store.touch_meta(requirement_id, git=stored_git)
@@ -86,8 +90,7 @@ def collect_snapshot(
         task_lines = [f"不可用（{task_error}）"]
     else:
         task_lines = [
-            f"- {task.id} [{_display_state(task.status)}] {task.title}"
-            for task in tasks
+            f"- {task.id} [{_display_state(task.status)}] {task.title}" for task in tasks
         ] or ["无"]
     completed = bullets(state.get("Completed", ""))
     pending = bullets(state.get("Pending", ""))
@@ -146,36 +149,46 @@ def persist_checkpoint(
 ) -> None:
     """幂等写入本地 checkpoint 状态。"""
 
-    data = store.load(requirement_id)
-    state = data["state"]
-    if phase:
-        state = replace_section(state, "Phase", phase)
-    if completed:
-        current = bullets(markdown_sections(state).get("Completed", ""))
-        merged = list(dict.fromkeys([*current, *completed]))
-        state = replace_section(state, "Completed", "\n".join(f"- {item}" for item in merged))
-    if next_action:
-        state = replace_section(state, "Next Action", next_action)
-    store.write_text(data["path"] / "state.md", state)
-    if completed:
-        plan = data["plan"]
-        for item in completed:
-            unchecked = f"- [ ] {item}"
-            in_progress = f"- [-] {item}"
-            if unchecked in plan:
-                plan = plan.replace(unchecked, f"- [x] {item}", 1)
-            elif in_progress in plan:
-                plan = plan.replace(in_progress, f"- [x] {item}", 1)
-            elif f"- [x] {item}" not in plan:
-                plan = plan.rstrip() + f"\n- [x] {item}\n"
-        store.write_text(data["path"] / "plan.md", plan)
-    if verification:
-        verification_doc = replace_section(data["verification"], "Latest Check", verification)
-        store.write_text(data["path"] / "verification.md", verification_doc)
-    status = data["meta"]["status"]
-    if status in {"draft", "ready"} and phase and phase not in {"draft", "ready"}:
-        status = "in_progress"
-    store.touch_meta(requirement_id, status=status)
+    with store.locked(requirement_id):
+        data = store.load(requirement_id)
+        state = data["state"]
+        if phase:
+            state = replace_section(state, "Phase", phase)
+        if completed:
+            current = bullets(markdown_sections(state).get("Completed", ""))
+            merged = list(dict.fromkeys([*current, *completed]))
+            state = replace_section(state, "Completed", "\n".join(f"- {item}" for item in merged))
+        if next_action:
+            state = replace_section(state, "Next Action", next_action)
+        store.write_text(data["path"] / "state.md", state)
+        if completed:
+            plan = data["plan"]
+            for item in completed:
+                unchecked = f"- [ ] {item}"
+                in_progress = f"- [-] {item}"
+                if unchecked in plan:
+                    plan = plan.replace(unchecked, f"- [x] {item}", 1)
+                elif in_progress in plan:
+                    plan = plan.replace(in_progress, f"- [x] {item}", 1)
+                elif f"- [x] {item}" not in plan:
+                    plan = plan.rstrip() + f"\n- [x] {item}\n"
+            store.write_text(data["path"] / "plan.md", plan)
+        if verification:
+            verification_doc = replace_section(data["verification"], "Latest Check", verification)
+            store.write_text(data["path"] / "verification.md", verification_doc)
+        status = data["meta"]["status"]
+        # 纯 handoff/等待确认文案不改变审查证据；阶段、完成项或验证变化才使旧审查失效。
+        changed = bool(phase or completed or verification)
+        if (
+            status in {"draft", "ready"}
+            and phase
+            and phase not in {"draft", "ready"}
+            or status == "in_review"
+            and changed
+            and phase != "review"
+        ):
+            status = "in_progress"
+        store.touch_meta(requirement_id, status=status)
 
 
 def persist_handoff(
@@ -190,23 +203,30 @@ def persist_handoff(
     next_action: str | None = None,
     known_problems: str | None = None,
 ) -> None:
-    data = store.load(requirement_id)
-    state = markdown_sections(data["state"])
-    doc = data["handoff"]
-    fields = {
-        "Last Session": session_id,
-        "Completed": "\n".join(f"- {item}" for item in completed)
-        or state.get("Completed", "无"),
-        "Files Changed": "\n".join(f"- {item}" for item in files_changed) or "无",
-        "Current State": current_state or state.get("In Progress", "无"),
-        "Important Context": important_context or "无",
-        "Next Recommended Action": next_action or state.get("Next Action", "无"),
-        "Known Problems": known_problems or "无",
-    }
-    for heading, value in fields.items():
-        doc = replace_section(doc, heading, value)
-    store.write_text(data["path"] / "handoff.md", doc)
-    store.touch_meta(requirement_id)
+    with store.locked(requirement_id):
+        data = store.load(requirement_id)
+        state = markdown_sections(data["state"])
+        previous_handoff = markdown_sections(data["handoff"])
+        doc = data["handoff"]
+        merged_files = list(
+            dict.fromkeys(
+                [*bullets(previous_handoff.get("Files Changed", "")), *files_changed]
+            )
+        )
+        fields = {
+            "Last Session": session_id,
+            "Completed": "\n".join(f"- {item}" for item in completed)
+            or state.get("Completed", "无"),
+            "Files Changed": "\n".join(f"- {item}" for item in merged_files) or "无",
+            "Current State": current_state or state.get("In Progress", "无"),
+            "Important Context": important_context or "无",
+            "Next Recommended Action": next_action or state.get("Next Action", "无"),
+            "Known Problems": known_problems or "无",
+        }
+        for heading, value in fields.items():
+            doc = replace_section(doc, heading, value)
+        store.write_text(data["path"] / "handoff.md", doc)
+        store.touch_meta(requirement_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,48 +234,93 @@ class VerificationResult:
     command: tuple[str, ...]
     returncode: int
     output: str
+    timed_out: bool = False
 
     @property
     def passed(self) -> bool:
         return self.returncode == 0
 
 
-def known_verification_commands(project_root: Path) -> tuple[tuple[str, ...], ...]:
-    """从项目配置读取命令；不存在配置时不猜测。"""
+def _verification_config(project_root: Path) -> tuple[tuple[tuple[str, ...], ...], float]:
+    """读取并严格校验验证命令与统一超时。"""
 
     config_path = project_root / "pyproject.toml"
     if not config_path.is_file():
-        return ()
-    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        return (), 300.0
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkspaceError(f"验证配置无效：{exc}") from exc
     configured = (
         config.get("tool", {})
         .get("workspace-orchestrator", {})
         .get("automation", {})
         .get("verification-commands", ())
     )
-    return tuple(
-        tuple(str(part).replace("{python}", sys.executable) for part in command)
-        for command in configured
+    timeout = (
+        config.get("tool", {})
+        .get("workspace-orchestrator", {})
+        .get("automation", {})
+        .get("verification-timeout-seconds", 300)
     )
+    if not isinstance(configured, list):
+        raise WorkspaceError("验证配置无效：verification-commands 必须是数组")
+    commands: list[tuple[str, ...]] = []
+    for index, command in enumerate(configured, start=1):
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(part, str) or not part.strip() for part in command)
+        ):
+            raise WorkspaceError(
+                f"验证配置无效：verification-commands 第 {index} 项必须是非空字符串数组"
+            )
+        commands.append(tuple(part.replace("{python}", sys.executable) for part in command))
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not 0 < timeout <= 3600
+    ):
+        raise WorkspaceError("验证配置无效：verification-timeout-seconds 必须在 0 到 3600 之间")
+    return tuple(commands), float(timeout)
+
+
+def known_verification_commands(project_root: Path) -> tuple[tuple[str, ...], ...]:
+    """从项目配置读取命令；不存在配置时不猜测。"""
+
+    return _verification_config(project_root)[0]
 
 
 def run_known_verifications(project_root: Path) -> tuple[VerificationResult, ...]:
+    commands, timeout = _verification_config(project_root)
     results = []
-    for command in known_verification_commands(project_root):
-        completed = subprocess.run(
-            command,
-            cwd=project_root,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-        )
-        output = "\n".join(
-            part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
-        )
-        results.append(VerificationResult(command, completed.returncode, output))
-        if completed.returncode != 0:
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=project_root,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+            output = "\n".join(
+                part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+            )
+            result = VerificationResult(command, completed.returncode, output)
+        except subprocess.TimeoutExpired:
+            result = VerificationResult(
+                command,
+                124,
+                f"命令超过 {timeout:g} 秒超时",
+                timed_out=True,
+            )
+        except OSError as exc:
+            result = VerificationResult(command, 127, f"无法启动命令：{exc}")
+        results.append(result)
+        if not result.passed:
             break
     return tuple(results)
 
@@ -267,10 +332,32 @@ def verification_summary(results: Sequence[VerificationResult]) -> str:
         f"状态：{'PASS' if all(item.passed for item in results) else 'FAIL'}",
         *(
             f"- {'PASS' if item.passed else 'FAIL'}：{' '.join(item.command)}"
+            + (f"（{item.output}）" if not item.passed and item.output else "")
             for item in results
         ),
     ]
     return "\n".join(lines)
+
+
+def verification_result_excerpt(
+    result: VerificationResult, project_root: Path, *, limit: int = 500
+) -> str:
+    """提取单行、限长且去除本机路径的稳定验证结果摘要。"""
+
+    lines = [" ".join(line.split()) for line in result.output.splitlines() if line.strip()]
+    if not lines:
+        return "无输出（命令成功）" if result.passed else "无输出（命令失败）"
+    summary = lines[-1]
+    replacements = (
+        (str(project_root.resolve()), "<workspace>"),
+        (str(Path.home()), "<home>"),
+        (tempfile.gettempdir(), "<temp>"),
+    )
+    for value, replacement in replacements:
+        summary = summary.replace(value, replacement).replace(value.casefold(), replacement)
+    if len(summary) > limit:
+        summary = "…" + summary[-(limit - 1) :]
+    return summary
 
 
 def persist_verification_results(
@@ -280,27 +367,33 @@ def persist_verification_results(
 ) -> None:
     """把已知命令结果同步到既有三类人类可读验证章节。"""
 
-    data = store.load(requirement_id)
-    document = data["verification"]
-    grouped: dict[str, list[VerificationResult]] = {}
-    for result in results:
-        command_text = " ".join(result.command).casefold()
-        if "pytest" in command_text:
-            section = "Unit Tests"
-        elif "ruff" in command_text or "mypy" in command_text or "pyright" in command_text:
-            section = "Type Check"
-        else:
-            section = "Integration Tests"
-        grouped.setdefault(section, []).append(result)
-    for section, section_results in grouped.items():
-        body = [
-            "命令：",
-            *[f"- {' '.join(item.command)}" for item in section_results],
-            "",
-            f"状态：{'PASS' if all(item.passed for item in section_results) else 'FAIL'}",
-        ]
-        document = replace_section(document, section, "\n".join(body))
-    store.write_text(data["path"] / "verification.md", document)
+    with store.locked(requirement_id):
+        data = store.load(requirement_id)
+        document = data["verification"]
+        grouped: dict[str, list[VerificationResult]] = {}
+        for result in results:
+            command_text = " ".join(result.command).casefold()
+            if "pytest" in command_text:
+                section = "Unit Tests"
+            elif "ruff" in command_text or "mypy" in command_text or "pyright" in command_text:
+                section = "Type Check"
+            else:
+                section = "Integration Tests"
+            grouped.setdefault(section, []).append(result)
+        for section, section_results in grouped.items():
+            body = [
+                "命令：",
+                *[f"- {' '.join(item.command)}" for item in section_results],
+                "",
+                f"状态：{'PASS' if all(item.passed for item in section_results) else 'FAIL'}",
+                "结果："
+                + "；".join(
+                    verification_result_excerpt(item, store.working_root)
+                    for item in section_results
+                ),
+            ]
+            document = replace_section(document, section, "\n".join(body))
+        store.write_text(data["path"] / "verification.md", document)
 
 
 def list_tasks_safely(

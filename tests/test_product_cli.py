@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 from workspace_orchestrator.product_cli import main
+from workspace_orchestrator.project_config import default_task_project_id
 from workspace_orchestrator.project_init import AGENTS_START, GITIGNORE_START
 
 
-def test_init_onboards_existing_project_without_creating_workspace(
-    tmp_path: Path, capsys
-) -> None:
+def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Path, capsys) -> None:
     (tmp_path / "README.md").write_text("# Existing project\n", encoding="utf-8")
 
     assert main(["init", str(tmp_path)]) == 0
@@ -20,28 +22,19 @@ def test_init_onboards_existing_project_without_creating_workspace(
     assert (tmp_path / "AGENTS.md").is_file()
     assert (tmp_path / "USER_PRINCIPLES.md").is_file()
     assert (tmp_path / "PROJECT_INTENT.md").is_file()
-    assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
-    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert set(hooks["hooks"]) == {
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop",
-        "SessionEnd",
-    }
-    assert all(
-        "workspace_orchestrator.codex_hook" in group["hooks"][0]["command"]
-        for groups in hooks["hooks"].values()
-        for group in groups
-    )
-    assert not (tmp_path / ".workspace").exists()
     config = json.loads((tmp_path / ".ai-dev-os.json").read_text(encoding="utf-8"))
-    assert config["automation"]["auto_finish_pushed_thread"] is True
+    assert config["task_provider"] == "dashi"
+    assert config["task_project_id"]
+    assert config["auto_execute_in_progress"] is True
+    assert config["dispatcher_poll_seconds"] == 2.0
+    assert config["codex_sandbox"] == "workspace-write"
+    assert config["codex_model"] is None
+    assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert not (tmp_path / ".workspace").exists()
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
 
 
-def test_init_preserves_existing_content_and_is_idempotent(
-    tmp_path: Path, capsys
-) -> None:
+def test_init_preserves_existing_content_and_is_idempotent(tmp_path: Path, capsys) -> None:
     agents = tmp_path / "AGENTS.md"
     principles = tmp_path / "USER_PRINCIPLES.md"
     intent = tmp_path / "PROJECT_INTENT.md"
@@ -72,8 +65,7 @@ def test_init_preserves_existing_content_and_is_idempotent(
     assert principles.read_text(encoding="utf-8") == "# My principles\n"
     assert intent.read_text(encoding="utf-8") == "# My intent\n"
     assert gitignore.read_text(encoding="utf-8").startswith(".env\n")
-    assert "已保留：" in second_output
-    assert ".codex/hooks.json" in second_output
+    assert "已保留：AGENTS.md, USER_PRINCIPLES.md, PROJECT_INTENT.md, .gitignore" in second_output
 
 
 def test_init_rejects_missing_directory(tmp_path: Path, capsys) -> None:
@@ -96,6 +88,67 @@ def test_init_rejects_incomplete_managed_block(tmp_path: Path, capsys) -> None:
     assert not (tmp_path / ".workspace").exists()
 
 
+def test_init_rejects_unknown_task_provider_before_other_writes(tmp_path: Path, capsys) -> None:
+    (tmp_path / ".ai-dev-os.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_provider": "dahsi",
+                "task_project_id": "demo",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["init", str(tmp_path)]) == 2
+
+    assert "不支持的 task_provider" in capsys.readouterr().err
+    assert not (tmp_path / "AGENTS.md").exists()
+
+
+def test_init_upgrades_existing_project_config_with_dispatcher_defaults(
+    tmp_path: Path, capsys
+) -> None:
+    config_path = tmp_path / ".ai-dev-os.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_provider": "dashi",
+                "task_project_id": "demo",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "已更新" in output
+    assert config["task_project_id"] == "demo"
+    assert config["auto_execute_in_progress"] is True
+    assert config["dispatcher_poll_seconds"] == 2.0
+    assert config["codex_sandbox"] == "workspace-write"
+    assert config["codex_model"] is None
+
+
+def test_default_dashi_project_id_distinguishes_same_named_directories(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "one" / "project"
+    second = tmp_path / "two" / "project"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    first_id = default_task_project_id(first)
+    second_id = default_task_project_id(second)
+
+    assert first_id.startswith("project-")
+    assert second_id.startswith("project-")
+    assert first_id != second_id
+
+
 def test_init_does_not_duplicate_existing_ignore_rules(tmp_path: Path, capsys) -> None:
     gitignore = tmp_path / ".gitignore"
     gitignore.write_text(".workspace/\n.worktrees/\n", encoding="utf-8")
@@ -110,8 +163,7 @@ def test_init_does_not_duplicate_existing_ignore_rules(tmp_path: Path, capsys) -
 def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> None:
     agents = tmp_path / "AGENTS.md"
     agents.write_text(
-        "# Existing\n\n"
-        f"{AGENTS_START}\n旧的手工 bootstrap 指引\n<!-- ai-dev-os:end -->\n",
+        f"# Existing\n\n{AGENTS_START}\n旧的手工 bootstrap 指引\n<!-- ai-dev-os:end -->\n",
         encoding="utf-8",
     )
 
@@ -125,25 +177,57 @@ def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> N
     assert "旧的手工 bootstrap 指引" not in content
 
 
-def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path, capsys) -> None:
-    config = tmp_path / ".ai-dev-os.json"
-    config.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "automation": {"auto_finish_pushed_thread": False},
-            },
-            ensure_ascii=False,
-        ),
+def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    dist = tmp_path / "dist"
+    venv = tmp_path / "tool-env"
+    project = tmp_path / "new-project"
+    project.mkdir()
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(dist)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["uv", "venv", str(venv)], check=True, capture_output=True, text=True)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        ["uv", "pip", "install", "--python", str(python), str(next(dist.glob("*.whl")))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scripts = venv / ("Scripts" if os.name == "nt" else "bin")
+    ai_dev_os = scripts / ("ai-dev-os.exe" if os.name == "nt" else "ai-dev-os")
+    workspace = scripts / ("workspace.exe" if os.name == "nt" else "workspace")
+
+    subprocess.run([str(ai_dev_os), "init", str(project)], check=True, capture_output=True)
+    subprocess.run(
+        [str(workspace), "--root", str(project), "new", "Wheel hook"],
+        check=True,
+        capture_output=True,
+    )
+    event = {
+        "session_id": "wheel-thread",
+        "cwd": str(project),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "继续 REQ-001",
+    }
+    result = subprocess.run(
+        [str(ai_dev_os), "hook"],
+        input=json.dumps(event),
+        text=True,
         encoding="utf-8",
+        capture_output=True,
+        check=True,
     )
 
-    assert main(["init", str(tmp_path)]) == 0
-
-    capsys.readouterr()
-    payload = json.loads(config.read_text(encoding="utf-8"))
-    assert payload["automation"]["auto_finish_pushed_thread"] is False
-    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    stop_hook = hooks["hooks"]["Stop"][0]["hooks"][0]
-    assert stop_hook["async"] is True
-    assert stop_hook["timeout"] == 30
+    hooks = json.loads((project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    assert "REQ-001" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "ai-dev-os hook"
+    assert not (project / "src").exists()
+    assert not (project / ".venv").exists()
+    assert shutil.which("python", path=str(project)) is None

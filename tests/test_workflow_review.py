@@ -2,9 +2,10 @@ from pathlib import Path
 
 import pytest
 
+from workspace_orchestrator.cli import main
 from workspace_orchestrator.intent import IntentStatus, review_intent
 from workspace_orchestrator.models import Task, WorkflowComplexity
-from workspace_orchestrator.review import review_requirement
+from workspace_orchestrator.review import confirm_requirement_done, review_requirement
 from workspace_orchestrator.workflow import route_workflow, upgrade_workflow
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
@@ -48,7 +49,7 @@ def test_workflow_can_upgrade_but_not_downgrade(tmp_path: Path) -> None:
 
 def test_review_blocks_until_acceptance_and_verification_pass(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
-    requirement_id = store.create("Demo", acceptance=["Feature works"])
+    requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)
 
     blocked = review_requirement(store, requirement_id)
 
@@ -62,7 +63,7 @@ def test_review_blocks_until_acceptance_and_verification_pass(tmp_path: Path) ->
 
 def test_review_enters_in_review_but_never_done(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
-    requirement_id = store.create("Demo", acceptance=["Feature works"])
+    requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)
     data = store.load(requirement_id)
     requirement = data["requirement"].replace("- [ ] Feature works", "- [x] Feature works")
     verification = data["verification"].replace("状态：TODO", "状态：PASS")
@@ -77,11 +78,120 @@ def test_review_enters_in_review_but_never_done(tmp_path: Path) -> None:
     assert store.load(requirement_id)["meta"]["status"] == "in_review"
 
 
+def test_review_requires_explicit_user_confirmation_before_done(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "requirement.md",
+        data["requirement"].replace("- [ ] Feature works", "- [x] Feature works"),
+    )
+    store.write_text(
+        data["path"] / "verification.md",
+        data["verification"].replace("状态：TODO", "状态：PASS"),
+    )
+    mark_intent_review_pass(store, requirement_id)
+    assert review_requirement(store, requirement_id).passed is True
+
+    with pytest.raises(WorkspaceError, match="明确确认"):
+        confirm_requirement_done(store, requirement_id, user_confirmed=False)
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+
+    confirm_requirement_done(store, requirement_id, user_confirmed=True)
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+
+
+def test_core_confirm_rejects_configured_provider_without_current_packet(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Provider confirm", task_provider="dashi")
+    store.touch_meta(requirement_id, status="in_review")
+
+    with pytest.raises(WorkspaceError, match="无法验证 Review Packet"):
+        confirm_requirement_done(store, requirement_id, user_confirmed=True)
+
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+
+
+def test_review_reopens_stale_in_review_when_acceptance_changes(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Stale review", acceptance=["Feature works"], task_provider=None)
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "requirement.md",
+        data["requirement"].replace("- [ ] Feature works", "- [x] Feature works"),
+    )
+    store.write_text(
+        data["path"] / "verification.md",
+        data["verification"].replace("状态：TODO", "状态：PASS"),
+    )
+    mark_intent_review_pass(store, requirement_id)
+    assert review_requirement(store, requirement_id).passed is True
+
+    current = store.load(requirement_id)
+    store.write_text(
+        current["path"] / "requirement.md",
+        current["requirement"].replace("- [x] Feature works", "- [ ] Feature works"),
+    )
+    result = review_requirement(store, requirement_id)
+
+    assert result.passed is False
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+
+
+def test_done_requirement_cannot_be_reopened_by_review(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Already done", task_provider=None)
+    store.touch_meta(requirement_id, status="done")
+
+    result = review_requirement(store, requirement_id)
+
+    assert result.passed is False
+    assert result.blockers == ("Requirement 已完成，不能重新进入审查",)
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+
+
+def test_current_id_ignores_requirements_waiting_for_user_review(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    reviewed = store.create("Reviewed")
+    active = store.create("Active")
+    store.touch_meta(reviewed, status="in_review")
+    store.touch_meta(active, status="in_progress")
+
+    assert store.current_id() == active
+
+
+def test_request_changes_cli_requires_feedback_and_reopens_requirement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Needs changes", task_provider=None)
+    store.touch_meta(requirement_id, status="in_review")
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "request-changes",
+                requirement_id,
+                "--feedback",
+                "请补充边界测试。",
+            ]
+        )
+        == 0
+    )
+
+    assert "已恢复 in_progress" in capsys.readouterr().out
+    data = store.load(requirement_id)
+    assert data["meta"]["status"] == "in_progress"
+    assert "请补充边界测试。" in data["state"]
+
+
 def test_review_checks_configured_task_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = WorkspaceStore(tmp_path)
-    requirement_id = store.create("Demo", acceptance=["Feature works"])
+    requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)
     data = store.load(requirement_id)
     store.write_text(
         data["path"] / "requirement.md",
@@ -95,15 +205,10 @@ def test_review_checks_configured_task_provider(
     store.touch_meta(requirement_id, task_provider="dashi")
 
     class FakeDashi:
-        def __init__(self, project_id: str) -> None:
-            self.project_id = project_id
-
         def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
             return (Task(id="TASK-001", title="Pending", status="in_progress"),)
 
-    monkeypatch.setattr("workspace_orchestrator.review.DashiTaskProvider", FakeDashi)
-
-    result = review_requirement(store, requirement_id)
+    result = review_requirement(store, requirement_id, task_provider=FakeDashi())  # type: ignore[arg-type]
 
     assert result.passed is False
     assert result.blockers == ("任务尚未达到可审查状态：TASK-001 [in_progress]",)
@@ -113,8 +218,10 @@ def test_intent_review_reports_violation_when_any_check_violates(tmp_path: Path)
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Over-designed change")
     data = store.load(requirement_id)
-    intent = data["intent"].replace("：PARTIAL", "：PASS").replace(
-        "- 不必要的复杂度：PASS", "- 不必要的复杂度：VIOLATION"
+    intent = (
+        data["intent"]
+        .replace("：PARTIAL", "：PASS")
+        .replace("- 不必要的复杂度：PASS", "- 不必要的复杂度：VIOLATION")
     )
     store.write_text(data["path"] / "intent.md", intent)
 

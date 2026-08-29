@@ -7,8 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
-            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "command": "ai-dev-os hook",
+            "commandWindows": "ai-dev-os hook",
             "statusMessage": "自动恢复 AI Dev OS Workspace",
             "additionalContextLimit": 5000
           }
@@ -20,24 +20,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
-            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "command": "ai-dev-os hook",
+            "commandWindows": "ai-dev-os hook",
             "statusMessage": "自动绑定 Requirement、Task 与 Session",
             "additionalContextLimit": 5000
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
-            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
-            "statusMessage": "检查已推送任务自动收尾",
-            "timeout": 30,
-            "async": true
           }
         ]
       }
@@ -47,8 +33,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
-            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "command": "ai-dev-os hook",
+            "commandWindows": "ai-dev-os hook",
             "timeout": 3
           }
         ]
