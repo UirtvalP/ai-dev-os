@@ -12,6 +12,46 @@ from .intent import INTENT_CHECK_LABELS, IntentStatus, review_intent
 from .workspace import WorkspaceError, WorkspaceStore, bullets, markdown_sections, replace_section
 
 
+def require_current_review_packet(
+    store: WorkspaceStore,
+    requirement_id: str,
+    task_provider: TaskProvider | None,
+    current_packet_fingerprint: str | None,
+):
+    """对配置 Provider 的 Requirement 强制核对已发布 Packet 与当前事实。"""
+
+    data = store.load(requirement_id)
+    meta = data["meta"]
+    if meta.get("task_provider") is None:
+        return None
+    if task_provider is None:
+        raise WorkspaceError("已配置 Task Provider，无法验证 Review Packet 新鲜度")
+    from .automation.task_attach import requirement_review_task
+    from .review_packet import parse_review_packet_marker
+
+    expected_id = meta.get("requirement_review_task_id")
+    if not expected_id:
+        raise WorkspaceError("Review Packet 尚未发布：缺少专用 Review 卡 ID")
+    review_task = requirement_review_task(
+        task_provider, requirement_id, expected_task_id=str(expected_id)
+    )
+    if review_task is None:
+        raise WorkspaceError("Review Packet 尚未发布：缺少专用 Review 卡")
+    marker = parse_review_packet_marker(review_task.description)
+    revision = meta.get("review_packet_published_revision")
+    fingerprint = meta.get("review_packet_published_fingerprint")
+    if not revision or not fingerprint:
+        raise WorkspaceError("Review Packet 尚未发布：缺少 revision/fingerprint")
+    if (
+        marker != (requirement_id.upper(), revision, fingerprint)
+        or meta.get("review_packet_revision") != revision
+        or meta.get("review_packet_fingerprint") != fingerprint
+        or current_packet_fingerprint != fingerprint
+    ):
+        raise WorkspaceError("Review Packet 已陈旧：marker、revision 或 fingerprint 与当前事实不一致")
+    return review_task
+
+
 def request_requirement_changes(
     store: WorkspaceStore,
     requirement_id: str,
@@ -136,11 +176,37 @@ def sync_requirement_review_outcome(
                     "旧 revision 不会批准当前 Requirement，已恢复 in_progress"
                 )
             if review_task.status == "done":
-                confirm_requirement_done(store, requirement_id, user_confirmed=True)
+                approval = task_provider.review_approval_fact(review_task.id)
+                if approval is None:
+                    store.touch_meta(
+                        requirement_id,
+                        review_approval_pending_reason="无法取得最后一次进入 done 的可靠 actor",
+                    )
+                    return (
+                        f"Requirement Review Task {review_task.id} 已是 done，"
+                        "但无法验证操作者；Requirement 保持 in_review"
+                    )
+                if approval.actor_type != "user" or not approval.actor_id:
+                    reason = (
+                        f"最后一次进入 done 的 actor 不是可靠用户："
+                        f"{approval.actor_type or 'unknown'}:{approval.actor_id or 'unknown'}"
+                    )
+                    store.touch_meta(requirement_id, review_approval_pending_reason=reason)
+                    return f"Requirement Review Task {review_task.id} 未获用户批准：{reason}"
+                confirm_requirement_done(
+                    store,
+                    requirement_id,
+                    user_confirmed=True,
+                    task_provider=task_provider,
+                    current_packet_fingerprint=current_packet_fingerprint,
+                )
                 store.touch_meta(
                     requirement_id,
                     review_confirmation_source=review_task.id,
                     review_confirmation_revision=published_revision,
+                    review_confirmation_activity_id=approval.activity_id,
+                    review_confirmation_actor_id=approval.actor_id,
+                    review_approval_pending_reason=None,
                 )
                 return f"用户已在 dashi 批准 {review_task.id}，Requirement 已进入 done"
             if review_task.status == "in_progress":
@@ -241,11 +307,17 @@ def confirm_requirement_done(
     requirement_id: str,
     *,
     user_confirmed: bool,
+    task_provider: TaskProvider | None = None,
+    current_packet_fingerprint: str | None = None,
 ) -> None:
     """仅在用户明确确认后执行 in_review → done；永不修改外部 Task。"""
 
     if not user_confirmed:
         raise WorkspaceError("必须提供用户明确确认，Requirement 才能进入 done")
+    before = store.load(requirement_id)["meta"]
+    require_current_review_packet(
+        store, requirement_id, task_provider, current_packet_fingerprint
+    )
     with store.locked(requirement_id):
         meta = store.load(requirement_id)["meta"]
         if meta.get("status") == "done":
@@ -254,4 +326,11 @@ def confirm_requirement_done(
             raise WorkspaceError(
                 f"Requirement 必须处于 in_review 才能确认完成；当前状态：{meta.get('status')}"
             )
+        if before.get("task_provider") is not None and (
+            meta.get("review_packet_published_revision")
+            != before.get("review_packet_published_revision")
+            or meta.get("review_packet_published_fingerprint")
+            != before.get("review_packet_published_fingerprint")
+        ):
+            raise WorkspaceError("确认期间 Review Packet 已发生变化，请重新审查")
         store.touch_meta(requirement_id, status="done")

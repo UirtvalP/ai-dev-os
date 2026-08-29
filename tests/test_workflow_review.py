@@ -101,6 +101,17 @@ def test_review_requires_explicit_user_confirmation_before_done(tmp_path: Path) 
     assert store.load(requirement_id)["meta"]["status"] == "done"
 
 
+def test_core_confirm_rejects_configured_provider_without_current_packet(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Provider confirm", task_provider="dashi")
+    store.touch_meta(requirement_id, status="in_review")
+
+    with pytest.raises(WorkspaceError, match="无法验证 Review Packet"):
+        confirm_requirement_done(store, requirement_id, user_confirmed=True)
+
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+
+
 def test_review_reopens_stale_in_review_when_acceptance_changes(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Stale review", acceptance=["Feature works"], task_provider=None)

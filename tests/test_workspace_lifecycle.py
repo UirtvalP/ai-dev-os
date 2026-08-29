@@ -429,7 +429,7 @@ def test_cli_confirm_requires_explicit_flag_and_marks_only_requirement_done(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     store = WorkspaceStore(tmp_path)
-    requirement_id = store.create("Confirm")
+    requirement_id = store.create("Confirm", task_provider=None)
     store.touch_meta(requirement_id, status="in_review")
     root_args = ["--root", str(tmp_path)]
 

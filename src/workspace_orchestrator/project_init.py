@@ -30,6 +30,8 @@ AGENTS_BLOCK = f"""{AGENTS_START}
   handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
 - 用户批准时使用 dashi 专用 Review 卡或 `workspace confirm REQ-ID --user-confirmed`；
   用户要求修改时使用 Review 卡新增留言并退回，或执行 `workspace request-changes`。
+- dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或
+  恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。
 {AGENTS_END}
 """
 
@@ -182,13 +184,30 @@ def _validate_project_config(path: Path) -> None:
 
 def _ensure_project_config(root: Path) -> str:
     path = root / CONFIG_NAME
-    if path.exists():
-        return "preserved"
-    WorkspaceStore.write_text(
-        path,
-        json.dumps(initialized_project_config(root), ensure_ascii=False, indent=2),
-    )
-    return "created"
+    desired = initialized_project_config(root)
+    if not path.exists():
+        WorkspaceStore.write_text(
+            path,
+            json.dumps(desired, ensure_ascii=False, indent=2),
+        )
+        return "created"
+    current = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for key in (
+        "auto_execute_in_progress",
+        "dispatcher_poll_seconds",
+        "codex_sandbox",
+    ):
+        if key not in current:
+            current[key] = desired[key]
+            changed = True
+    if changed:
+        WorkspaceStore.write_text(
+            path,
+            json.dumps(current, ensure_ascii=False, indent=2),
+        )
+        return "updated"
+    return "preserved"
 
 
 def _append_managed_block(path: Path, block: str, start: str, end: str) -> str:

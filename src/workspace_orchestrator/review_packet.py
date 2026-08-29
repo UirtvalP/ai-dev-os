@@ -98,10 +98,8 @@ def build_review_packet(
             for line in body.splitlines()
             if line.strip().startswith("- ")
         )
-        result = next(
-            (line.strip() for line in body.splitlines() if line.strip() and not line.startswith("- ")),
-            "",
-        )
+        results = re.findall(r"(?im)^(?:Result|结果)[:：]\s*(.+)$", body)
+        result = results[-1].strip() if results else "未记录结果摘要"
         verification.append(
             ReviewVerification(name, commands, statuses[-1].upper() if statuses else "MISSING", result)
         )
@@ -185,6 +183,7 @@ def render_review_packet(packet: ReviewPacket, revision: int) -> str:
     verification = "\n".join(
         f"- {item.name}：{item.status}\n"
         + (lines(item.commands, indent="  ") if item.commands else "  无命令")
+        + f"\n  结果：{item.result}"
         for item in packet.verification
     ) or "无"
     tasks = "\n".join(

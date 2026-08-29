@@ -16,3 +16,4 @@
 - 仓库级 Codex Hook 会在 `SessionStart` / `UserPromptSubmit` 自动触发 bootstrap；Agent 不得重复手工执行其内部的 Session、Requirement、Task、dashi 或 Git 步骤。Hook 未启用或未受信任时，Skill 仅回退触发一次
   `.\.venv\Scripts\workspace.exe bootstrap --request "<当前开发请求>"`。将返回的 Context Snapshot 视为事实来源。多个活动需求且当前 Thread 尚未绑定时不得静默选择；多个 `in_progress` Task 时不得静默绑定。
 - 语义工作完成后只触发一次 `workspace finalize REQ-ID`；已知验证、checkpoint、Task `in_review`、handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。
+- dashi 中未绑定的普通开发 Task 被用户移到 `in_progress` 后，由本地 Dispatcher 自动启动或恢复 Codex；Agent 不得重复认领或再次启动执行。Requirement Review 卡不进入该路径。

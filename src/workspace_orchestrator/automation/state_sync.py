@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -338,6 +339,27 @@ def verification_summary(results: Sequence[VerificationResult]) -> str:
     return "\n".join(lines)
 
 
+def verification_result_excerpt(
+    result: VerificationResult, project_root: Path, *, limit: int = 500
+) -> str:
+    """提取单行、限长且去除本机路径的稳定验证结果摘要。"""
+
+    lines = [" ".join(line.split()) for line in result.output.splitlines() if line.strip()]
+    if not lines:
+        return "无输出（命令成功）" if result.passed else "无输出（命令失败）"
+    summary = lines[-1]
+    replacements = (
+        (str(project_root.resolve()), "<workspace>"),
+        (str(Path.home()), "<home>"),
+        (tempfile.gettempdir(), "<temp>"),
+    )
+    for value, replacement in replacements:
+        summary = summary.replace(value, replacement).replace(value.casefold(), replacement)
+    if len(summary) > limit:
+        summary = "…" + summary[-(limit - 1) :]
+    return summary
+
+
 def persist_verification_results(
     store: WorkspaceStore,
     requirement_id: str,
@@ -364,6 +386,11 @@ def persist_verification_results(
                 *[f"- {' '.join(item.command)}" for item in section_results],
                 "",
                 f"状态：{'PASS' if all(item.passed for item in section_results) else 'FAIL'}",
+                "结果："
+                + "；".join(
+                    verification_result_excerpt(item, store.working_root)
+                    for item in section_results
+                ),
             ]
             document = replace_section(document, section, "\n".join(body))
         store.write_text(data["path"] / "verification.md", document)

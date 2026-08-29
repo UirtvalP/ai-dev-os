@@ -19,7 +19,7 @@ from workspace_orchestrator.automation.runtime import AutomationRuntime
 from workspace_orchestrator.automation.session_runtime import end_session
 from workspace_orchestrator.automation.task_attach import configured_task_provider
 from workspace_orchestrator.cli import main
-from workspace_orchestrator.models import Task
+from workspace_orchestrator.models import ReviewApprovalFact, Task
 from workspace_orchestrator.review_packet import build_review_packet, render_review_packet
 from workspace_orchestrator.workspace import WorkspaceStore
 
@@ -46,6 +46,7 @@ class FakeTasks:
         self.git_updates: list[tuple[str, str | None, str | None]] = []
         self.comments: dict[str, list[str]] = {}
         self.review_publications: list[str] = []
+        self.approval_actors: dict[str, str | None] = {}
 
     def list_tasks(self, requirement_id: str) -> tuple[Task, ...]:
         return tuple(self.tasks.get(requirement_id, ()))
@@ -73,6 +74,18 @@ class FakeTasks:
         self.tasks[requirement_id][index] = updated
         self.review_publications.append(task_id)
         return updated
+
+    def review_approval_fact(self, task_id: str) -> ReviewApprovalFact | None:
+        actor_type = self.approval_actors.get(task_id, "user")
+        if actor_type is None:
+            return None
+        return ReviewApprovalFact(
+            activity_id=f"activity-{task_id}",
+            actor_type=actor_type,
+            actor_id="local-user" if actor_type == "user" else "codex-agent",
+            actor_name="本地用户" if actor_type == "user" else "Codex Agent",
+            changed_at="2026-08-29T08:00:00Z",
+        )
 
     def add_comment(self, task_id: str, body: str) -> None:
         self.comments.setdefault(task_id, []).append(body)
@@ -315,7 +328,7 @@ def test_finalize_runs_known_verification_and_automates_review_handoff_detach(
 
 
 def test_finalize_publishes_complete_idempotent_review_packet(tmp_path: Path) -> None:
-    _, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
 
     result = runtime.finalize(requirement_id, completed=("确定性 Review Packet",))
 
@@ -334,10 +347,16 @@ def test_finalize_publishes_complete_idempotent_review_packet(tmp_path: Path) ->
     ):
         assert heading in review_task.description
     assert "ai-dev-os-review-packet:v1" in review_task.description
+    assert "结果：pytest" in review_task.description
+    assert "结果：ruff" in review_task.description
+    assert "结果：integration" in review_task.description
+    assert "结果：状态：" not in review_task.description
     publications = len(tasks.review_publications)
+    fingerprint = store.load(requirement_id)["meta"]["review_packet_fingerprint"]
     blockers, _ = runtime._publish_review_packet(requirement_id, tasks)
     assert blockers == ()
     assert len(tasks.review_publications) == publications
+    assert store.load(requirement_id)["meta"]["review_packet_fingerprint"] == fingerprint
 
 
 def test_review_packet_evidence_change_updates_revision(tmp_path: Path) -> None:
@@ -489,6 +508,75 @@ def test_dashi_review_task_done_is_explicit_requirement_approval(tmp_path: Path)
     assert store.load(requirement_id)["meta"]["review_confirmation_source"] == "TASK-REVIEW"
     assert "用户已在 dashi 批准" in messages[0]
     assert tasks.get_task("TASK-001").status == "done"
+
+
+@pytest.mark.parametrize("actor_type", ["agent", "script", None])
+def test_done_review_card_without_reliable_user_actor_never_approves(
+    tmp_path: Path, actor_type: str | None
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Review actor")
+    store.touch_meta(requirement_id, status="in_review")
+    tasks = FakeTasks()
+    tasks.tasks[requirement_id] = [
+        Task(
+            id="TASK-REVIEW",
+            title="Requirement Review",
+            status="done",
+            labels=("requirement-review",),
+        )
+    ]
+    tasks.approval_actors["TASK-REVIEW"] = actor_type
+    _seed_current_review_packet(store, requirement_id, tasks)
+
+    messages = AutomationRuntime(store, CodexAgentProvider(environ={}), tasks).sync_reviews(
+        requirement_id
+    )
+
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+    assert "Requirement" in messages[0]
+    assert "批准" in messages[0] or "操作者" in messages[0]
+
+
+def test_cli_confirm_rejects_missing_and_stale_dashi_review_packet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    missing_id = store.create("Missing packet")
+    store.touch_meta(missing_id, status="in_review")
+    tasks = FakeTasks()
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.runtime.configured_task_provider",
+        lambda *_: tasks,
+    )
+
+    assert main(["--root", str(tmp_path), "confirm", missing_id, "--user-confirmed"]) == 2
+    assert "Review Packet" in capsys.readouterr().err
+    assert store.load(missing_id)["meta"]["status"] == "in_review"
+
+    store.touch_meta(missing_id, status="done")
+    stale_id = store.create("Stale packet")
+    store.touch_meta(stale_id, status="in_review")
+    tasks.tasks[stale_id] = [
+        Task(
+            id="TASK-REVIEW",
+            title="Requirement Review",
+            status="in_review",
+            labels=("requirement-review",),
+        )
+    ]
+    _seed_current_review_packet(store, stale_id, tasks)
+    data = store.load(stale_id)
+    store.write_text(
+        data["path"] / "state.md",
+        data["state"].replace("## 已完成\n\n无", "## 已完成\n\n- 新证据"),
+    )
+
+    assert main(["--root", str(tmp_path), "confirm", stale_id, "--user-confirmed"]) == 2
+    assert "已陈旧" in capsys.readouterr().err
+    assert store.load(stale_id)["meta"]["status"] == "in_review"
 
 
 def test_workspace_status_syncs_dashi_review_approval(

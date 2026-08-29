@@ -15,6 +15,10 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 3. 将生成的 Context Snapshot 视为需求、状态、交接、计划、决策、验证、相关意图、Dashi Task、Git 上下文和下一步行动的事实来源。`workspace current` 和 `workspace resume REQ-ID` 仅作为诊断入口。
 4. 多个活动 Requirement 或多个 `in_progress` Task 返回 `ambiguity` 时，只有这一步请求用户选择。Requirement 不得因小修改自动创建。
 
+项目配置启用 `auto_execute_in_progress` 时，dashi 中由用户移到 `in_progress` 的未绑定开发 Task
+会由本地 Dispatcher 自动启动或恢复 Codex。新 Session 的 Hook Snapshot 仍是事实来源；Agent 不得
+再次启动 Dispatcher 或重复认领 Task。Requirement Review 卡不属于自动执行目标。
+
 兼容回退命令保持为 `workspace bootstrap REQ-ID --request "用户当前开发请求"` 或 `workspace bootstrap --request "用户当前开发请求"`；多个活动 Task 时不得猜测。
 
 ## 执行

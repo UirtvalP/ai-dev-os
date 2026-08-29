@@ -30,6 +30,7 @@ Checkpoint / Handoff
 - Intent Layer 保存用户长期原则、项目取舍和 Requirement 的设计理由；技术验收通过但 Intent
   Alignment 失败时仍不能进入 review。
 - dashi-taskboard 作为可替换的 Task Provider，保存执行状态与 Thread / branch / worktree 关联。
+- 本地 Dispatcher 把用户明确移到 `in_progress` 的开发 Task 自动交给 Codex 执行。
 - Codex Skill 负责恢复 Workspace，并按 tiny / normal / complex / research 选择最轻的安全流程。
 - Git 保存代码状态；V1 的 Agent Provider 仅支持 Codex。
 - Multica 多 Agent 调度和 Obsidian 知识写入保留为后续 Adapter，不进入 V1。
@@ -79,9 +80,32 @@ ai-dev-os init
 
 该命令只补充项目级接入文件，并保留已有内容；重复执行不会重复写入。它会创建
 `.ai-dev-os.json`，默认配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，但不会创建
-Requirement Workspace，也不会改变 `workspace` 命令层级。接入完成后，再使用
+Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使用
 `workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
 `ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
+
+Dispatcher 的默认配置写在 `.ai-dev-os.json`：
+
+```json
+{
+  "auto_execute_in_progress": true,
+  "dispatcher_poll_seconds": 2.0,
+  "codex_sandbox": "workspace-write"
+}
+```
+
+用户把带 `requirement:REQ-*` 标签的普通开发 Task 移到 `in_progress`，即表示授权执行。
+Dispatcher 会在本地通过官方 `codex exec` 启动新 Session；存在已结束的 Workspace Session 时优先
+使用 `codex exec resume`。已有活动 Thread 绑定、专用 Requirement Review 卡以及相同 task version
+不会被重复认领。Codex 结束但 Task 未进入 review 时，Dispatcher 会把它转为 `blocked` 并写入错误，
+不会继续显示成“处理中”。
+
+```bash
+ai-dev-os dispatcher status
+ai-dev-os dispatcher start
+ai-dev-os dispatcher stop
+ai-dev-os dispatcher run-once
+```
 
 构建可安装 wheel：
 
@@ -136,6 +160,8 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 - `git_sync.py`：Git root、branch、worktree、status、commits、changed files 与 dashi Git 上下文。
 - `state_sync.py`：纯结构化 Context Snapshot、checkpoint、handoff 和已知验证命令。
 - `runtime.py`：一次触发连续编排上述确定性步骤；不调用 LLM，也不读取对话历史。
+- `dispatcher.py`：从 dashi `in_progress` 状态确定性认领未绑定开发 Task，通过 Codex Adapter
+  启动/恢复非交互 Session，并记录本地 JSON 状态与执行日志。
 - `review_packet.py`：只从 Requirement、Intent、State、Verification、Handoff、开发 Task 与
   Git Adapter 生成结构化审查事实、稳定 revision/fingerprint 和中文 Markdown。
 
@@ -163,8 +189,11 @@ OS advisory 文件锁与原子替换；进程被 `SessionEnd` 超时强杀后锁
    包含目标与范围、完成内容、验收、验证命令与结果、修改文件、Git 上下文、风险、开发 Task 和操作说明。
    正文发布成功且 revision/fingerprint 与当前 Workspace 证据一致后，Requirement 与卡片才进入 `in_review`。
 2. 批准：用户在 dashi 将这张 Review 卡手动移到 `done`；后续 Hook、bootstrap 或
-   `workspace status REQ-ID` 会把 Requirement 确认到 `done`。等价 CLI 是
-   `workspace confirm REQ-ID --user-confirmed`。
+   `workspace status REQ-ID` 只有在 dashi 结构化活动能够证明最后一次进入 `done` 的操作者是
+   用户时，才会把 Requirement 确认到 `done`。Agent、脚本、未知操作者或无法取得可靠活动事实时
+   保持可重试，不产生批准语义。等价 CLI 是 `workspace confirm REQ-ID --user-confirmed`；配置了
+   dashi 时，该显式入口同样必须核对当前 Workspace 事实与卡片 marker、revision、fingerprint，
+   缺失或陈旧时拒绝确认。显式无 Provider 的本地审查不依赖外部卡片，仍可使用该命令。
 3. 要求修改：用户先在 Review 卡留言，再手动移到 `in_progress`；后续同步会记录最新留言、
    把 Requirement 恢复为 `in_progress`，并重开仍处于 `in_review` 的开发 Task。等价 CLI 是
    `workspace request-changes REQ-ID --feedback "修改意见"`。
@@ -174,7 +203,8 @@ OS advisory 文件锁与原子替换；进程被 `SessionEnd` 超时强杀后锁
 判断都不会批准或退回 Requirement。Runtime 永不自行把 Review 卡置为 `done`，`confirm` 也不会
 自动完成任何外部 Task。Provider 离线时，退回修改先保存本地状态并在后续 bootstrap 重试 Task 收敛。
 Review 卡正文发布失败、关键证据缺失，或卡片 marker 与当前 revision/fingerprint 不一致时，Runtime 会
-返回具体 blocker 并保持/恢复 `in_progress`；旧 revision 的 `done` 卡绝不会批准新证据。
+返回具体 blocker 并保持/恢复 `in_progress`；旧 revision 的 `done` 卡绝不会批准新证据。Packet 的
+验证区同时展示命令、状态和经过长度限制及路径清理的真实结果摘要，不会把状态行误当作执行结果。
 
 并发边界：V1 支持多个 Session 并发更新不同 Requirement，也支持不同 Requirement 的 Thread
 在**已经分配好的各自 Git worktree** 中并发执行；它们共享主工作树 `.workspace`，但 Session、

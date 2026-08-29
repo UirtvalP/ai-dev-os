@@ -96,6 +96,18 @@ Hook、finalize blockers、验证超时与无效配置均有自动回归测试�
 验收：任务面板 Review 卡可独立验收；证据变化会生成新 revision，重复发布不产生额外写入，
 并发 Hook 的批准/退回只应用一次，SessionEnd 超时终止不会遗留阻塞后续本地开发的锁。
 
+## 阶段 9 — dashi 反向触发 Codex 执行
+
+- [x] `ai-dev-os init` 默认启用并启动本地单任务 Dispatcher
+- [x] 未绑定开发 Task 移到 `in_progress` 后通过 `codex exec` 自动启动
+- [x] 返工 Task 优先通过 Workspace 历史 Session 执行 `codex exec resume`
+- [x] 已有活动绑定、Review 卡和相同 task version 不重复认领
+- [x] 缺失 worktree、Codex 失败或未 finalize 时转为 `blocked` 并写入可读诊断
+- [ ] 完成真实 dashi → Codex → finalize → review 端到端验收
+
+验收：用户只需在 dashi 将开发 Task 移到“处理中”，无需再打开 Codex 或输入继续指令；
+任务必须实际执行，或在失败时明确进入 blocked，不能无处理地停留在 `in_progress`。
+
 ## 后续规划
 
 - Multica、多 Agent 调度与自动并行 Agent（待 Task Graph 与完整 Worktree 隔离成熟）

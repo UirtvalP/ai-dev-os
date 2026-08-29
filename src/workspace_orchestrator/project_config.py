@@ -18,6 +18,9 @@ CONFIG_NAME = ".ai-dev-os.json"
 class ProjectConfig:
     task_provider: str | None
     task_project_id: str | None
+    auto_execute_in_progress: bool = True
+    dispatcher_poll_seconds: float = 2.0
+    codex_sandbox: str = "workspace-write"
 
 
 def default_task_project_id(root: Path) -> str:
@@ -60,6 +63,9 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         raise WorkspaceError(f"项目配置 schema_version 必须为 1：{path}")
     provider = payload.get("task_provider")
     project_id = payload.get("task_project_id")
+    auto_execute = payload.get("auto_execute_in_progress", True)
+    poll_seconds = payload.get("dispatcher_poll_seconds", 2.0)
+    codex_sandbox = payload.get("codex_sandbox", "workspace-write")
     if provider is not None and (not isinstance(provider, str) or not provider.strip()):
         raise WorkspaceError(f"项目配置 task_provider 必须是非空字符串或 null：{path}")
     if provider not in {None, "dashi"}:
@@ -68,7 +74,27 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         raise WorkspaceError(f"项目配置 task_project_id 必须是非空字符串或 null：{path}")
     if provider == "dashi" and project_id is None:
         raise WorkspaceError(f"dashi 项目配置缺少 task_project_id：{path}")
-    return ProjectConfig(provider, project_id)
+    if not isinstance(auto_execute, bool):
+        raise WorkspaceError(f"项目配置 auto_execute_in_progress 必须是布尔值：{path}")
+    if (
+        isinstance(poll_seconds, bool)
+        or not isinstance(poll_seconds, (int, float))
+        or not 0.5 <= float(poll_seconds) <= 60
+    ):
+        raise WorkspaceError(
+            f"项目配置 dispatcher_poll_seconds 必须在 0.5 到 60 秒之间：{path}"
+        )
+    if codex_sandbox not in {"read-only", "workspace-write"}:
+        raise WorkspaceError(
+            f"项目配置 codex_sandbox 仅支持 read-only 或 workspace-write：{path}"
+        )
+    return ProjectConfig(
+        provider,
+        project_id,
+        auto_execute_in_progress=auto_execute,
+        dispatcher_poll_seconds=float(poll_seconds),
+        codex_sandbox=codex_sandbox,
+    )
 
 
 def initialized_project_config(root: Path) -> dict[str, object]:
@@ -77,4 +103,7 @@ def initialized_project_config(root: Path) -> dict[str, object]:
         "schema_version": 1,
         "task_provider": default.task_provider,
         "task_project_id": default.task_project_id,
+        "auto_execute_in_progress": default.auto_execute_in_progress,
+        "dispatcher_poll_seconds": default.dispatcher_poll_seconds,
+        "codex_sandbox": default.codex_sandbox,
     }

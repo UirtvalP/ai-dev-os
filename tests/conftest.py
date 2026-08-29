@@ -8,3 +8,4 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_external_task_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DASHI_TASKCTL", "ai-dev-os-test-taskctl-unavailable")
+    monkeypatch.setenv("AI_DEV_OS_DISABLE_AUTOSTART", "1")

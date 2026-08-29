@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from workspace_orchestrator.adapters.agent import CodexAgentProvider
+from workspace_orchestrator.adapters.agent import CodexAgentProvider, CodexExecProvider
 from workspace_orchestrator.adapters.git import LocalGitProvider
 from workspace_orchestrator.adapters.task import DashiTaskProvider, TaskProviderError
 from workspace_orchestrator.context import build_snapshot, handoff
@@ -55,6 +55,65 @@ def test_codex_agent_provider_owns_thread_environment_lookup() -> None:
 
     assert provider.name == "codex"
     assert provider.current_session_id() == "thread-123"
+
+
+def test_codex_exec_provider_uses_official_non_interactive_boundary(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], Path, dict[str, str], float]] = []
+
+    def runner(command, cwd, environ, timeout):
+        calls.append((tuple(command), cwd, dict(environ), timeout))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"type":"thread.started","thread_id":"thread-auto"}\n',
+            stderr="",
+        )
+
+    result = CodexExecProvider(
+        runner=runner, executable="codex", timeout_seconds=30
+    ).execute(tmp_path, "继续 REQ-001，处理 AID-1")
+
+    assert result.session_id == "thread-auto"
+    assert result.resumed is False
+    command, cwd, environ, timeout = calls[0]
+    assert command[:3] == ("codex", "exec", "--json")
+    assert ("--sandbox", "workspace-write") == (
+        command[command.index("--sandbox")],
+        command[command.index("--sandbox") + 1],
+    )
+    assert 'approval_policy="never"' in command
+    assert "--dangerously-bypass-hook-trust" in command
+    assert cwd == tmp_path
+    assert timeout == 30
+    assert "CODEX_THREAD_ID" not in environ
+
+
+def test_codex_exec_provider_falls_back_to_new_session_when_resume_fails(
+    tmp_path: Path,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command, cwd, environ, timeout):
+        commands.append(tuple(command))
+        if "resume" in command:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="not found")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"type":"thread.started","thread_id":"thread-new"}\n',
+            stderr="",
+        )
+
+    result = CodexExecProvider(runner=runner, executable="codex").execute(
+        tmp_path,
+        "继续",
+        resume_session_id="thread-old",
+    )
+
+    assert commands[0][:3] == ("codex", "exec", "resume")
+    assert commands[1][:2] == ("codex", "exec")
+    assert result.session_id == "thread-new"
+    assert result.resumed is False
 
 
 def test_resume_prefers_requirement_bound_worktree_over_current_repo(tmp_path: Path) -> None:
@@ -379,6 +438,40 @@ def test_dashi_review_packet_uses_description_file_cas_and_is_idempotent() -> No
     assert uploaded == [content]
     update = next(command for command in commands if "update" in command)
     assert update[-3:] == ("--if-version", "4", "--json")
+
+
+def test_dashi_review_approval_fact_uses_last_done_transition_actor() -> None:
+    provider = DashiTaskProvider(
+        runner=lambda _: "{}",
+        executable="taskctl",
+        activity_reader=lambda _: {
+            "activities": [
+                {
+                    "id": "change-1",
+                    "actorType": "user",
+                    "actorId": "alice",
+                    "actorName": "Alice",
+                    "createdAt": "2026-08-29T01:00:00Z",
+                    "changes": [{"field": "status", "before": "in_review", "after": "done"}],
+                },
+                {
+                    "id": "change-2",
+                    "actorType": "agent",
+                    "actorId": "codex-agent",
+                    "actorName": "Codex Agent",
+                    "createdAt": "2026-08-29T02:00:00Z",
+                    "changes": [{"field": "status", "before": "in_review", "after": "done"}],
+                },
+            ]
+        },
+    )
+
+    fact = provider.review_approval_fact("AID-7")
+
+    assert fact is not None
+    assert fact.activity_id == "change-2"
+    assert fact.actor_type == "agent"
+    assert fact.actor_id == "codex-agent"
 
 
 def test_dashi_adapter_lists_review_comments() -> None:

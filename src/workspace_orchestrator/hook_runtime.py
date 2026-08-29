@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .adapters.agent import CodexAgentProvider
+from .automation.dispatcher import start_dispatcher
 from .automation.requirement_attach import AutomationAmbiguity, discover_project_root
 from .automation.runtime import AutomationRuntime
 from .automation.session_runtime import end_session
@@ -45,6 +46,11 @@ def main() -> int:
     if not session_id:
         return 0
     store = WorkspaceStore(root, execution_root=execution_root)
+    try:
+        start_dispatcher(store)
+    except (OSError, WorkspaceError):
+        # Dispatcher 启动失败不能阻断当前前台 Hook；status 命令提供显式诊断入口。
+        pass
     agent = CodexAgentProvider(environ={"CODEX_THREAD_ID": session_id})
     runtime = AutomationRuntime(store, agent)
 

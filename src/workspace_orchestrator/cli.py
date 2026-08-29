@@ -11,7 +11,6 @@ from .automation.requirement_attach import AutomationAmbiguity, discover_project
 from .automation.runtime import AutomationRuntime
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
 from .models import WorkflowComplexity
-from .review import confirm_requirement_done
 from .workflow import route_workflow
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections
 
@@ -249,8 +248,7 @@ def run(args: argparse.Namespace) -> str:
             f"意图审查：{result.intent_status}\n审查受阻：{args.requirement_id.upper()}\n{details}"
         )
     if args.command == "confirm":
-        confirm_requirement_done(
-            store,
+        AutomationRuntime(store, agent_provider).confirm(
             args.requirement_id,
             user_confirmed=args.user_confirmed,
         )

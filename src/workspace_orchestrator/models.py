@@ -43,8 +43,24 @@ class Task:
     worktree: str | None = None
     session_ids: tuple[str, ...] = ()
     binding_session_id: str | None = None
+    binding_codex_project_id: str | None = None
+    binding_codex_project_kind: str | None = None
+    binding_codex_host_id: str | None = None
+    binding_workspace_path: str | None = None
     labels: tuple[str, ...] = ()
     version: int | None = None
+    activity_updated_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewApprovalFact:
+    """Provider 对 Review 卡最后一次进入 done 的结构化审计事实。"""
+
+    activity_id: str
+    actor_type: str
+    actor_id: str
+    actor_name: str
+    changed_at: str
 
 
 @dataclass(slots=True)

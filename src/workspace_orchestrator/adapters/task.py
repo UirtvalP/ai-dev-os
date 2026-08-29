@@ -13,19 +13,32 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import urlopen
 
 from workspace_orchestrator.adapters.base import TaskProviderError
-from workspace_orchestrator.models import Task
+from workspace_orchestrator.models import ReviewApprovalFact, Task
 
 CommandRunner = Callable[[Sequence[str]], str]
 ServiceStarter = Callable[[], None]
+ActivityReader = Callable[[str], Any]
 
 
 def _taskboard_endpoint() -> tuple[str, int]:
     url = os.environ.get("CODEX_TASKBOARD_URL", "http://127.0.0.1:47823")
     parsed = urlparse(url)
     return parsed.hostname or "127.0.0.1", parsed.port or 47823
+
+
+def _default_activity_reader(task_id: str) -> Any:
+    base_url = os.environ.get("CODEX_TASKBOARD_URL", "http://127.0.0.1:47823").rstrip("/")
+    url = f"{base_url}/api/tasks/{quote(task_id, safe='')}/activities"
+    try:
+        with urlopen(url, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, HTTPError, URLError, json.JSONDecodeError) as exc:
+        raise TaskProviderError(f"无法读取 dashi Review 活动事实：{exc}") from exc
 
 
 def _service_is_listening(host: str, port: int) -> bool:
@@ -152,8 +165,13 @@ def _task(data: dict[str, Any]) -> Task:
             or data.get("threadId")
             or data.get("legacyLocalThreadId")
         ),
+        binding_codex_project_id=thread_binding.get("codexProjectId"),
+        binding_codex_project_kind=thread_binding.get("codexProjectKind"),
+        binding_codex_host_id=thread_binding.get("codexHostId"),
+        binding_workspace_path=thread_binding.get("workspacePath"),
         labels=tuple(data.get("labels", ())),
         version=data.get("version"),
+        activity_updated_at=data.get("activityUpdatedAt") or data.get("updatedAt"),
     )
 
 
@@ -180,6 +198,7 @@ class DashiTaskProvider:
     service_starter: ServiceStarter | None = None
     project_name: str | None = None
     workspace_path: str | None = None
+    activity_reader: ActivityReader = _default_activity_reader
     _service_ready: bool = False
     _project_ready: bool = False
 
@@ -308,6 +327,40 @@ class DashiTaskProvider:
             finally:
                 path.unlink(missing_ok=True)
         raise TaskProviderError(f"Review Packet 并发更新未收敛：{task_id}")
+
+    def review_approval_fact(self, task_id: str) -> ReviewApprovalFact | None:
+        """读取最后一次进入 done 的结构化 actor；缺失事实绝不猜测。"""
+
+        if self.service_starter is not None and not self._service_ready:
+            self.service_starter()
+            self._service_ready = True
+        payload = self.activity_reader(task_id)
+        activities = payload.get("activities", ()) if isinstance(payload, dict) else ()
+        for activity in reversed(tuple(activities)):
+            if not isinstance(activity, dict):
+                continue
+            changes = activity.get("changes", ())
+            entered_done = any(
+                isinstance(change, dict)
+                and change.get("field") == "status"
+                and change.get("after") == "done"
+                for change in changes
+            )
+            if not entered_done:
+                continue
+            activity_id = str(activity.get("id") or "").strip()
+            actor_type = str(activity.get("actorType") or "").strip()
+            changed_at = str(activity.get("createdAt") or "").strip()
+            if not activity_id or not actor_type or not changed_at:
+                return None
+            return ReviewApprovalFact(
+                activity_id=activity_id,
+                actor_type=actor_type,
+                actor_id=str(activity.get("actorId") or "").strip(),
+                actor_name=str(activity.get("actorName") or "").strip(),
+                changed_at=changed_at,
+            )
+        return None
 
     def add_comment(self, task_id: str, body: str) -> None:
         self._json("comment", "add", task_id, "--body", body)

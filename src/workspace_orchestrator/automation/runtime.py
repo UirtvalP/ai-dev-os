@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
 from workspace_orchestrator.review import (
+    confirm_requirement_done,
     request_requirement_changes,
     review_requirement,
     sync_requirement_review_outcome,
@@ -69,6 +70,24 @@ class AutomationRuntime:
             self.store.load(requirement_id)["meta"], self.store.project_root
         )
 
+    def _current_packet_fingerprint(
+        self, requirement_id: str, provider: TaskProvider | None
+    ) -> str | None:
+        if provider is None:
+            return None
+        tasks, task_error = list_tasks_safely(provider, requirement_id)
+        if task_error:
+            raise WorkspaceError(f"无法验证 Review Packet 当前事实：{task_error}")
+        data = self.store.load(requirement_id)
+        git = collect_git_context(
+            self.store.project_root,
+            dict(data["meta"].get("git") or {}),
+            execution_root=self.store.working_root,
+        )
+        return build_review_packet(
+            self.store, requirement_id, tasks=tasks, git=git
+        ).fingerprint
+
     def sync_reviews(self, requirement_id: str | None = None) -> tuple[str, ...]:
         """同步所有待审查结果和离线待补偿状态，不创建或完成 Review 卡。"""
 
@@ -82,17 +101,12 @@ class AutomationRuntime:
             provider = self._provider(current_id)
             current_fingerprint = None
             if provider is not None:
-                tasks, task_error = list_tasks_safely(provider, current_id)
-                if task_error is None:
-                    data = self.store.load(current_id)
-                    git = collect_git_context(
-                        self.store.project_root,
-                        dict(data["meta"].get("git") or {}),
-                        execution_root=self.store.working_root,
+                try:
+                    current_fingerprint = self._current_packet_fingerprint(
+                        current_id, provider
                     )
-                    current_fingerprint = build_review_packet(
-                        self.store, current_id, tasks=tasks, git=git
-                    ).fingerprint
+                except WorkspaceError:
+                    current_fingerprint = None
             message = sync_requirement_review_outcome(
                 self.store,
                 current_id,
@@ -256,6 +270,19 @@ class AutomationRuntime:
             feedback=feedback,
             next_action=next_action,
             task_provider=self._provider(requirement_id),
+        )
+
+    def confirm(self, requirement_id: str, *, user_confirmed: bool) -> None:
+        """显式确认；配置 Provider 时仍必须通过当前 Review Packet 门禁。"""
+
+        provider = self._provider(requirement_id)
+        fingerprint = self._current_packet_fingerprint(requirement_id, provider)
+        confirm_requirement_done(
+            self.store,
+            requirement_id,
+            user_confirmed=user_confirmed,
+            task_provider=provider,
+            current_packet_fingerprint=fingerprint,
         )
 
     def review(self, requirement_id: str):
