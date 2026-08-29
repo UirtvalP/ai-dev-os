@@ -185,6 +185,9 @@ def _ensure_project_config(root: Path) -> str:
         return "created"
     current = json.loads(path.read_text(encoding="utf-8"))
     changed = False
+    if "project_id" not in current:
+        current["project_id"] = current.get("task_project_id") or desired["project_id"]
+        changed = True
     for key in (
         "auto_execute_in_progress",
         "dispatcher_poll_seconds",

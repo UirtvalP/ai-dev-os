@@ -19,6 +19,7 @@ AUTO_FINISH_OPTION = "auto_finish_pushed_thread"
 class ProjectConfig:
     task_provider: str | None
     task_project_id: str | None
+    project_id: str | None = None
     auto_execute_in_progress: bool = True
     dispatcher_poll_seconds: float = 2.0
     codex_sandbox: str = "workspace-write"
@@ -26,8 +27,36 @@ class ProjectConfig:
     auto_finish_pushed_thread: bool = True
 
 
+def _pyproject_name(root: Path) -> str | None:
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        name = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {}).get("name")
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _package_name(root: Path) -> str | None:
+    package_json = root / "package.json"
+    if not package_json.is_file():
+        return None
+    try:
+        name = json.loads(package_json.read_text(encoding="utf-8")).get("name")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def project_display_name(root: Path) -> str:
+    """以最小确定性规则发现项目显示名；显示名不承担唯一身份。"""
+
+    return _pyproject_name(root) or _package_name(root) or root.name
+
+
 def default_task_project_id(root: Path) -> str:
-    """优先采用 Python 项目名，否则从目录名生成稳定 dashi 项目 ID。"""
+    """以显示名和绝对路径指纹生成首次接入时的稳定项目 ID。"""
 
     def slug(value: str) -> str:
         normalized = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
@@ -35,21 +64,12 @@ def default_task_project_id(root: Path) -> str:
 
     fingerprint = hashlib.sha256(str(root.resolve()).casefold().encode("utf-8")).hexdigest()[:8]
 
-    pyproject = root / "pyproject.toml"
-    if pyproject.is_file():
-        try:
-            name = (
-                tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {}).get("name")
-            )
-        except (OSError, tomllib.TOMLDecodeError):
-            name = None
-        if isinstance(name, str) and name.strip():
-            return f"{slug(name)}-{fingerprint}"
-    return f"{slug(root.name)}-{fingerprint}"
+    return f"{slug(project_display_name(root))}-{fingerprint}"
 
 
 def default_project_config(root: Path) -> ProjectConfig:
-    return ProjectConfig("dashi", default_task_project_id(root))
+    project_id = default_task_project_id(root)
+    return ProjectConfig("dashi", project_id, project_id=project_id)
 
 
 def load_project_config(root: Path) -> ProjectConfig | None:
@@ -65,7 +85,13 @@ def load_project_config(root: Path) -> ProjectConfig | None:
     if payload.get("schema_version") != 1:
         raise WorkspaceError(f"项目配置 schema_version 必须为 1：{path}")
     provider = payload.get("task_provider")
-    project_id = payload.get("task_project_id")
+    task_project_id = payload.get("task_project_id")
+    configured_project_id = payload.get("project_id")
+    project_id = (
+        configured_project_id
+        if configured_project_id is not None
+        else task_project_id or default_task_project_id(root)
+    )
     auto_execute = payload.get("auto_execute_in_progress", True)
     poll_seconds = payload.get("dispatcher_poll_seconds", 2.0)
     codex_sandbox = payload.get("codex_sandbox", "workspace-write")
@@ -75,10 +101,14 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         raise WorkspaceError(f"项目配置 task_provider 必须是非空字符串或 null：{path}")
     if provider not in {None, "dashi"}:
         raise WorkspaceError(f"项目配置包含 V1 不支持的 task_provider：{provider}")
-    if project_id is not None and (not isinstance(project_id, str) or not project_id.strip()):
+    if task_project_id is not None and (
+        not isinstance(task_project_id, str) or not task_project_id.strip()
+    ):
         raise WorkspaceError(f"项目配置 task_project_id 必须是非空字符串或 null：{path}")
-    if provider == "dashi" and project_id is None:
+    if provider == "dashi" and task_project_id is None:
         raise WorkspaceError(f"dashi 项目配置缺少 task_project_id：{path}")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise WorkspaceError(f"项目配置 project_id 必须是非空字符串：{path}")
     if not isinstance(auto_execute, bool):
         raise WorkspaceError(f"项目配置 auto_execute_in_progress 必须是布尔值：{path}")
     if (
@@ -106,7 +136,8 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         )
     return ProjectConfig(
         provider,
-        project_id,
+        task_project_id,
+        project_id=project_id,
         auto_execute_in_progress=auto_execute,
         dispatcher_poll_seconds=float(poll_seconds),
         codex_sandbox=codex_sandbox,
@@ -119,6 +150,7 @@ def initialized_project_config(root: Path) -> dict[str, object]:
     default = default_project_config(root)
     return {
         "schema_version": 1,
+        "project_id": default.project_id,
         "task_provider": default.task_provider,
         "task_project_id": default.task_project_id,
         "auto_execute_in_progress": default.auto_execute_in_progress,

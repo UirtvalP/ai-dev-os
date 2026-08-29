@@ -95,8 +95,32 @@ Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使
 `workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
 `ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
 
-当前用户层只有固定位置的 `USER_PRINCIPLES.md`，没有需要持久化的用户级开关，因此不创建
-`~/.ai-dev-os/config.json`；未来只有出现真实用户级配置需求时才扩展该文件。
+用户级目录同时保存长期原则与最小项目索引：
+
+```text
+~/.ai-dev-os/
+├── USER_PRINCIPLES.md
+└── projects.json
+```
+
+`projects.json` 是 Global Project Registry，只记录已经显式执行 `ai-dev-os init` 的项目身份、
+显示名、绝对路径和 Task Provider 映射。项目级 `.ai-dev-os.json` 仍是 Dispatcher、Agent 与
+Automation 设置的事实来源；Registry 不复制这些运行配置。当前没有用户级运行开关，因此仍不创建
+`~/.ai-dev-os/config.json`。
+
+每次 `init` 会在项目文件成功写入后幂等登记或刷新 Registry；`migrate` 会刷新已有记录或为合法旧项目
+补登记。Registry 更新失败不会回滚已完成的项目接入，CLI 会给出可重试警告。项目 ID 持久化在
+`.ai-dev-os.json`：有 dashi 时与 `task_project_id` 一致，避免出现第二套随机身份。
+
+```bash
+ai-dev-os project list
+ai-dev-os project show <project-id>
+ai-dev-os project unregister <project-id>
+```
+
+`list` 会把路径不存在的项目标记为 `missing`，但不会自动删除。`unregister` 只移除全局登记，
+不删除项目文件、`.workspace`、Git 或 dashi Task。多个项目仍各自运行原有 Dispatcher；
+dashi 的 `__all_projects__` 继续根据各项目 `task_project_id` 汇总 Task，不需要修改 UI。
 
 只有版本说明明确指出项目持久格式发生变化时，才对相应项目执行迁移：
 
@@ -115,6 +139,9 @@ Dispatcher 的默认配置写在 `.ai-dev-os.json`：
 
 ```json
 {
+  "project_id": "example-a81f291c",
+  "task_provider": "dashi",
+  "task_project_id": "example-a81f291c",
   "auto_execute_in_progress": true,
   "dispatcher_poll_seconds": 2.0,
   "codex_sandbox": "workspace-write",

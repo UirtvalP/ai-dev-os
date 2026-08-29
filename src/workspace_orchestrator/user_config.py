@@ -6,7 +6,9 @@ from pathlib import Path
 
 USER_CONFIG_DIR_NAME = ".ai-dev-os"
 USER_PRINCIPLES_NAME = "USER_PRINCIPLES.md"
+PROJECTS_REGISTRY_NAME = "projects.json"
 USER_PRINCIPLES_DISPLAY_PATH = f"~/{USER_CONFIG_DIR_NAME}/{USER_PRINCIPLES_NAME}"
+PROJECTS_REGISTRY_DISPLAY_PATH = f"~/{USER_CONFIG_DIR_NAME}/{PROJECTS_REGISTRY_NAME}"
 
 DEFAULT_USER_PRINCIPLES = """# 用户原则
 
@@ -31,3 +33,9 @@ def user_principles_path() -> Path:
     """返回唯一的用户级原则文件路径。"""
 
     return user_config_root() / USER_PRINCIPLES_NAME
+
+
+def projects_registry_path() -> Path:
+    """返回当前用户的全局项目索引路径。"""
+
+    return user_config_root() / PROJECTS_REGISTRY_NAME

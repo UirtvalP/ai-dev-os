@@ -108,8 +108,23 @@ Hook、finalize blockers、验证超时与无效配置均有自动回归测试�
 验收：用户只需在 dashi 将开发 Task 移到“处理中”，无需再打开 Codex 或输入继续指令；
 任务必须实际执行，或在失败时明确进入 blocked，不能无处理地停留在 `in_progress`。
 
+## 阶段 10 — Global Project Registry
+
+- [x] 在 `~/.ai-dev-os/projects.json` 保存最小、版本化的全局项目索引
+- [x] 将稳定 `project_id` 持久化到项目配置，并优先与 dashi `task_project_id` 对齐
+- [x] `ai-dev-os init` / `migrate` 幂等登记、刷新或补登记项目
+- [x] 实现 `ai-dev-os project list/show/unregister`
+- [x] 路径缺失只标记 `missing`，不自动删除项目
+- [x] 使用跨进程文件锁和原子替换避免并发登记覆盖
+- [x] Registry 失败不回滚已成功的项目本地接入
+
+验收：AI Dev OS 能确定性回答当前用户接入了哪些项目；Registry 仍只是索引，不复制项目运行配置，
+不新增 Dashboard、Global Dispatcher、磁盘扫描、数据库或多 Agent 能力。
+
 ## 后续规划
 
+- 基于用户明确选择批量接入现有项目，以及安全清理失效 Registry/dashi 项目记录
+- Global Dispatcher（仅在多个 Project-local Dispatcher 的实际维护成本得到证实时评估）
 - Multica、多 Agent 调度与自动并行 Agent（待 Task Graph 与完整 Worktree 隔离成熟）
 - 跨项目知识库与 Obsidian / Markdown Knowledge Provider（待知识候选审核模型成熟）
 - GitHub Issues / Linear Task Provider

@@ -33,6 +33,7 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
     assert (tmp_path / "PROJECT_INTENT.md").is_file()
     config = json.loads((tmp_path / ".ai-dev-os.json").read_text(encoding="utf-8"))
     assert config["task_provider"] == "dashi"
+    assert config["project_id"] == config["task_project_id"]
     assert config["task_project_id"]
     assert config["auto_execute_in_progress"] is True
     assert config["dispatcher_poll_seconds"] == 2.0
@@ -173,6 +174,7 @@ def test_init_upgrades_existing_project_config_with_dispatcher_defaults(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert "已更新" in output
     assert config["task_project_id"] == "demo"
+    assert config["project_id"] == "demo"
     assert config["auto_execute_in_progress"] is True
     assert config["dispatcher_poll_seconds"] == 2.0
     assert config["codex_sandbox"] == "workspace-write"
@@ -290,6 +292,7 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
     assert "~/.ai-dev-os/USER_PRINCIPLES.md" in result.stdout
     assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "ai-dev-os hook"
     assert (isolated_home / ".ai-dev-os" / "USER_PRINCIPLES.md").is_file()
+    assert (isolated_home / ".ai-dev-os" / "projects.json").is_file()
     assert not (project / "USER_PRINCIPLES.md").exists()
     assert not (project / "src").exists()
     assert not (project / ".venv").exists()
