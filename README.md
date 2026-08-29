@@ -90,15 +90,18 @@ Dispatcher 的默认配置写在 `.ai-dev-os.json`：
 {
   "auto_execute_in_progress": true,
   "dispatcher_poll_seconds": 2.0,
-  "codex_sandbox": "workspace-write"
+  "codex_sandbox": "workspace-write",
+  "codex_model": null
 }
 ```
 
 用户把带 `requirement:REQ-*` 标签的普通开发 Task 移到 `in_progress`，即表示授权执行。
-Dispatcher 会在本地通过官方 `codex exec` 启动新 Session；存在已结束的 Workspace Session 时优先
-使用 `codex exec resume`。已有活动 Thread 绑定、专用 Requirement Review 卡以及相同 task version
+Dispatcher 会在本地通过官方 `codex exec` 启动新 Session；存在由 Dispatcher 以受控 sandbox 启动的
+历史 Session 时优先使用 `codex exec resume`，不会恢复权限来源未知的交互式 Thread。已有活动 Thread 绑定、专用 Requirement Review 卡以及相同 task version
 不会被重复认领。Codex 结束但 Task 未进入 review 时，Dispatcher 会把它转为 `blocked` 并写入错误，
 不会继续显示成“处理中”。
+`codex_model` 默认为 `null`，表示沿用本机 Codex CLI 配置；若独立 CLI 与桌面端模型版本不兼容，
+可在此指定该 CLI 支持的模型。执行失败会把服务端错误写入 Task 评论和本地 Dispatcher 日志。
 
 ```bash
 ai-dev-os dispatcher status

@@ -4,5 +4,6 @@
   "task_project_id": "ai-dev-os",
   "auto_execute_in_progress": true,
   "dispatcher_poll_seconds": 2.0,
-  "codex_sandbox": "workspace-write"
+  "codex_sandbox": "workspace-write",
+  "codex_model": null
 }

@@ -71,7 +71,12 @@ def test_codex_exec_provider_uses_official_non_interactive_boundary(tmp_path: Pa
 
     result = CodexExecProvider(
         runner=runner, executable="codex", timeout_seconds=30
-    ).execute(tmp_path, "继续 REQ-001，处理 AID-1")
+    ).execute(
+        tmp_path,
+        "继续 REQ-001，处理 AID-1",
+        model="gpt-test",
+        bypass_hook_trust=True,
+    )
 
     assert result.session_id == "thread-auto"
     assert result.resumed is False
@@ -82,6 +87,10 @@ def test_codex_exec_provider_uses_official_non_interactive_boundary(tmp_path: Pa
         command[command.index("--sandbox") + 1],
     )
     assert 'approval_policy="never"' in command
+    assert ("--model", "gpt-test") == (
+        command[command.index("--model")],
+        command[command.index("--model") + 1],
+    )
     assert "--dangerously-bypass-hook-trust" in command
     assert cwd == tmp_path
     assert timeout == 30

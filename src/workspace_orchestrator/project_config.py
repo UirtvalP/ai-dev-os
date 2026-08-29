@@ -21,6 +21,7 @@ class ProjectConfig:
     auto_execute_in_progress: bool = True
     dispatcher_poll_seconds: float = 2.0
     codex_sandbox: str = "workspace-write"
+    codex_model: str | None = None
 
 
 def default_task_project_id(root: Path) -> str:
@@ -66,6 +67,7 @@ def load_project_config(root: Path) -> ProjectConfig | None:
     auto_execute = payload.get("auto_execute_in_progress", True)
     poll_seconds = payload.get("dispatcher_poll_seconds", 2.0)
     codex_sandbox = payload.get("codex_sandbox", "workspace-write")
+    codex_model = payload.get("codex_model")
     if provider is not None and (not isinstance(provider, str) or not provider.strip()):
         raise WorkspaceError(f"项目配置 task_provider 必须是非空字符串或 null：{path}")
     if provider not in {None, "dashi"}:
@@ -88,12 +90,17 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         raise WorkspaceError(
             f"项目配置 codex_sandbox 仅支持 read-only 或 workspace-write：{path}"
         )
+    if codex_model is not None and (
+        not isinstance(codex_model, str) or not codex_model.strip()
+    ):
+        raise WorkspaceError(f"项目配置 codex_model 必须是非空字符串或 null：{path}")
     return ProjectConfig(
         provider,
         project_id,
         auto_execute_in_progress=auto_execute,
         dispatcher_poll_seconds=float(poll_seconds),
         codex_sandbox=codex_sandbox,
+        codex_model=codex_model,
     )
 
 
@@ -106,4 +113,5 @@ def initialized_project_config(root: Path) -> dict[str, object]:
         "auto_execute_in_progress": default.auto_execute_in_progress,
         "dispatcher_poll_seconds": default.dispatcher_poll_seconds,
         "codex_sandbox": default.codex_sandbox,
+        "codex_model": default.codex_model,
     }

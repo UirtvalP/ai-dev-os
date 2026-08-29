@@ -25,6 +25,10 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
     config = json.loads((tmp_path / ".ai-dev-os.json").read_text(encoding="utf-8"))
     assert config["task_provider"] == "dashi"
     assert config["task_project_id"]
+    assert config["auto_execute_in_progress"] is True
+    assert config["dispatcher_poll_seconds"] == 2.0
+    assert config["codex_sandbox"] == "workspace-write"
+    assert config["codex_model"] is None
     assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert not (tmp_path / ".workspace").exists()
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
@@ -100,6 +104,33 @@ def test_init_rejects_unknown_task_provider_before_other_writes(tmp_path: Path, 
 
     assert "不支持的 task_provider" in capsys.readouterr().err
     assert not (tmp_path / "AGENTS.md").exists()
+
+
+def test_init_upgrades_existing_project_config_with_dispatcher_defaults(
+    tmp_path: Path, capsys
+) -> None:
+    config_path = tmp_path / ".ai-dev-os.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_provider": "dashi",
+                "task_project_id": "demo",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["init", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "已更新" in output
+    assert config["task_project_id"] == "demo"
+    assert config["auto_execute_in_progress"] is True
+    assert config["dispatcher_poll_seconds"] == 2.0
+    assert config["codex_sandbox"] == "workspace-write"
+    assert config["codex_model"] is None
 
 
 def test_default_dashi_project_id_distinguishes_same_named_directories(

@@ -23,6 +23,7 @@ from workspace_orchestrator.project_config import (
 )
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
+from .session_runtime import end_session
 from .task_attach import configured_task_provider, is_requirement_review_task
 
 STATE_FILE = "dispatcher.json"
@@ -101,17 +102,6 @@ def _active_workspace_session(
     )
 
 
-def _resume_session_id(
-    store: WorkspaceStore, requirement_id: str, task_id: str
-) -> str | None:
-    for item in reversed(store.load(requirement_id)["sessions"]):
-        if task_id in item.get("task_ids", ()) and item.get("result") != "in_progress":
-            session_id = str(item.get("id") or "").strip()
-            if session_id:
-                return session_id
-    return None
-
-
 def _execution_path(store: WorkspaceStore, task: Task, meta: dict[str, Any]) -> Path:
     configured = task.worktree or dict(meta.get("git") or {}).get("worktree")
     if not configured:
@@ -135,20 +125,68 @@ def _prompt(candidate: DispatchCandidate) -> str:
     )
 
 
+def _only_managed_hooks(workspace_path: Path) -> bool:
+    """只有全部 Hook 都是 ai-dev-os 托管命令时才允许跳过首次信任提示。"""
+
+    path = workspace_path / ".codex" / "hooks.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    groups = payload.get("hooks") if isinstance(payload, dict) else None
+    if not isinstance(groups, dict) or not groups:
+        return False
+    commands: list[str] = []
+    for entries in groups.values():
+        if not isinstance(entries, list):
+            return False
+        for group in entries:
+            hooks = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(hooks, list):
+                return False
+            for hook in hooks:
+                if not isinstance(hook, dict):
+                    return False
+                for field in ("command", "commandWindows"):
+                    if hook.get(field):
+                        commands.append(str(hook[field]).strip())
+    return bool(commands) and all(command == "ai-dev-os hook" for command in commands)
+
+
 def _result_summary(result: CodexExecutionResult) -> str:
-    detail = result.stderr.strip()
-    if not detail:
-        messages: list[str] = []
-        for line in result.stdout.splitlines():
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = payload.get("item") or {}
-            if item.get("type") == "agent_message" and item.get("text"):
-                messages.append(str(item["text"]))
-        detail = messages[-1] if messages else "Codex 未返回可读结果"
-    return detail[-4000:]
+    messages: list[str] = []
+    for line in result.stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = payload.get("item") or {}
+        if item.get("type") == "agent_message" and item.get("text"):
+            messages.append(str(item["text"]))
+        elif payload.get("type") == "error" and payload.get("message"):
+            messages.append(str(payload["message"]))
+        elif payload.get("type") == "turn.failed":
+            error = payload.get("error") or {}
+            if error.get("message"):
+                messages.append(str(error["message"]))
+    detail = messages[-1] if messages else result.stderr.strip()
+    return (detail or "Codex 未返回可读结果")[-1800:]
+
+
+def _block_task(provider: TaskProvider, task: Task, message: str) -> Task:
+    """评论失败也必须继续改状态，避免卡片永久伪装成处理中。"""
+
+    try:
+        provider.add_comment(task.id, message)
+    except TaskProviderError:
+        pass
+    try:
+        return provider.update_status(task.id, "blocked")
+    except TaskProviderError:
+        try:
+            return provider.get_task(task.id)
+        except TaskProviderError:
+            return task
 
 
 @dataclass(slots=True)
@@ -220,8 +258,12 @@ class AutoDispatcher:
                     task=task,
                     task_provider=provider,
                     execution_path=path,
-                    resume_session_id=_resume_session_id(
-                        self.store, requirement_id, task.id
+                    # 只恢复 Dispatcher 自己以受控 sandbox 启动过的 Session；
+                    # 不恢复权限配置未知的交互式 Desktop Thread。
+                    resume_session_id=(
+                        str(previous.get("session_id"))
+                        if previous and previous.get("session_id")
+                        else None
                     ),
                     comments=comments,
                 )
@@ -257,11 +299,7 @@ class AutoDispatcher:
         task = candidate.task
         if not candidate.execution_path.is_dir():
             message = f"自动执行失败：任务工作目录不存在：{candidate.execution_path}"
-            try:
-                candidate.task_provider.add_comment(task.id, message)
-                refreshed = candidate.task_provider.update_status(task.id, "blocked")
-            except TaskProviderError:
-                refreshed = task
+            refreshed = _block_task(candidate.task_provider, task, message)
             self._remember(refreshed, result="blocked", error=message)
             return "blocked"
 
@@ -270,7 +308,9 @@ class AutoDispatcher:
             candidate.execution_path,
             _prompt(candidate),
             sandbox=_config(self.store).codex_sandbox,
+            model=_config(self.store).codex_model,
             resume_session_id=candidate.resume_session_id,
+            bypass_hook_trust=_only_managed_hooks(candidate.execution_path),
         )
         log_path = self._record_log(candidate, result)
         try:
@@ -285,15 +325,19 @@ class AutoDispatcher:
             return "provider-unavailable"
 
         if result.returncode != 0:
+            if result.session_id:
+                end_session(
+                    self.store,
+                    candidate.requirement_id,
+                    result.session_id,
+                    result="failed",
+                    task_provider=candidate.task_provider,
+                )
             message = (
                 f"自动 Codex 执行失败（退出码 {result.returncode}）。\n\n"
                 f"{_result_summary(result)}\n\n本地日志：{log_path}"
             )
-            try:
-                candidate.task_provider.add_comment(task.id, message)
-                refreshed = candidate.task_provider.update_status(task.id, "blocked")
-            except TaskProviderError:
-                pass
+            refreshed = _block_task(candidate.task_provider, refreshed, message)
             self._remember(
                 refreshed,
                 result="blocked",
@@ -308,11 +352,7 @@ class AutoDispatcher:
                 "Codex 自动执行进程已经结束，但 Task 未进入 review；为避免看似仍在处理，"
                 f"已转为 blocked。\n\n{_result_summary(result)}\n\n本地日志：{log_path}"
             )
-            try:
-                candidate.task_provider.add_comment(task.id, message)
-                refreshed = candidate.task_provider.update_status(task.id, "blocked")
-            except TaskProviderError:
-                pass
+            refreshed = _block_task(candidate.task_provider, refreshed, message)
             outcome = "blocked"
         else:
             outcome = "completed"

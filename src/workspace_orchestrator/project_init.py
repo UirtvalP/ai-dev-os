@@ -197,6 +197,7 @@ def _ensure_project_config(root: Path) -> str:
         "auto_execute_in_progress",
         "dispatcher_poll_seconds",
         "codex_sandbox",
+        "codex_model",
     ):
         if key not in current:
             current[key] = desired[key]

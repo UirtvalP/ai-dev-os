@@ -121,9 +121,13 @@ class CodexExecProvider:
         prompt: str,
         *,
         sandbox: str = "workspace-write",
+        model: str | None = None,
         resume_session_id: str | None = None,
+        bypass_hook_trust: bool = False,
     ) -> CodexExecutionResult:
         executable = self.executable or _codex_executable()
+        trust_options = ("--dangerously-bypass-hook-trust",) if bypass_hook_trust else ()
+        model_options = ("--model", model) if model else ()
         if resume_session_id:
             resumed = self._run(
                 (
@@ -131,7 +135,8 @@ class CodexExecProvider:
                     "exec",
                     "resume",
                     "--json",
-                    "--dangerously-bypass-hook-trust",
+                    *model_options,
+                    *trust_options,
                     resume_session_id,
                     prompt,
                 ),
@@ -147,7 +152,8 @@ class CodexExecProvider:
                 "--json",
                 "--sandbox",
                 sandbox,
-                "--dangerously-bypass-hook-trust",
+                *model_options,
+                *trust_options,
                 "-c",
                 'approval_policy="never"',
                 "-C",

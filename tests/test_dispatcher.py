@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -7,10 +8,12 @@ from pathlib import Path
 from workspace_orchestrator.adapters.agent import CodexExecutionResult
 from workspace_orchestrator.automation.dispatcher import (
     AutoDispatcher,
+    _only_managed_hooks,
     dispatcher_status,
     start_dispatcher,
     stop_dispatcher,
 )
+from workspace_orchestrator.automation.session_runtime import attach_session
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.workspace import WorkspaceStore
 
@@ -37,6 +40,9 @@ class FakeTasks:
     def add_comment(self, task_id: str, body: str) -> None:
         self.added_comments.append(body)
 
+    def unlink_session(self, task_id: str, session_id: str) -> None:
+        return None
+
 
 class FakeExecutor:
     def __init__(self, tasks: FakeTasks, *, returncode: int = 0) -> None:
@@ -50,14 +56,18 @@ class FakeExecutor:
         prompt: str,
         *,
         sandbox: str,
+        model: str | None,
         resume_session_id: str | None,
+        bypass_hook_trust: bool,
     ) -> CodexExecutionResult:
         self.calls.append(
             {
                 "workspace_path": workspace_path,
                 "prompt": prompt,
                 "sandbox": sandbox,
+                "model": model,
                 "resume_session_id": resume_session_id,
+                "bypass_hook_trust": bypass_hook_trust,
             }
         )
         if self.returncode == 0:
@@ -113,29 +123,32 @@ def test_dispatcher_executes_unbound_in_progress_task_once(
     call = executor.calls[0]
     assert call["workspace_path"] == tmp_path
     assert call["resume_session_id"] is None
+    assert call["model"] is None
     assert requirement_id in str(call["prompt"])
     assert "AID-1" in str(call["prompt"])
     assert "请覆盖失败场景" in str(call["prompt"])
     assert tasks.task.status == "in_review"
 
 
-def test_dispatcher_resumes_latest_detached_task_session(
+def test_dispatcher_resumes_its_previous_controlled_task_session(
     tmp_path: Path, monkeypatch
 ) -> None:
-    store, requirement_id = _store(tmp_path)
-    sessions_path = store.path_for(requirement_id) / "sessions.json"
+    store, _ = _store(tmp_path)
     store.write_json(
-        sessions_path,
-        [
-            {
-                "id": "thread-old",
-                "agent": "codex",
-                "started_at": "2026-08-29T00:00:00+08:00",
-                "ended_at": "2026-08-29T00:10:00+08:00",
-                "task_ids": ["AID-1"],
-                "result": "detached",
-            }
-        ],
+        store.root / "dispatcher.json",
+        {
+            "schema_version": 1,
+            "pid": None,
+            "status": "stopped",
+            "tasks": {
+                "AID-1": {
+                    "task_id": "AID-1",
+                    "version": 7,
+                    "result": "completed",
+                    "session_id": "thread-old",
+                }
+            },
+        },
     )
     tasks = FakeTasks(
         Task(id="AID-1", title="返工", status="in_progress", version=8)
@@ -209,6 +222,36 @@ def test_dispatcher_blocks_missing_worktree_instead_of_looking_busy(
     assert executor.calls == []
 
 
+def test_dispatcher_ends_failed_codex_session_and_blocks_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, requirement_id = _store(tmp_path)
+    tasks = FakeTasks(Task(id="AID-1", title="失败任务", status="in_progress", version=2))
+
+    class FailingExecutor(FakeExecutor):
+        def execute(self, *args, **kwargs) -> CodexExecutionResult:
+            attach_session(
+                store,
+                requirement_id,
+                session_id="thread-auto",
+                agent_name="codex",
+                task_ids=("AID-1",),
+            )
+            return super().execute(*args, **kwargs)
+
+    executor = FailingExecutor(tasks, returncode=1)
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.dispatcher.configured_task_provider",
+        lambda meta, root: tasks,
+    )
+
+    assert AutoDispatcher(store, executor).run_once() == "blocked"  # type: ignore[arg-type]
+
+    assert tasks.task.status == "blocked"
+    assert store.load(requirement_id)["sessions"][0]["result"] == "failed"
+    assert "退出码 1" in tasks.added_comments[0]
+
+
 def test_dispatcher_background_process_starts_reports_status_and_stops(
     tmp_path: Path,
 ) -> None:
@@ -227,3 +270,33 @@ def test_dispatcher_background_process_starts_reports_status_and_stops(
         stopped = stop_dispatcher(store)
     assert stopped["running"] is False
     assert stopped["status"] == "stopped"
+
+
+def test_dispatcher_bypasses_hook_trust_only_for_exclusively_managed_hooks(
+    tmp_path: Path,
+) -> None:
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir()
+    managed = {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "ai-dev-os hook",
+                            "commandWindows": "ai-dev-os hook",
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    hooks_path.write_text(json.dumps(managed), encoding="utf-8")
+    assert _only_managed_hooks(tmp_path) is True
+
+    managed["hooks"]["UserPromptSubmit"][0]["hooks"].append(
+        {"type": "command", "command": "custom-hook"}
+    )
+    hooks_path.write_text(json.dumps(managed), encoding="utf-8")
+    assert _only_managed_hooks(tmp_path) is False
