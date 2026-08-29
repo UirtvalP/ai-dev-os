@@ -10,10 +10,12 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 
 ## 恢复
 
-1. 新 Thread 第一次执行时，如果用户请求中包含准确的 `REQ-<数字>` 标识符，直接提取它并运行 `workspace bootstrap REQ-ID --request "用户当前开发请求"`；不得推导或改写 ID。用户已明确 Task ID 时改用 `--task TASK-ID`。
-2. 否则运行 `workspace bootstrap --request "用户当前开发请求"`。它优先复用当前 Thread 已有绑定，仅在没有绑定时自动选择唯一活动需求；如果存在多个活动需求，请用户选择。未明确 Task 时只恢复唯一的 `in_progress` Task；没有活动 Task 时根据当前开发请求创建，存在多个活动 Task 时要求用户或上层调用明确选择。
-3. 将 Bootstrap 生成的上下文快照视为需求、状态、交接、计划、决策、验证、相关用户原则、项目意图、需求意图、Dashi 任务、Git 上下文和下一步行动的当前事实来源。`workspace current` 和 `workspace resume REQ-ID` 仍作为手动检查与恢复命令保留。
-4. 如果工作区不存在且用户正在开始需要长期维护的工作，使用 `workspace new` 创建。不要为琐碎的一次性请求创建持久化跟踪。
+1. 优先使用仓库 `.codex/hooks.json`：`SessionStart` / `UserPromptSubmit` 会在 Agent 推理前自动执行 bootstrap，并把 Context Snapshot 注入 developer context。不要重复执行 Session、Requirement、Task、dashi 或 Git 子步骤。
+2. 如果 Hook 未启用、未受信任或当前 Codex surface 不支持 Hook，Skill 只负责触发一次 `workspace bootstrap --request "用户当前开发请求"`。用户请求中含准确 `REQ-<数字>` 或 Task ID 时原样传入，不得推导或改写。
+3. 将生成的 Context Snapshot 视为需求、状态、交接、计划、决策、验证、相关意图、Dashi Task、Git 上下文和下一步行动的事实来源。`workspace current` 和 `workspace resume REQ-ID` 仅作为诊断入口。
+4. 多个活动 Requirement 或多个 `in_progress` Task 返回 `ambiguity` 时，只有这一步请求用户选择。Requirement 不得因小修改自动创建。
+
+兼容回退命令保持为 `workspace bootstrap REQ-ID --request "用户当前开发请求"` 或 `workspace bootstrap --request "用户当前开发请求"`；多个活动 Task 时不得猜测。
 
 ## 执行
 
@@ -26,7 +28,7 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 
 ## 持久化
 
-完成一个有意义的阶段后，保存发生变化的事实：
+完成一个有意义的中间阶段时，可保存发生变化的语义事实：
 
 ```text
 workspace checkpoint REQ-ID --phase PHASE \
@@ -35,15 +37,19 @@ workspace checkpoint REQ-ID --phase PHASE \
   --verification "状态：PASS - 验证命令或证据"
 ```
 
-当前 Thread 可以结束时，生成可替换会话的交接边界：
+语义工作完成后只触发一次自动收尾：
 
 ```text
-workspace handoff REQ-ID \
+workspace finalize REQ-ID \
   --completed "已完成事项" \
   --current-state "当前状态" \
   --important-context "重要上下文" \
   --next-action "下一步行动"
 ```
+
+Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。
+
+`workspace handoff REQ-ID` 保留为显式中途交接兼容命令；完整实现结束优先使用 `finalize`。
 
 运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。未经用户明确批准，不得将需求或 Dashi Issue（事项）标记为 `done`。
 

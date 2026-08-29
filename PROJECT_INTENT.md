@@ -27,3 +27,14 @@
 3. 最低复杂度和人类可读的本地状态
 4. 在真实外部边界保持 Provider（提供方）无关性
 5. 未来可扩展性
+
+## 执行优先级
+
+摘要：确定性代码和规则自动化优先于任何 AI 语义判断或完整 Agent 推理。
+
+1. Deterministic code
+2. Rule-based automation
+3. Small semantic decision
+4. Full Agent reasoning
+
+Session、项目与 Git 发现，唯一匹配选择，绑定、同步、结构化状态收集、已知验证命令、checkpoint 和 handoff 等可确定流程属于 Automation Layer。Automation Layer 不调用 LLM、不依赖对话历史、尽量幂等且必须可测试。

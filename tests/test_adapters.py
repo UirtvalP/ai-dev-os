@@ -1,9 +1,11 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from workspace_orchestrator.adapters import task as task_adapter
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.adapters.git import LocalGitProvider
 from workspace_orchestrator.adapters.task import DashiTaskProvider, TaskProviderError
@@ -210,6 +212,50 @@ def test_dashi_adapter_uses_json_contract() -> None:
         ),
     )
     assert commands == [("taskctl", "issue", "list", "--project", "ai-dev-os", "--json")]
+
+
+def test_dashi_adapter_starts_service_once_before_first_command() -> None:
+    starts: list[str] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        return json.dumps({"tasks": []})
+
+    provider = DashiTaskProvider(
+        runner=runner,
+        executable="taskctl",
+        service_starter=lambda: starts.append("started"),
+    )
+
+    provider.list_tasks("REQ-001")
+    provider.list_tasks("REQ-001")
+
+    assert starts == ["started"]
+
+
+def test_taskboard_service_is_started_when_local_port_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suffix = ".cmd" if os.name == "nt" else ""
+    launcher = tmp_path / f"dashi-taskboard{suffix}"
+    launcher.write_text("launcher", encoding="utf-8")
+    checks = iter((False, True))
+    launches: list[tuple[object, dict[str, object]]] = []
+
+    monkeypatch.setenv("CODEX_TASKBOARD_URL", "http://127.0.0.1:47999")
+    monkeypatch.setattr(task_adapter, "_taskboard_launcher", lambda: launcher)
+    monkeypatch.setattr(
+        task_adapter, "_service_is_listening", lambda host, port: next(checks)
+    )
+    monkeypatch.setattr(
+        task_adapter.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append((command, kwargs)),
+    )
+
+    task_adapter.ensure_taskboard_service()
+
+    assert len(launches) == 1
+    assert launches[0][1]["env"]["CODEX_TASKBOARD_PORT"] == "47999"
 
 
 def test_dashi_adapter_creates_requirement_linked_issue() -> None:

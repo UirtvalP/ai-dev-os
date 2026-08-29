@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +67,70 @@ GITIGNORE_BLOCK = f"""{GITIGNORE_START}
 .worktrees/
 {GITIGNORE_END}
 """
+
+
+def _hook_commands() -> tuple[str, str]:
+    executable = str(Path(sys.executable).resolve())
+    command = f"{shlex.quote(executable)} -m workspace_orchestrator.codex_hook"
+    powershell_executable = executable.replace("'", "''")
+    command_windows = (
+        "powershell -NoProfile -Command "
+        f'"& \'{powershell_executable}\' -m workspace_orchestrator.codex_hook"'
+    )
+    return command, command_windows
+
+
+def _hook_entry(event_name: str) -> dict[str, object]:
+    command, command_windows = _hook_commands()
+    hook: dict[str, object] = {
+        "type": "command",
+        "command": command,
+        "commandWindows": command_windows,
+    }
+    if event_name != "SessionEnd":
+        hook["statusMessage"] = "AI Dev OS 自动恢复并同步任务面板"
+        hook["additionalContextLimit"] = 5000
+    else:
+        hook["timeout"] = 3
+    group: dict[str, object] = {"hooks": [hook]}
+    if event_name == "SessionStart":
+        group["matcher"] = "startup|resume"
+    return group
+
+
+def _validate_hooks(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise WorkspaceError(f"目标不是普通文件：{path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise WorkspaceError(f"Codex Hook 配置不是有效 JSON：{path}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("hooks", {}), dict):
+        raise WorkspaceError(f"Codex Hook 配置结构无效：{path}")
+
+
+def _ensure_hooks(path: Path) -> str:
+    existed = path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8")) if existed else {}
+    hooks = payload.setdefault("hooks", {})
+    changed = False
+    for event_name in ("SessionStart", "UserPromptSubmit", "SessionEnd"):
+        groups = hooks.setdefault(event_name, [])
+        installed = any(
+            "workspace_orchestrator.codex_hook" in str(hook.get("command", ""))
+            for group in groups
+            for hook in group.get("hooks", [])
+        )
+        if not installed:
+            groups.append(_hook_entry(event_name))
+            changed = True
+    if not changed:
+        return "preserved"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return "updated" if existed else "created"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +227,7 @@ def initialize_project(root: Path) -> InitResult:
     }
     for name, markers in targets.items():
         _validate_file(resolved / name, *markers)
+    _validate_hooks(resolved / ".codex" / "hooks.json")
 
     outcomes = {
         "AGENTS.md": _append_managed_block(
@@ -172,6 +240,7 @@ def initialize_project(root: Path) -> InitResult:
             resolved / "PROJECT_INTENT.md", PROJECT_INTENT
         ),
         ".gitignore": _ensure_gitignore(resolved / ".gitignore"),
+        ".codex/hooks.json": _ensure_hooks(resolved / ".codex" / "hooks.json"),
     }
     return InitResult(
         root=resolved,

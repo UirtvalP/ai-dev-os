@@ -97,6 +97,7 @@ workspace current
 workspace status REQ-001
 workspace checkpoint REQ-001 --phase implementation --task TASK-001 --completed "登录接口" --next-action "实现中间件"
 workspace handoff REQ-001 --current-state "登录功能可用" --next-action "实现中间件"
+workspace finalize REQ-001 --completed "登录接口"
 workspace resume REQ-001
 workspace review REQ-001
 ```
@@ -110,6 +111,26 @@ workspace review REQ-001
 Task 的 dashi 当前 Thread 绑定并把旧 Session 记为 `detached`；历史 Task 归属保留在该
 Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Task。同一 Thread 切回
 旧 Requirement 时会重新建立 dashi 当前绑定。
+
+当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 会幂等安装项目的
+`.codex/hooks.json`：`SessionStart` 尝试恢复已有绑定，`UserPromptSubmit` 读取结构化 hook
+事件中的用户 prompt 并自动执行完整 bootstrap，`SessionEnd` 自动 detach。项目配置了
+dashi Task Provider 时，Hook 会先检测本地任务面板端口；未运行则通过本机
+`dashi-taskboard` 启动器在后台按需拉起，已运行则直接复用。项目 Hook 第一次启用或内容
+变更后必须由用户在 Codex 中审查并信任；未受信任时 Skill 只作为一次 bootstrap 回退触发器。
+
+## Automation First
+
+`src/workspace_orchestrator/automation/` 是正式 Automation Layer：
+
+- `session_runtime.py`：CODEX_THREAD_ID、Session 注册/复用/结束与 Task 双向绑定。
+- `requirement_attach.py`：项目发现、已有绑定、唯一活动 Requirement 与 `ambiguity`。
+- `task_attach.py`：显式/已绑定/唯一 Task 选择、结构化请求创建与状态同步。
+- `git_sync.py`：Git root、branch、worktree、status、commits、changed files 与 dashi Git 上下文。
+- `state_sync.py`：纯结构化 Context Snapshot、checkpoint、handoff 和已知验证命令。
+- `runtime.py`：一次触发连续编排上述确定性步骤；不调用 LLM，也不读取对话历史。
+
+AI 仍负责语义理解、歧义含义、Root Cause、架构与实现决策、代码修改、Intent 判断以及无法稳定程序化的选择。`finalize` 由 AI 在判断语义工作已完成后触发一次；触发后的验证、状态同步、Requirement review 门禁、交接与 detach 均不再由 AI 决定。
 
 `resume` 生成精简 Context Snapshot，其中只抽取相关的 User Principles、Project Intent 和
 Requirement Intent 摘要，不把三份原文全部塞入上下文。CLI 通过 `CodexAgentProvider` 发现当前 Thread；Core 不读取

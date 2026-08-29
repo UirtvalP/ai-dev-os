@@ -34,6 +34,7 @@ SECTION_ALIASES = {
     "设计方向": "Design Direction",
     "约束": "Constraints",
     "取舍优先级": "Trade-off Priorities",
+    "执行优先级": "Execution Priority",
     "意图审查": "Intent Review",
     "阶段": "Phase",
     "已完成": "Completed",

@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 from .adapters.agent import CodexAgentProvider
+from .automation.requirement_attach import AutomationAmbiguity, discover_project_root
+from .automation.runtime import AutomationRuntime
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
 from .models import WorkflowComplexity
 from .review import review_requirement
@@ -38,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     parser.add_argument(
-        "--root", type=Path, default=Path.cwd(), help="项目根目录（默认：当前目录）"
+        "--root", type=Path, default=None, help="项目根目录（默认：从当前路径自动发现）"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -86,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_parser.add_argument("--known-problems")
     handoff_parser.add_argument("--task", dest="task_ids", action="append", default=[])
 
+    finalize = commands.add_parser(
+        "finalize", help="自动验证、检查点、Task 审查、交接并结束 Session"
+    )
+    finalize.add_argument("requirement_id")
+    finalize.add_argument("--completed", action="append", default=[])
+    finalize.add_argument("--current-state")
+    finalize.add_argument("--important-context")
+    finalize.add_argument("--next-action")
+
     review = commands.add_parser("review", help="检查验收与验证门禁")
     review.add_argument("requirement_id")
     return parser
@@ -107,7 +118,8 @@ def _status(store: WorkspaceStore, requirement_id: str) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
-    store = WorkspaceStore(args.root.resolve())
+    project_root = args.root.resolve() if args.root else discover_project_root(Path.cwd())
+    store = WorkspaceStore(project_root)
     agent_provider = CodexAgentProvider()
     if args.command == "new":
         if bool(args.task_provider) != bool(args.task_project):
@@ -171,6 +183,28 @@ def run(args: argparse.Namespace) -> str:
             task_ids=args.task_ids,
         )
         return f"已交接 {args.requirement_id.upper()}"
+    if args.command == "finalize":
+        result = AutomationRuntime(store, agent_provider).finalize(
+            args.requirement_id,
+            completed=args.completed,
+            current_state=args.current_state,
+            important_context=args.important_context,
+            next_action=(
+                args.next_action
+                or "等待用户确认；Requirement 与 Task 均不得自动标记 done。"
+            ),
+        )
+        if not result.passed:
+            raise WorkspaceError(
+                f"自动验证失败，已保存 checkpoint：{args.requirement_id.upper()}\n"
+                f"{result.verification}"
+            )
+        return (
+            f"已完成自动收尾：{args.requirement_id.upper()}\n"
+            f"Task 已进入 in_review：{', '.join(result.task_ids) or '无外部 Task'}\n"
+            f"Requirement：{'in_review' if result.requirement_in_review else '等待审查门禁'}\n"
+            f"{result.verification}"
+        )
     if args.command == "review":
         result = review_requirement(store, args.requirement_id)
         if result.passed:
@@ -189,6 +223,9 @@ def run(args: argparse.Namespace) -> str:
 def main(argv: list[str] | None = None) -> int:
     try:
         output = run(build_parser().parse_args(argv))
+    except AutomationAmbiguity as exc:
+        print(f"状态：ambiguity\n错误：{exc}", file=sys.stderr)
+        return 2
     except WorkspaceError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2

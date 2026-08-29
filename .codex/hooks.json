@@ -1,0 +1,44 @@
+{
+  "description": "AI Dev OS 确定性 Workspace 生命周期入口。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "statusMessage": "自动恢复 AI Dev OS Workspace",
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "statusMessage": "自动绑定 Requirement、Task 与 Session",
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/workspace_runtime.py\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & (Join-Path $root '.venv/Scripts/python.exe') (Join-Path $root '.codex/hooks/workspace_runtime.py')\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

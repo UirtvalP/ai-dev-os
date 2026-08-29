@@ -30,3 +30,10 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.workspace-orchestrator.automation]
+verification-commands = [
+  ["{python}", "-m", "pytest"],
+  ["{python}", "-m", "ruff", "check", "."],
+  ["git", "diff", "--check"],
+]

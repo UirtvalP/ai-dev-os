@@ -25,3 +25,16 @@
 摘要：优先选择清晰、可维护且能解决实际问题的方案，而不是理论上更整洁但实用性更低的方案。
 
 架构是实现可靠交付的手段，而不是目的。
+
+## 确定性执行优先
+
+摘要：输入、规则与输出确定的动作必须由普通程序逻辑执行，不得交给 AI 推理或提示词约定。
+
+执行优先级：
+
+1. Deterministic code
+2. Rule-based automation
+3. Small semantic decision
+4. Full Agent reasoning
+
+如果一个动作可以稳定写成普通程序逻辑，就不能使用 LLM 完成。AI 只承担语义理解、歧义判断、Root Cause 分析、架构与实现决策、Intent 判断以及无法用确定规则解决的选择。

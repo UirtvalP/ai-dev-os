@@ -13,8 +13,6 @@
 - 保留现有用户文件以及人类可读的 Markdown/JSON 状态。
 - V1 不得添加数据库、Web UI、多 Agent 调度器或自动知识写入。
 - 技术上正确但违反已记录意图的修改不算完成。
-- 新 Codex Thread 在本项目的第一次执行中必须先运行
-  `.\.venv\Scripts\workspace.exe bootstrap --request "<当前开发请求>"`；用户请求含明确
-  `REQ-<数字>` 时传入该 ID，含明确 Task ID 时改用 `--task TASK-ID`。
-  将返回的 Context Snapshot 视为事实来源。
-  多个活动需求且当前 Thread 尚未绑定时不得静默选择；多个 `in_progress` Task 时不得静默绑定。
+- 仓库级 Codex Hook 会在 `SessionStart` / `UserPromptSubmit` 自动触发 bootstrap；Agent 不得重复手工执行其内部的 Session、Requirement、Task、dashi 或 Git 步骤。Hook 未启用或未受信任时，Skill 仅回退触发一次
+  `.\.venv\Scripts\workspace.exe bootstrap --request "<当前开发请求>"`。将返回的 Context Snapshot 视为事实来源。多个活动需求且当前 Thread 尚未绑定时不得静默选择；多个 `in_progress` Task 时不得静默绑定。
+- 语义工作完成后只触发一次 `workspace finalize REQ-ID`；已知验证、checkpoint、Task `in_review`、handoff、Git changed files 和 Session detach 由 Automation Runtime 连续执行。

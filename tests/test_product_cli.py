@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from workspace_orchestrator.product_cli import main
@@ -20,6 +21,13 @@ def test_init_onboards_existing_project_without_creating_workspace(
     assert (tmp_path / "USER_PRINCIPLES.md").is_file()
     assert (tmp_path / "PROJECT_INTENT.md").is_file()
     assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    assert set(hooks["hooks"]) == {"SessionStart", "UserPromptSubmit", "SessionEnd"}
+    assert all(
+        "workspace_orchestrator.codex_hook" in group["hooks"][0]["command"]
+        for groups in hooks["hooks"].values()
+        for group in groups
+    )
     assert not (tmp_path / ".workspace").exists()
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
 
@@ -58,6 +66,7 @@ def test_init_preserves_existing_content_and_is_idempotent(
     assert intent.read_text(encoding="utf-8") == "# My intent\n"
     assert gitignore.read_text(encoding="utf-8").startswith(".env\n")
     assert "已保留：" in second_output
+    assert ".codex/hooks.json" in second_output
 
 
 def test_init_rejects_missing_directory(tmp_path: Path, capsys) -> None:
