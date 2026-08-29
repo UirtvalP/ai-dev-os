@@ -3,9 +3,7 @@ from pathlib import Path
 
 def test_workspace_skill_keeps_restore_and_approval_contract() -> None:
     root = Path(__file__).parents[1]
-    skill = (root / "skills" / "workspace-orchestrator" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
+    skill = (root / "skills" / "workspace-orchestrator" / "SKILL.md").read_text(encoding="utf-8")
 
     assert "workspace current" in skill
     assert "workspace resume REQ-ID" in skill
@@ -20,3 +18,7 @@ def test_workspace_skill_keeps_restore_and_approval_contract() -> None:
     assert "用户原则、项目意图或需求意图" in skill
     assert "`PASS`、`PARTIAL` 或 `VIOLATION`" in skill
     assert "未经用户明确批准" in skill
+    assert "workspace request-changes REQ-ID" in skill
+    assert "requirement-review" in skill
+    assert "后续 Hook/bootstrap/status" in skill
+    assert ".ai-dev-os.json" in skill

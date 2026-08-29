@@ -212,6 +212,57 @@ def test_dashi_adapter_uses_json_contract() -> None:
     assert commands == [("taskctl", "issue", "list", "--project", "ai-dev-os", "--json")]
 
 
+def test_dashi_adapter_starts_service_once_before_first_command() -> None:
+    starts: list[str] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        return json.dumps({"tasks": []})
+
+    provider = DashiTaskProvider(
+        runner=runner,
+        executable="taskctl",
+        service_starter=lambda: starts.append("started"),
+    )
+
+    provider.list_tasks("REQ-001")
+    provider.list_tasks("REQ-001")
+
+    assert starts == ["started"]
+
+
+def test_dashi_project_mapping_never_steals_same_id_from_another_workspace(
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    current = tmp_path / "current"
+    other.mkdir()
+    current.mkdir()
+
+    def runner(command: tuple[str, ...]) -> str:
+        assert command[1:3] == ("project", "list")
+        return json.dumps(
+            {
+                "projects": [
+                    {
+                        "id": "same-project",
+                        "name": "same-project",
+                        "workspacePath": str(other),
+                    }
+                ]
+            }
+        )
+
+    provider = DashiTaskProvider(
+        project_id="same-project",
+        runner=runner,
+        executable="taskctl",
+        workspace_path=str(current),
+    )
+
+    with pytest.raises(TaskProviderError, match="已映射到其他目录"):
+        provider.list_tasks("REQ-001")
+
+
 def test_dashi_adapter_creates_requirement_linked_issue() -> None:
     commands: list[tuple[str, ...]] = []
 
@@ -291,6 +342,64 @@ def test_dashi_status_update_uses_current_version() -> None:
         "4",
         "--json",
     )
+
+
+def test_dashi_review_packet_uses_description_file_cas_and_is_idempotent() -> None:
+    commands: list[tuple[str, ...]] = []
+    uploaded: list[str] = []
+    current_description = "旧正文"
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal current_description
+        commands.append(tuple(command))
+        if "update" in command:
+            file_path = Path(command[command.index("--description-file") + 1])
+            uploaded.append(file_path.read_text(encoding="utf-8"))
+            current_description = uploaded[-1]
+            version = 5
+        else:
+            version = 4
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Review",
+                    "description": current_description,
+                    "status": "in_review",
+                    "version": version,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    content = "<!-- packet -->\n\n完整审查材料"
+    assert provider.publish_review("AID-1", content).description == content
+    assert provider.publish_review("AID-1", content).description == content
+    assert uploaded == [content]
+    update = next(command for command in commands if "update" in command)
+    assert update[-3:] == ("--if-version", "4", "--json")
+
+
+def test_dashi_adapter_lists_review_comments() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        return json.dumps(
+            {
+                "comments": [
+                    {"id": "comment-1", "body": "请补测试。"},
+                    {"id": "comment-2", "content": "请更新 README。"},
+                ],
+                "nextCursor": "2",
+            }
+        )
+
+    comments = DashiTaskProvider(runner=runner, executable="taskctl").list_comments("AID-1")
+
+    assert comments == ("请补测试。", "请更新 README。")
+    assert commands == [("taskctl", "comment", "list", "AID-1", "--json")]
 
 
 def test_dashi_unlink_clears_only_matching_current_thread_binding() -> None:

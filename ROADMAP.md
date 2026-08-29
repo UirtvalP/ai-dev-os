@@ -60,9 +60,45 @@ Issue 创建、查询、评论、乐观版本状态更新、Git 上下文、完�
 验收：`workspace-orchestrator` 已通过统一 Skill 管理器链接到 Codex、Cursor 和 Claude；
 `ai_dev_os-0.1.0-py3-none-any.whl` 已完成隔离导入和 CLI 冒烟测试。
 
+## 阶段 6 — Hook-first 交付与可靠性加固
+
+- [x] 提供 `in_review` 经用户明确确认进入 `done` 的确定性 CLI/API
+- [x] 从 Git 关联 worktree 发现并共享主 `.workspace`
+- [x] dashi/taskctl 离线时本地降级，并对 Session/Task 绑定失败持续重试
+- [x] 为 JSON/Markdown 复合更新增加跨进程文件锁与原子替换
+- [x] 已安装 wheel 的 `ai-dev-os init` 直接交付 Hook，不依赖目标源码或 `.venv`
+- [x] finalize 返回具体 blockers，验证命令支持超时与配置校验
+
+验收：review→用户确认→done、worktree 发现、Provider 离线恢复、多进程写入、wheel 安装后新项目
+Hook、finalize blockers、验证超时与无效配置均有自动回归测试。
+
+## 阶段 7 — 默认 dashi 与用户审查闭环
+
+- [x] `ai-dev-os init` 初始化项目级 dashi 默认配置
+- [x] 新 Requirement 默认继承 dashi，并允许用户显式关闭 Provider
+- [x] finalize 创建具有稳定身份的专用 Requirement Review Task
+- [x] dashi Review 卡 `done` 作为显式批准，普通开发 Task `done` 不推导批准
+- [x] dashi Review 卡留言并退回 `in_progress`，或 `workspace request-changes`，恢复开发
+- [x] Provider 离线时保留退回修改状态并在后续同步收敛
+- [x] 明确并测试已绑定独立 worktree 的多 Requirement 并发边界
+
+验收：用户可以只在 dashi 面板完成批准或退回；Core 仍只依赖 TaskProvider 契约，且没有
+用户明确动作时 Requirement 与 Review Task 均不会自动进入 `done`。
+
+## 阶段 8 — 确定性 Review Packet 与并发收敛
+
+- [x] 从 Workspace、开发 Task 与 Git 事实生成结构化 Review Packet，不依赖 LLM 或聊天历史
+- [x] 通过 TaskProvider 幂等更新 dashi Review 卡正文，不重复刷评论
+- [x] 持久化并核验 packet revision/fingerprint，拒绝旧 revision 的 `done` 审批
+- [x] Packet 缺字段或发布失败时阻断 review-ready，并保留可重试状态
+- [x] 为 Requirement ID 创建、Review 同步和 SessionEnd 强杀恢复补齐并发测试
+
+验收：任务面板 Review 卡可独立验收；证据变化会生成新 revision，重复发布不产生额外写入，
+并发 Hook 的批准/退回只应用一次，SessionEnd 超时终止不会遗留阻塞后续本地开发的锁。
+
 ## 后续规划
 
-- Multica、多 Agent 调度与自动并行 Agent（待 Task Graph、锁和 Worktree 隔离成熟）
+- Multica、多 Agent 调度与自动并行 Agent（待 Task Graph 与完整 Worktree 隔离成熟）
 - 跨项目知识库与 Obsidian / Markdown Knowledge Provider（待知识候选审核模型成熟）
 - GitHub Issues / Linear Task Provider
 - Remote Runtime、Web UI、自动 PR 与 CI feedback loop

@@ -10,10 +10,12 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 
 ## 恢复
 
-1. 新 Thread 第一次执行时，如果用户请求中包含准确的 `REQ-<数字>` 标识符，直接提取它并运行 `workspace bootstrap REQ-ID --request "用户当前开发请求"`；不得推导或改写 ID。用户已明确 Task ID 时改用 `--task TASK-ID`。
-2. 否则运行 `workspace bootstrap --request "用户当前开发请求"`。它优先复用当前 Thread 已有绑定，仅在没有绑定时自动选择唯一活动需求；如果存在多个活动需求，请用户选择。未明确 Task 时只恢复唯一的 `in_progress` Task；没有活动 Task 时根据当前开发请求创建，存在多个活动 Task 时要求用户或上层调用明确选择。
-3. 将 Bootstrap 生成的上下文快照视为需求、状态、交接、计划、决策、验证、相关用户原则、项目意图、需求意图、Dashi 任务、Git 上下文和下一步行动的当前事实来源。`workspace current` 和 `workspace resume REQ-ID` 仍作为手动检查与恢复命令保留。
-4. 如果工作区不存在且用户正在开始需要长期维护的工作，使用 `workspace new` 创建。不要为琐碎的一次性请求创建持久化跟踪。
+1. 优先使用仓库 `.codex/hooks.json`：`SessionStart` / `UserPromptSubmit` 会在 Agent 推理前自动执行 bootstrap，并把 Context Snapshot 注入 developer context。不要重复执行 Session、Requirement、Task、dashi 或 Git 子步骤。
+2. 如果 Hook 未启用、未受信任或当前 Codex surface 不支持 Hook，Skill 只负责触发一次 `workspace bootstrap --request "用户当前开发请求"`。用户请求中含准确 `REQ-<数字>` 或 Task ID 时原样传入，不得推导或改写。
+3. 将生成的 Context Snapshot 视为需求、状态、交接、计划、决策、验证、相关意图、Dashi Task、Git 上下文和下一步行动的事实来源。`workspace current` 和 `workspace resume REQ-ID` 仅作为诊断入口。
+4. 多个活动 Requirement 或多个 `in_progress` Task 返回 `ambiguity` 时，只有这一步请求用户选择。Requirement 不得因小修改自动创建。
+
+兼容回退命令保持为 `workspace bootstrap REQ-ID --request "用户当前开发请求"` 或 `workspace bootstrap --request "用户当前开发请求"`；多个活动 Task 时不得猜测。
 
 ## 执行
 
@@ -26,7 +28,7 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 
 ## 持久化
 
-完成一个有意义的阶段后，保存发生变化的事实：
+完成一个有意义的中间阶段时，可保存发生变化的语义事实：
 
 ```text
 workspace checkpoint REQ-ID --phase PHASE \
@@ -35,16 +37,24 @@ workspace checkpoint REQ-ID --phase PHASE \
   --verification "状态：PASS - 验证命令或证据"
 ```
 
-当前 Thread 可以结束时，生成可替换会话的交接边界：
+语义工作完成后只触发一次自动收尾：
 
 ```text
-workspace handoff REQ-ID \
+workspace finalize REQ-ID \
   --completed "已完成事项" \
   --current-state "当前状态" \
   --important-context "重要上下文" \
   --next-action "下一步行动"
 ```
 
-运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。未经用户明确批准，不得将需求或 Dashi Issue（事项）标记为 `done`。
+Automation Runtime 会自动运行已知验证命令、写 checkpoint、把 Task 推进到 `in_review`、执行 Requirement review 门禁、收集 Git changed files、生成 handoff 并 detach Session；不得把这些确定性步骤拆成 Agent 手工流程。验证、Task 同步或 review gate 失败时，按 CLI 返回的具体 blockers 继续修复，不得描述为只等待用户确认。`SessionEnd` Hook 负责异常退出或未 finalize 时的幂等 detach。
+
+`workspace handoff REQ-ID` 保留为显式中途交接兼容命令；完整实现结束优先使用 `finalize`。
+
+运行 `workspace review REQ-ID` 前，对照用户原则、项目意图、需求意图和不必要的复杂度，更新 `intent.md` 中的四项检查。每项必须为 `PASS`、`PARTIAL` 或 `VIOLATION`；只有全部为 `PASS` 才能进入审查。之后还需确认验收标准、验证结果以及已配置的任务状态均可审查。
+
+只有用户明确批准已经处于 `in_review` 的 Requirement 时，才允许执行 `workspace confirm REQ-ID --user-confirmed`。用户明确要求修改时，执行 `workspace request-changes REQ-ID --feedback "用户反馈"`，将 Requirement 与仍在审查的开发 Task 恢复到 `in_progress`，已完成 Task 保持 `done`。未经用户明确批准，不得选择批准结果；未经用户明确要求修改，也不得选择退回结果。
+
+默认 dashi 项目会在 `ai-dev-os init` 时写入 `.ai-dev-os.json`。finalize 通过后，Runtime 创建或复用带 `requirement-review` 标签的专用 Review 卡，并把由 Workspace、开发 Task 与 Git 事实确定性生成的完整 Review Packet 幂等写入卡片正文。只有正文发布成功，且卡片 marker、revision、fingerprint 与当前 Workspace 证据一致时才允许进入 `in_review`。用户可在 dashi 将该卡手动移到 `done` 表示批准，或新增本轮留言后移到 `in_progress` 表示要求修改；后续 Hook/bootstrap/status 执行确定性同步。旧 revision 的 `done` 卡不得批准当前 Requirement。只有专用 ID 与标签同时匹配的卡才有审批语义；普通开发 Task `done`、仅留言、没有本轮新留言的 `in_progress` 或 Agent 判断都不会改变 Requirement，Runtime 不得自行把 Review 卡移到 `done`。
 
 核心项目规则和 V1 范围记录在 `V1架构.md` 中。持久化状态由工作区系统负责；本 Skill 只负责遵循并更新这些状态。

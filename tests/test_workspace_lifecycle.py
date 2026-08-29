@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,34 @@ from workspace_orchestrator.cli import main
 from workspace_orchestrator.context import bootstrap_session, build_snapshot, checkpoint, handoff
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
+
+
+def _concurrent_workspace_update(root: str, requirement_id: str, index: int) -> None:
+    from pathlib import Path
+
+    from workspace_orchestrator.automation.session_runtime import attach_session
+    from workspace_orchestrator.automation.state_sync import persist_checkpoint
+    from workspace_orchestrator.workspace import WorkspaceStore
+
+    store = WorkspaceStore(Path(root))
+    persist_checkpoint(store, requirement_id, completed=(f"并发事项 {index}",))
+    attach_session(
+        store,
+        requirement_id,
+        session_id=f"thread-{index}",
+        agent_name="codex",
+    )
+
+
+def _concurrent_create(root: str, index: int) -> None:
+    WorkspaceStore(Path(root)).create(f"并发需求 {index}")
+
+
+def _hold_requirement_lock(root: str, requirement_id: str, ready: object) -> None:
+    store = WorkspaceStore(Path(root))
+    with store.locked(requirement_id):
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(30)
 
 
 def test_create_initializes_complete_human_readable_workspace(tmp_path: Path) -> None:
@@ -21,6 +51,8 @@ def test_create_initializes_complete_human_readable_workspace(tmp_path: Path) ->
     data = store.load(first)
     assert data["meta"]["id"] == first
     assert data["meta"]["title"] == "Add authentication"
+    assert data["meta"]["task_provider"] == "dashi"
+    assert data["meta"]["task_project_id"]
     assert "- [ ] Valid users can log in" in data["requirement"]
     assert data["sessions"] == []
     assert {path.name for path in data["path"].iterdir()} == {
@@ -57,6 +89,23 @@ def test_load_migrates_legacy_workspace_without_overwriting_files(tmp_path: Path
     assert "Preserve old state" in data["intent"]
     assert "迁移到意图层之前" in data["intent"]
     assert "- 需求意图：PARTIAL" in data["intent"]
+
+
+def test_load_migrates_legacy_null_provider_but_preserves_explicit_disable(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    legacy = store.create("Legacy provider")
+    disabled = store.create("Explicit local only", task_provider=None)
+    legacy_meta_path = store.path_for(legacy) / "meta.json"
+    legacy_meta = store.read_json(legacy_meta_path)
+    legacy_meta["task_provider"] = None
+    legacy_meta["task_project_id"] = None
+    legacy_meta.pop("task_provider_explicitly_disabled")
+    store.write_json(legacy_meta_path, legacy_meta)
+
+    assert store.load(legacy)["meta"]["task_provider"] == "dashi"
+    assert store.load(disabled)["meta"]["task_provider"] is None
 
 
 def test_current_id_resolves_only_active_workspace(tmp_path: Path) -> None:
@@ -376,6 +425,23 @@ def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     assert "REQ-001 CLI demo" in capsys.readouterr().out
 
 
+def test_cli_confirm_requires_explicit_flag_and_marks_only_requirement_done(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Confirm")
+    store.touch_meta(requirement_id, status="in_review")
+    root_args = ["--root", str(tmp_path)]
+
+    assert main([*root_args, "confirm", requirement_id]) == 2
+    assert "明确确认" in capsys.readouterr().err
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+
+    assert main([*root_args, "confirm", requirement_id, "--user-confirmed"]) == 0
+    assert "外部 Task 未自动完成" in capsys.readouterr().out
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+
+
 def test_cli_bootstrap_auto_attaches_unique_requirement(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -395,6 +461,65 @@ def test_persisted_json_is_utf8_and_readable(tmp_path: Path) -> None:
     meta_path = store.path_for(requirement_id) / "meta.json"
 
     assert json.loads(meta_path.read_text(encoding="utf-8"))["title"] == "中文需求"
+
+
+def test_concurrent_sessions_preserve_json_meta_and_markdown_updates(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Concurrent updates")
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_concurrent_workspace_update,
+            args=(str(tmp_path), requirement_id, index),
+        )
+        for index in range(6)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+
+    data = store.load(requirement_id)
+    assert {item["id"] for item in data["sessions"]} == {f"thread-{index}" for index in range(6)}
+    assert all(f"- 并发事项 {index}" in data["state"] for index in range(6))
+    assert all(f"- [x] 并发事项 {index}" in data["plan"] for index in range(6))
+    assert data["meta"]["status"] == "draft"
+
+
+def test_concurrent_create_allocates_unique_complete_requirement_ids(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=_concurrent_create, args=(str(tmp_path), index))
+        for index in range(8)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    store = WorkspaceStore(tmp_path)
+    assert store.requirement_ids() == tuple(f"REQ-{index:03d}" for index in range(1, 9))
+    assert all(store.load(item)["meta"]["id"] == item for item in store.requirement_ids())
+
+
+def test_dead_process_releases_requirement_lock_immediately(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("锁恢复")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(
+        target=_hold_requirement_lock, args=(str(tmp_path), requirement_id, ready)
+    )
+    process.start()
+    assert ready.wait(10)
+    process.terminate()
+    process.join(10)
+    started = time.monotonic()
+    with store.locked(requirement_id):
+        store.touch_meta(requirement_id, recovered=True)
+    assert time.monotonic() - started < 3
+    assert store.load(requirement_id)["meta"]["recovered"] is True
 
 
 def test_cli_can_configure_dashi_project(
@@ -418,6 +543,29 @@ def test_cli_can_configure_dashi_project(
     meta = WorkspaceStore(tmp_path).load("REQ-001")["meta"]
     assert meta["task_provider"] == "dashi"
     assert meta["task_project_id"] == "ai-dev-os"
+
+
+def test_cli_uses_dashi_by_default_and_allows_explicit_disable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--root", str(tmp_path), "new", "Default provider"]) == 0
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "new",
+                "Local only",
+                "--no-task-provider",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    store = WorkspaceStore(tmp_path)
+    assert store.load("REQ-001")["meta"]["task_provider"] == "dashi"
+    assert store.load("REQ-002")["meta"]["task_provider"] is None
 
 
 def test_cli_bootstrap_passes_current_development_request(
