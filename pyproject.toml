@@ -17,6 +17,7 @@ dev = [
 ]
 
 [project.scripts]
+ai-dev-os = "workspace_orchestrator.product_cli:main"
 workspace = "workspace_orchestrator.cli:main"
 
 [tool.hatch.build.targets.wheel]

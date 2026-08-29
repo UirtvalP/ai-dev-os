@@ -50,16 +50,42 @@ ROADMAP.md                    第一版实施路线图
 
 需要 Python 3.11+。
 
+从源码目录安装为用户级命令（推荐使用 `uv`）：
+
+```bash
+uv tool install .
+ai-dev-os --version
+```
+
+`uv` 会把 `ai-dev-os` 和 `workspace` 安装到用户 PATH 可发现的工具目录。安装后可以离开
+本仓库，在任意现有项目目录直接运行 `ai-dev-os init`。仅在项目虚拟环境中执行
+`pip install -e` 不会让其他目录自动找到该命令。
+
+开发本仓库时再使用 editable 环境：
+
 ```bash
 python -m pip install -e ".[dev]"
 pytest
+ai-dev-os --help
 workspace --help
 ```
+
+将一个现有项目接入 AI Dev OS：
+
+```bash
+cd existing-project
+ai-dev-os init
+```
+
+该命令只补充项目级接入文件，并保留已有内容；重复执行不会重复写入。它不会创建
+Requirement Workspace，也不会改变 `workspace` 命令层级。接入完成后，再使用
+`workspace new` 创建首个 Requirement。
 
 构建可安装 wheel：
 
 ```bash
 python -m pip wheel . --no-deps --wheel-dir dist
+uv tool install --force dist/ai_dev_os-0.1.0-py3-none-any.whl
 ```
 
 当前仓库已经跑通 V1 的本地核心生命周期：
