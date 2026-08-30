@@ -116,6 +116,47 @@ def test_current_id_resolves_only_active_workspace(tmp_path: Path) -> None:
     assert store.current_id() == requirement_id
 
 
+def test_active_session_conflicts_reports_only_duplicate_active_bindings(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    store.write_json(
+        store.path_for(first) / "sessions.json",
+        [{"id": "thread-1", "result": "in_progress"}],
+    )
+    store.write_json(
+        store.path_for(second) / "sessions.json",
+        [
+            {"id": "thread-1", "result": "in_progress"},
+            {"id": "thread-ended", "result": "detached"},
+        ],
+    )
+
+    assert store.active_session_conflicts() == {"thread-1": (first, second)}
+
+
+def test_doctor_reports_conflicts_and_missing_verification_without_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    for requirement_id in (first, second):
+        store.write_json(
+            store.path_for(requirement_id) / "sessions.json",
+            [{"id": "thread-1", "result": "in_progress"}],
+        )
+    before = [store.read_json(store.path_for(item) / "sessions.json") for item in (first, second)]
+
+    assert main(["--root", str(tmp_path), "doctor"]) == 0
+
+    output = capsys.readouterr().out
+    assert "thread-1：REQ-001, REQ-002" in output
+    assert "REQ-001, REQ-002" in output
+    after = [store.read_json(store.path_for(item) / "sessions.json") for item in (first, second)]
+    assert after == before
+
+
 def test_current_id_refuses_to_guess_between_active_workspaces(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
     store.create("First")

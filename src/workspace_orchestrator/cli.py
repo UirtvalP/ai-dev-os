@@ -68,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("current", help="输出唯一的活动需求 ID")
 
+    commands.add_parser("doctor", help="只读诊断 Session 绑定冲突与需求收敛建议")
+
     status = commands.add_parser("status", help="显示已持久化的需求状态")
     status.add_argument("requirement_id", nargs="?")
 
@@ -144,6 +146,35 @@ def _status(store: WorkspaceStore, requirement_id: str) -> str:
     return result
 
 
+def _doctor(store: WorkspaceStore) -> str:
+    """输出可人工审查的收敛预览，绝不自动结束或解绑 Requirement。"""
+
+    conflicts = store.active_session_conflicts()
+    lines = ["工作区诊断（只读）"]
+    if conflicts:
+        lines.append("活跃 Session 多重绑定：")
+        lines.extend(
+            f"- {session_id}：{', '.join(requirements)}"
+            for session_id, requirements in sorted(conflicts.items())
+        )
+        lines.append("建议：先确认每个 Session 应保留的唯一 Requirement，再显式交接其余绑定。")
+    else:
+        lines.append("活跃 Session 多重绑定：无")
+    pending = []
+    for requirement_id in store.requirement_ids(statuses={"draft", "ready", "in_progress", "blocked", "in_review"}):
+        data = store.load(requirement_id)
+        verification = data["verification"]
+        if "未配置已知验证命令" in verification:
+            pending.append(requirement_id)
+    if pending:
+        lines.append("未配置已知验证命令：" + ", ".join(pending))
+        lines.append("建议：为这些需求补充确定性验证命令或明确标记人工验收；不要据此自动标记 done。")
+    else:
+        lines.append("未配置已知验证命令：无")
+    lines.append("收敛预览：本命令不修改 Session、Requirement、Task 或 Git 状态。")
+    return "\n".join(lines)
+
+
 def run(args: argparse.Namespace) -> str:
     project_root = args.root.resolve() if args.root else discover_project_root(Path.cwd())
     store = WorkspaceStore(
@@ -178,6 +209,8 @@ def run(args: argparse.Namespace) -> str:
         return f"已创建 {requirement_id}{suffix}"
     if args.command == "current":
         return store.current_id()
+    if args.command == "doctor":
+        return _doctor(store)
     if args.command == "status":
         return _status(store, args.requirement_id or store.current_id())
     if args.command == "resume":

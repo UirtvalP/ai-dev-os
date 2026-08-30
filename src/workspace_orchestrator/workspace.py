@@ -327,6 +327,24 @@ class WorkspaceStore:
 
         return self.requirement_id_for_session(session_id)
 
+    def active_session_conflicts(self) -> dict[str, tuple[str, ...]]:
+        """返回活跃 Session 的多需求绑定；仅诊断，不修改任何状态。"""
+
+        bindings: dict[str, list[str]] = {}
+        for requirement_id in self.requirement_ids():
+            sessions_path = self.path_for(requirement_id) / "sessions.json"
+            if not sessions_path.is_file():
+                continue
+            for session in self.read_json(sessions_path):
+                session_id = str(session.get("id") or "").strip()
+                if session_id and session.get("result") == "in_progress":
+                    bindings.setdefault(session_id, []).append(requirement_id)
+        return {
+            session_id: tuple(requirements)
+            for session_id, requirements in bindings.items()
+            if len(requirements) > 1
+        }
+
     def create(
         self,
         title: str,

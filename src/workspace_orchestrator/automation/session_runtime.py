@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider
 from workspace_orchestrator.adapters.task import TaskProviderError
-from workspace_orchestrator.workspace import WorkspaceStore, now_iso
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 
 def require_session_id(agent_provider: AgentProvider) -> str:
@@ -52,7 +52,22 @@ def attach_session(
     """幂等注册 Session，并只建立尚不存在的外部 Task 绑定。"""
 
     path = store.path_for(requirement_id) / "sessions.json"
-    with store.locked(requirement_id):
+    # Session 是可替换的执行上下文，但一个活跃 Session 只能服务一个 Requirement。
+    # 使用 Workspace 总锁把“检查其他绑定 + 写入当前绑定”合并为一次原子操作。
+    with store.locked():
+        conflicts = store.active_session_conflicts()
+        if session_id in conflicts:
+            linked = ", ".join(conflicts[session_id])
+            raise WorkspaceError(
+                f"会话 {session_id} 同时关联了多个需求：{linked}；"
+                "请先运行 workspace doctor 查看并显式处理遗留绑定"
+            )
+        existing_requirement = store.requirement_id_for_session(session_id)
+        if existing_requirement and existing_requirement != requirement_id.upper():
+            raise WorkspaceError(
+                f"会话 {session_id} 已活跃绑定到 {existing_requirement}，"
+                f"不能同时接入 {requirement_id.upper()}；请先交接或结束旧会话"
+            )
         sessions = store.read_json(path)
         timestamp = now_iso()
         existing = next((item for item in sessions if item["id"] == session_id), None)

@@ -1189,6 +1189,28 @@ def test_two_requirements_in_prebound_worktrees_keep_sessions_and_git_state_isol
     assert second_data["meta"]["git"]["worktree"] == str(second_worktree)
 
 
+def test_legacy_multi_requirement_session_is_rejected_without_mutation(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First")
+    second = store.create("Second")
+    store.write_json(
+        store.path_for(first) / "sessions.json",
+        [{"id": "shared-thread", "result": "in_progress", "task_ids": []}],
+    )
+    store.write_json(
+        store.path_for(second) / "sessions.json",
+        [{"id": "shared-thread", "result": "in_progress", "task_ids": []}],
+    )
+    runtime = AutomationRuntime(
+        store, CodexAgentProvider(environ={"CODEX_THREAD_ID": "shared-thread"})
+    )
+
+    with pytest.raises(WorkspaceError, match="同时关联了多个需求"):
+        runtime.bootstrap(first)
+
+    assert store.active_session_conflicts() == {"shared-thread": (first, second)}
+
+
 def test_stop_auto_finishes_only_after_thread_commit_is_clean_and_pushed(
     tmp_path: Path,
 ) -> None:
