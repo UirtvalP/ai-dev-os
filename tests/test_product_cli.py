@@ -266,7 +266,14 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
         env=subprocess_env,
     )
     subprocess.run(
-        [str(workspace), "--root", str(project), "new", "Wheel hook"],
+        [
+            str(workspace),
+            "--root",
+            str(project),
+            "new",
+            "Wheel hook",
+            "--no-task-provider",
+        ],
         check=True,
         capture_output=True,
     )

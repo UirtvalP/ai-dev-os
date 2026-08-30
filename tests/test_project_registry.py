@@ -57,8 +57,8 @@ def test_repeated_init_is_idempotent_and_preserves_registered_at(
     second = _payload()["projects"][0]
 
     assert len(_payload()["projects"]) == 1
-    assert second["registered_at"] == first["registered_at"]
-    assert second["updated_at"] == "2026-08-30T02:00:00+08:00"
+    assert second == first
+    assert second["updated_at"] == "2026-08-30T01:00:00+08:00"
 
 
 def test_project_move_updates_path_under_persisted_identity(tmp_path: Path) -> None:

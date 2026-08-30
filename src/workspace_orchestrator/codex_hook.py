@@ -99,10 +99,12 @@ def main() -> int:
         )
     )
     try:
+        turn_id = str(event.get("turn_id") or event.get("prompt_id") or "").strip()
         snapshot = runtime.bootstrap(
             requirement_match.group(0).upper() if requirement_match else None,
             task_ids=task_ids,
             development_request=prompt or None,
+            creation_key=f"{session_id}:{turn_id}" if turn_id else None,
         )
     except AutomationAmbiguity as exc:
         if event_name == "UserPromptSubmit":

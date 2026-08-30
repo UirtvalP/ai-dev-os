@@ -110,7 +110,6 @@ class GlobalProjectRegistry:
     def register(self, root: Path, config: ProjectConfig) -> RegisteredProject:
         resolved = root.expanduser().resolve()
         project_id = config.project_id or config.task_project_id or default_task_project_id(resolved)
-        timestamp = now_iso()
         with _file_lock(self.lock_path):
             projects = list(self._read_unlocked())
             path_conflict = next(
@@ -126,10 +125,21 @@ class GlobalProjectRegistry:
                     f"项目路径 {resolved} 已登记为 {path_conflict.id}，不能猜测是否应改为 {project_id}"
                 )
             current = next((item for item in projects if item.id == project_id), None)
+            name = project_display_name(resolved)
+            path = str(resolved)
+            if current is not None and (
+                current.name == name
+                and current.path == path
+                and current.task_provider == config.task_provider
+                and current.task_project_id == config.task_project_id
+            ):
+                return current
+
+            timestamp = now_iso()
             registered = RegisteredProject(
                 id=project_id,
-                name=project_display_name(resolved),
-                path=str(resolved),
+                name=name,
+                path=path,
                 task_provider=config.task_provider,
                 task_project_id=config.task_project_id,
                 registered_at=current.registered_at if current else timestamp,

@@ -48,11 +48,13 @@ def bootstrap_session(
     task_provider: TaskProvider | None = None,
     task_ids: Sequence[str] = (),
     development_request: str | None = None,
+    creation_key: str | None = None,
 ) -> str:
     return _runtime(store, agent_provider, task_provider).bootstrap(
         requirement_id,
         task_ids=task_ids,
         development_request=development_request,
+        creation_key=creation_key,
     )
 
 

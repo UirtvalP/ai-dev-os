@@ -192,6 +192,8 @@ workspace request-changes REQ-001 --feedback "请补充失败场景测试"
 
 `bootstrap` 是新 Codex Thread 的首次执行入口。显式传入 Requirement ID 时接入该需求；
 无参数时先复用当前 Thread 已有绑定，否则只自动选择唯一可执行 Requirement。
+用户请求以“新增需求”“新建需求”或“创建需求”开头时，Runtime 会用 Hook `turn_id` 幂等创建并接入，
+即使已有多个活动 Requirement 也不再二次确认；否定表达和普通修改仍保留原有歧义门禁。
 处于 `in_review` 的 Requirement 正在等待用户确认，不再被 `current` 或自动 bootstrap 当作活动开发需求。
 多个活动需求时会要求显式选择，已绑定的 Thread 也不会被静默切换。
 新 Requirement 默认继承项目的 `dashi` 配置；只有显式使用 `workspace new --no-task-provider`
@@ -204,6 +206,8 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 旧 Requirement 时会重新建立 dashi 当前绑定。dashi/taskctl 离线时 bootstrap 会保留本地恢复能力，
 在 `sessions.json` 记录尚未收敛的绑定/解绑，并在后续 bootstrap 自动重试；本地已有 Session 记录不会
 成为永久跳过外部同步的理由。
+每个未完成 Requirement 会幂等保持至少一张带 `requirement-work` 标签的主面板工作卡；历史漏项与
+Provider 离线失败会在后续 bootstrap 补偿，并通过 Requirement 文件锁避免并发重复建卡。
 
 当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 安装的 `.codex/hooks.json` 在
 `SessionStart` 尝试恢复已有绑定，在 `UserPromptSubmit` 读取结构化 hook 事件中的用户 prompt 并自动
@@ -225,13 +229,14 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 - `review_packet.py`：只从 Requirement、Intent、State、Verification、Handoff、开发 Task 与
   Git Adapter 生成结构化审查事实、稳定 revision/fingerprint 和中文 Markdown。
 
-AI 仍负责语义理解、歧义含义、Root Cause、架构与实现决策、代码修改、Intent 判断以及无法稳定程序化的选择。`finalize` 由 AI 在判断语义工作已完成后触发一次；触发后的验证、状态同步与 Requirement review 门禁不再由 AI 决定。验证命令支持统一超时并严格校验配置；验证、Task 同步或 review 失败时，CLI 返回具体 blockers，保留 Session 供修复后重试，且不会误报为“只等待用户确认”。
+AI 仍负责语义理解、Root Cause、架构与实现决策、代码修改和 Intent 判断。`finalize` 由 AI 在语义工作完成后触发一次；默认在已知验证、验收标准与 Intent 门禁全部通过后自动把 Requirement 与开发 Task 完成。只有 Requirement 明确记录人工测试/验收时才发布 Review Packet 并进入 `in_review`。验证失败时保留 Session 供修复后重试。
 
 当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 会幂等安装项目的
 `.codex/hooks.json`：`SessionStart` 尝试恢复已有绑定，`UserPromptSubmit` 读取结构化 hook
 事件中的用户 prompt 并自动执行完整 bootstrap，`Stop` 检查已推送自动收尾，`SessionEnd`
-自动 detach。自动收尾只在当前 Thread 启动后产生新提交、工作树干净、HEAD 与上游完全一致，
-且 Thread 已绑定开发 Task 时触发；它把关联 Task 置为 `done`、归档 Thread，但不完成 Requirement。
+自动 detach。finalize 会先把 Session 记为 `pending_auto_finish` 并清除活动绑定；Stop 仍可按 Thread ID
+找到该持久记录。只有当前 Thread 启动后产生新提交、工作树干净、HEAD 与上游完全一致时，
+它才幂等完成关联 Task、归档 Thread并清除 pending，因此真实的“finalize → commit → push → Stop”顺序可收敛。
 将 `.ai-dev-os.json` 中的 `automation.auto_finish_pushed_thread` 设为 `false` 即可关闭。项目配置了
 dashi Task Provider 时，Hook 会先检测本地任务面板端口；未运行则通过本机
 `dashi-taskboard` 启动器在后台按需拉起，已运行则直接复用。项目 Hook 第一次启用或内容
@@ -265,7 +270,8 @@ OS advisory 文件锁与原子替换；进程被 `SessionEnd` 超时强杀后锁
 并发写入不会相互覆盖，Provider I/O 也不占用 Session 状态写锁。Review 会输出 Intent Alignment 的
 `PASS / PARTIAL / VIOLATION`；只有四项 Intent 检查全部 PASS 才允许进入 `in_review`。
 
-最短用户审查流程：
+默认完成流程无需用户审查：独立代码审阅和已知验证通过、验收与 Intent 全部为 PASS 后，
+`workspace finalize` 自动结束 Requirement。明确要求人工测试或验收时使用以下流程：
 
 1. Agent 只执行一次 `workspace finalize REQ-ID`。通过后 Runtime 创建或复用一张带
    `requirement-review` 稳定标签的专用 Review 卡，并把完整 Review Packet 幂等写入卡片正文。Packet
@@ -281,10 +287,8 @@ OS advisory 文件锁与原子替换；进程被 `SessionEnd` 超时强杀后锁
    把 Requirement 恢复为 `in_progress`，并重开仍处于 `in_review` 的开发 Task。等价 CLI 是
    `workspace request-changes REQ-ID --feedback "修改意见"`。
 
-只有 meta 中专用卡 ID 与稳定标签同时匹配时才有审查语义。普通开发 Task `done`、仅留言、
-没有本轮新留言的 `in_progress`、测试通过或 Agent
-判断都不会批准或退回 Requirement。Runtime 永不自行把 Review 卡置为 `done`，`confirm` 也不会
-自动完成任何外部 Task。Provider 离线时，退回修改先保存本地状态并在后续 bootstrap 重试 Task 收敛。
+只有人工测试路径中 meta 的专用卡 ID 与稳定标签同时匹配时才有人工审查语义。默认自动路径不创建
+Review 卡，也不伪造用户批准。Provider 离线时，本地状态与待补偿事实继续保留。
 Review 卡正文发布失败、关键证据缺失，或卡片 marker 与当前 revision/fingerprint 不一致时，Runtime 会
 返回具体 blocker 并保持/恢复 `in_progress`；旧 revision 的 `done` 卡绝不会批准新证据。Packet 的
 验证区同时展示命令、状态和经过长度限制及路径清理的真实结果摘要，不会把状态行误当作执行结果。

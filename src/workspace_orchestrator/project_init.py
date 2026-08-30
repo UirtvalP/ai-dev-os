@@ -25,7 +25,10 @@ AGENTS_BLOCK = f"""{AGENTS_START}
 - Hook 未启用或未受信任时，只回退执行一次 `workspace bootstrap --request "<当前开发请求>"`；
   请求包含明确的 `REQ-<数字>` 或 Task ID 时原样传入。
 - 必须阅读用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`、项目级 `PROJECT_INTENT.md` 和当前需求的 `intent.md`。
-- 多个活动 Requirement 或多个 `in_progress` Task 存在歧义时，不得静默选择。
+- 明确“新增/新建/创建需求”时由 Runtime 幂等创建并接入，不再二次确认；普通修改遇到多个活动 Requirement 或多个 `in_progress` Task 时不得静默选择。
+- 语义工作完成后只触发一次 `workspace finalize REQ-ID`。默认在已知验证、验收标准与 Intent 门禁通过后自动完成 Requirement；只有明确要求人工测试或验收时才进入人工 Review。
+- finalize 后的待推送记录由 Stop Hook 在新提交完整推送后完成关联 Task 并归档 Thread。
+- 每个活动 Requirement 必须在任务面板保持至少一张可见工作卡；Provider 离线或并发重试由 Runtime 幂等补偿。
 {AGENTS_END}
 """
 

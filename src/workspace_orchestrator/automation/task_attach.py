@@ -13,15 +13,21 @@ from workspace_orchestrator.adapters.task import (
     ensure_taskboard_service,
 )
 from workspace_orchestrator.models import Task
-from workspace_orchestrator.workspace import WorkspaceError
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, markdown_sections
 
 from .requirement_attach import AutomationAmbiguity
 
 REQUIREMENT_REVIEW_LABEL = "requirement-review"
+REQUIREMENT_WORK_LABEL = "requirement-work"
+BOARD_VISIBLE_STATUSES = {"todo", "ready", "in_progress", "blocked", "in_review"}
 
 
 class ReviewTaskSyncError(WorkspaceError):
     """专用 Review Task 的可重试 Provider 同步失败。"""
+
+
+class BoardTaskSyncError(WorkspaceError):
+    """Requirement 工作卡的可重试 Provider 同步失败。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +65,71 @@ def _request_task(development_request: str) -> Task:
 
 def is_requirement_review_task(task: Task) -> bool:
     return REQUIREMENT_REVIEW_LABEL in task.labels
+
+
+def ensure_requirement_board_task(
+    store: WorkspaceStore,
+    requirement_id: str,
+    task_provider: TaskProvider | None,
+) -> Task | None:
+    """为每个未完成 Requirement 保证一张可在主面板继续执行的活动工作卡。"""
+
+    if task_provider is None:
+        return None
+    try:
+        with store.provider_locked(requirement_id):
+            data = store.load(requirement_id)
+            meta = data["meta"]
+            if meta.get("status") == "done":
+                return None
+            tasks = tuple(
+                task
+                for task in task_provider.list_tasks(requirement_id)
+                if not is_requirement_review_task(task)
+            )
+            expected_id = str(meta.get("requirement_task_id") or "")
+            visible = tuple(task for task in tasks if task.status in BOARD_VISIBLE_STATUSES)
+            current = next((task for task in visible if task.id == expected_id), None)
+            if current is None and visible:
+                current = next(
+                    (task for task in visible if REQUIREMENT_WORK_LABEL in task.labels),
+                    visible[0],
+                )
+            if current is not None:
+                if expected_id != current.id or meta.get("pending_task_visibility"):
+                    store.touch_meta(
+                        requirement_id,
+                        requirement_task_id=current.id,
+                        pending_task_visibility=False,
+                    )
+                return current
+            sections = markdown_sections(data["requirement"])
+            desired_status = (
+                "blocked"
+                if meta.get("status") == "blocked"
+                else "in_review"
+                if meta.get("status") == "in_review"
+                else "todo"
+            )
+            created = task_provider.create_task(
+                requirement_id,
+                Task(
+                    id="new",
+                    title=f"{requirement_id} {meta['title']}",
+                    description=sections.get("Goal", str(meta["title"])),
+                    status=desired_status,
+                    labels=(REQUIREMENT_WORK_LABEL,),
+                ),
+            )
+            store.touch_meta(
+                requirement_id,
+                requirement_task_id=created.id,
+                pending_task_visibility=False,
+            )
+            return created
+    except TaskProviderError as exc:
+        store.touch_meta(requirement_id, pending_task_visibility=True)
+        raise BoardTaskSyncError(f"Requirement 工作卡同步失败：{exc}") from exc
 
 
 def requirement_review_task(
@@ -156,12 +227,21 @@ def select_tasks(
             if active:
                 selected = (active[0].id,)
             elif development_request and development_request.strip():
-                created = task_provider.create_task(
-                    requirement_id, _request_task(development_request)
-                )
-                tasks = (*tasks, created)
-                by_id[created.id] = created
-                selected = (created.id,)
+                work_cards = [
+                    task
+                    for task in tasks
+                    if REQUIREMENT_WORK_LABEL in task.labels
+                    and task.status in {"todo", "ready"}
+                ]
+                if len(work_cards) == 1:
+                    selected = (work_cards[0].id,)
+                else:
+                    created = task_provider.create_task(
+                        requirement_id, _request_task(development_request)
+                    )
+                    tasks = (*tasks, created)
+                    by_id[created.id] = created
+                    selected = (created.id,)
             else:
                 # SessionStart 可能没有开发请求；先恢复 Requirement，首次用户请求
                 # 到达时再创建开发 Task，不能让空任务板阻断本地开发。

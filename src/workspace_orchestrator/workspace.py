@@ -241,6 +241,13 @@ class WorkspaceStore:
         with _file_lock(self.root / f".{requirement_id.upper()}.provider.lock"):
             yield
 
+    @contextmanager
+    def finalize_locked(self, requirement_id: str):
+        """串行同一 Requirement 的完整 finalize；进程退出时由 OS 自动释放。"""
+
+        with _file_lock(self.root / f".{requirement_id.upper()}.finalize.lock"):
+            yield
+
     def next_id(self) -> str:
         existing = []
         if self.root.exists():
@@ -288,9 +295,15 @@ class WorkspaceStore:
                 result.append(path.name)
         return tuple(result)
 
-    def attached_requirement_id(self, session_id: str) -> str | None:
-        """查找已与会话绑定的需求，不容忍一对多歧义。"""
+    def requirement_id_for_session(
+        self,
+        session_id: str,
+        *,
+        results: set[str] | None = None,
+    ) -> str | None:
+        """按允许的 Session 结果查找需求，不容忍一对多歧义。"""
 
+        selected_results = results or {"in_progress"}
         attached: list[str] = []
         if self.root.exists():
             for path in sorted(self.root.iterdir()):
@@ -301,13 +314,18 @@ class WorkspaceStore:
                     continue
                 sessions = self.read_json(sessions_path)
                 if any(
-                    item.get("id") == session_id and item.get("result") == "in_progress"
+                    item.get("id") == session_id and item.get("result") in selected_results
                     for item in sessions
                 ):
                     attached.append(path.name)
         if len(attached) > 1:
             raise WorkspaceError(f"会话 {session_id} 同时关联了多个需求：" + ", ".join(attached))
         return attached[0] if attached else None
+
+    def attached_requirement_id(self, session_id: str) -> str | None:
+        """查找当前活动绑定的需求。"""
+
+        return self.requirement_id_for_session(session_id)
 
     def create(
         self,
@@ -318,6 +336,8 @@ class WorkspaceStore:
         complexity: WorkflowComplexity = WorkflowComplexity.NORMAL,
         task_provider: str | None | object = _PROJECT_DEFAULT,
         task_project_id: str | None = None,
+        manual_test_required: bool = False,
+        creation_key: str | None = None,
     ) -> str:
         from .project_config import default_project_config, load_project_config
 
@@ -338,6 +358,18 @@ class WorkspaceStore:
         else:
             selected_project_id = task_project_id
         with self.locked():
+            normalized_creation_key = (creation_key or "").strip() or None
+            if normalized_creation_key and self.root.exists():
+                for existing_path in sorted(self.root.iterdir()):
+                    meta_path = existing_path / "meta.json"
+                    if (
+                        existing_path.is_dir()
+                        and re.fullmatch(r"REQ-\d{3,}", existing_path.name)
+                        and meta_path.is_file()
+                        and self.read_json(meta_path).get("creation_key")
+                        == normalized_creation_key
+                    ):
+                        return existing_path.name
             requirement_id = self.next_id()
             path = self.path_for(requirement_id)
             path.mkdir(parents=True, exist_ok=False)
@@ -353,9 +385,12 @@ class WorkspaceStore:
             "task_provider": selected_provider,
             "task_project_id": selected_project_id,
             "task_provider_explicitly_disabled": selected_provider is None,
+            "manual_test_required": manual_test_required,
             "agent_provider": "codex",
             "git": {"branch": None, "worktree": None},
             }
+            if normalized_creation_key:
+                meta["creation_key"] = normalized_creation_key
             self.write_json(path / "meta.json", meta)
             criteria = acceptance or ["定义验收标准"]
             checked = "\n".join(f"- [ ] {item}" for item in criteria)

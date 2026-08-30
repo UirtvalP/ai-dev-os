@@ -46,6 +46,8 @@ def attach_session(
     task_provider: TaskProvider | None = None,
     task_ids: Sequence[str] = (),
     head_commit: str | None = None,
+    branch: str | None = None,
+    worktree: str | None = None,
 ) -> None:
     """幂等注册 Session，并只建立尚不存在的外部 Task 绑定。"""
 
@@ -64,6 +66,10 @@ def attach_session(
             existing["task_ids"] = list(dict.fromkeys([*previous, *normalized]))
             if head_commit and not existing.get("started_head"):
                 existing["started_head"] = head_commit
+            if branch:
+                existing["branch"] = branch
+            if worktree:
+                existing["worktree"] = worktree
             links_to_attempt = list(
                 dict.fromkeys(
                     [
@@ -81,6 +87,8 @@ def attach_session(
                 "ended_at": None,
                 "task_ids": normalized,
                 "started_head": head_commit,
+                "branch": branch,
+                "worktree": worktree,
                 "result": "in_progress",
             }
             sessions.append(existing)
@@ -146,6 +154,7 @@ def end_session(
     *,
     result: str = "detached",
     task_provider: TaskProvider | None = None,
+    allowed_results: Sequence[str] = ("in_progress",),
 ) -> None:
     """幂等结束 Session，同时清除 dashi 当前 Thread 绑定。"""
 
@@ -156,7 +165,7 @@ def end_session(
             (
                 item
                 for item in sessions
-                if item.get("id") == session_id and item.get("result") == "in_progress"
+                if item.get("id") == session_id and item.get("result") in allowed_results
             ),
             None,
         )
@@ -179,7 +188,7 @@ def end_session(
     with store.locked(requirement_id):
         sessions = store.read_json(path)
         existing = next((item for item in sessions if item.get("id") == session_id), None)
-        if existing is None or existing.get("result") == "in_progress":
+        if existing is None or existing.get("result") in allowed_results:
             return
         current = set(existing.get("pending_unlink_task_ids", ()))
         current.difference_update(task_ids)

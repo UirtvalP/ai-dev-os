@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from workspace_orchestrator.adapters.agent import AgentProviderError
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
@@ -20,10 +21,11 @@ from workspace_orchestrator.review_packet import (
     render_review_packet,
     validate_review_packet,
 )
+from workspace_orchestrator.workflow import route_workflow
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 from .git_sync import collect_git_context, sync_task_git_context
-from .requirement_attach import select_requirement
+from .requirement_attach import parse_new_requirement_request, select_requirement
 from .session_runtime import attach_session, end_session, require_session_id, session_task_ids
 from .state_sync import (
     collect_snapshot,
@@ -37,6 +39,7 @@ from .state_sync import (
 from .task_attach import (
     complete_tasks,
     configured_task_provider,
+    ensure_requirement_board_task,
     ensure_requirement_review_task,
     move_tasks_to_review,
     select_tasks,
@@ -49,6 +52,7 @@ class FinalizeResult:
     verification: str
     task_ids: tuple[str, ...]
     requirement_in_review: bool = False
+    requirement_completed: bool = False
     blockers: tuple[str, ...] = ()
     review_task_id: str | None = None
 
@@ -128,16 +132,74 @@ class AutomationRuntime:
                 messages.append(message)
         return tuple(messages)
 
+    def sync_taskboard_visibility(
+        self, skip_requirement_id: str | None = None
+    ) -> tuple[str, ...]:
+        """幂等补偿活动 Requirement 的主面板工作卡；Provider 离线不破坏本地状态。"""
+
+        messages: list[str] = []
+        skipped = skip_requirement_id.upper() if skip_requirement_id else None
+        for current_id in self.store.requirement_ids(
+            statuses={"draft", "ready", "in_progress", "blocked", "in_review"}
+        ):
+            if current_id == skipped:
+                continue
+            try:
+                ensure_requirement_board_task(
+                    self.store, current_id, self._provider(current_id)
+                )
+            except WorkspaceError as exc:
+                messages.append(f"{current_id}：{exc}")
+        return tuple(messages)
+
     def bootstrap(
         self,
         requirement_id: str | None = None,
         *,
         task_ids: Sequence[str] = (),
         development_request: str | None = None,
+        creation_key: str | None = None,
     ) -> str:
         """完成 Session→Requirement→Task→dashi→Git→Snapshot 全链路。"""
 
+        session_id = require_session_id(self.agent_provider)
+        pending_requirement_id = self.store.requirement_id_for_session(
+            session_id, results={"pending_auto_finish"}
+        )
+        new_request = parse_new_requirement_request(development_request)
+        if pending_requirement_id and (
+            new_request is not None
+            or (
+                requirement_id is not None
+                and requirement_id.upper() != pending_requirement_id
+            )
+        ):
+            raise WorkspaceError(
+                f"当前 Thread 正在等待 {pending_requirement_id} 的提交推送后自动归档；"
+                "请先完成该收尾，再创建或切换 Requirement"
+            )
+        if pending_requirement_id:
+            requirement_id = pending_requirement_id
+        if new_request is not None:
+            requirement_id = self.store.create(
+                new_request.title,
+                goal=new_request.goal,
+                complexity=route_workflow(new_request.goal).complexity,
+                manual_test_required=new_request.manual_test_required,
+                creation_key=creation_key,
+            )
         sync_messages = self.sync_reviews(requirement_id)
+        visibility_target = requirement_id or self.store.attached_requirement_id(session_id)
+        if visibility_target is None:
+            try:
+                visibility_target = self.store.current_id()
+            except WorkspaceError:
+                visibility_target = None
+        visibility_messages = self.sync_taskboard_visibility(visibility_target)
+        if pending_requirement_id:
+            snapshot = self.snapshot(pending_requirement_id, attach=False)
+            messages = (*sync_messages, *visibility_messages)
+            return "\n".join((*messages, "", snapshot)).lstrip() if messages else snapshot
         if requirement_id and self.store.load(requirement_id)["meta"].get("status") == "done":
             provider = self._provider(requirement_id)
             tasks, task_error = list_tasks_safely(provider, requirement_id)
@@ -149,7 +211,6 @@ class AutomationRuntime:
             )
             prefix = "\n".join(sync_messages)
             return f"{prefix}\n\n{snapshot}" if prefix else snapshot
-        session_id = require_session_id(self.agent_provider)
         selected_id, attached_id = select_requirement(self.store, session_id, requirement_id)
         provider = self._provider(selected_id)
         bound_ids = (
@@ -194,14 +255,25 @@ class AutomationRuntime:
             task_provider=provider,
             task_ids=selection.task_ids,
             head_commit=str(git["head"]) if git.get("head") else None,
+            branch=str(git["branch"]) if git.get("branch") else None,
+            worktree=str(git["worktree"]) if git.get("worktree") else None,
         )
-        return collect_snapshot(
+        try:
+            ensure_requirement_board_task(self.store, selected_id, provider)
+        except WorkspaceError as exc:
+            visibility_messages = (
+                *visibility_messages,
+                f"{selected_id}：{exc}",
+            )
+        snapshot = collect_snapshot(
             self.store,
             selected_id,
             tasks=selection.tasks,
             task_error=selection.task_error,
             git=git,
         )
+        messages = (*sync_messages, *visibility_messages)
+        return "\n".join((*messages, "", snapshot)).lstrip() if messages else snapshot
 
     def snapshot(
         self,
@@ -257,7 +329,9 @@ class AutomationRuntime:
         if not config.auto_finish_pushed_thread:
             return AutoFinishResult(False, "项目已关闭已推送 Thread 自动收尾")
         session_id = require_session_id(self.agent_provider)
-        requirement_id = self.store.attached_requirement_id(session_id)
+        requirement_id = self.store.requirement_id_for_session(
+            session_id, results={"pending_auto_finish"}
+        ) or self.store.attached_requirement_id(session_id)
         if not requirement_id:
             return AutoFinishResult(False, "当前 Thread 未绑定 Requirement")
         data = self.store.load(requirement_id)
@@ -265,12 +339,13 @@ class AutomationRuntime:
             (
                 item
                 for item in data["sessions"]
-                if item.get("id") == session_id and item.get("result") == "in_progress"
+                if item.get("id") == session_id
+                and item.get("result") in {"in_progress", "pending_auto_finish"}
             ),
             None,
         )
         if session is None:
-            return AutoFinishResult(False, "当前 Thread 已结束", requirement_id)
+            return AutoFinishResult(False, "当前 Thread 没有待归档记录", requirement_id)
         task_ids = tuple(dict.fromkeys(session.get("task_ids", ())))
         if not task_ids:
             return AutoFinishResult(False, "当前 Thread 未绑定开发 Task", requirement_id)
@@ -278,14 +353,14 @@ class AutomationRuntime:
         git = collect_git_context(
             self.store.project_root,
             dict(data["meta"].get("git") or {}),
-            execution_root=self.store.working_root,
+            execution_root=Path(str(session.get("worktree") or self.store.working_root)),
         )
         current_head = git.get("head")
         if not started_head or not current_head or current_head == started_head:
             return AutoFinishResult(
                 False, "当前 Thread 启动后没有产生新提交", requirement_id, task_ids
             )
-        bound_branch = (data["meta"].get("git") or {}).get("branch")
+        bound_branch = session.get("branch") or (data["meta"].get("git") or {}).get("branch")
         if bound_branch and git.get("branch") != bound_branch:
             return AutoFinishResult(
                 False, "当前分支与 Requirement 绑定分支不一致", requirement_id, task_ids
@@ -310,6 +385,7 @@ class AutomationRuntime:
             session_id,
             result="completed",
             task_provider=provider,
+            allowed_results=("in_progress", "pending_auto_finish"),
         )
         return AutoFinishResult(
             True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids
@@ -524,6 +600,25 @@ class AutomationRuntime:
                 task_provider=self._provider(requirement_id),
             )
 
+    def _finish_or_defer_session(
+        self,
+        requirement_id: str,
+        session_id: str,
+        task_ids: Sequence[str],
+        provider: TaskProvider | None,
+    ) -> None:
+        """finalize 后保留可由 Stop Hook 收敛的待推送归档记录。"""
+
+        config = load_project_config(self.store.project_root)
+        pending = bool(config and config.auto_finish_pushed_thread and task_ids and provider)
+        end_session(
+            self.store,
+            requirement_id,
+            session_id,
+            result="pending_auto_finish" if pending else "completed",
+            task_provider=provider,
+        )
+
     def finalize(
         self,
         requirement_id: str,
@@ -531,12 +626,39 @@ class AutomationRuntime:
         completed: Sequence[str] = (),
         current_state: str | None = None,
         important_context: str | None = None,
-        next_action: str = "等待用户确认；Requirement 与 Task 均不得自动标记 done。",
+        next_action: str = "提交并推送后由 Stop Hook 自动归档 Thread。",
+    ) -> FinalizeResult:
+        """串行同一 Requirement 的终态转换，避免并发 finalize 回滚完成状态。"""
+
+        with self.store.finalize_locked(requirement_id):
+            return self._finalize_once(
+                requirement_id,
+                completed=completed,
+                current_state=current_state,
+                important_context=important_context,
+                next_action=next_action,
+            )
+
+    def _finalize_once(
+        self,
+        requirement_id: str,
+        *,
+        completed: Sequence[str] = (),
+        current_state: str | None = None,
+        important_context: str | None = None,
+        next_action: str = "提交并推送后由 Stop Hook 自动归档 Thread。",
     ) -> FinalizeResult:
         """一次触发执行验证、checkpoint、Task review、handoff 与 detach。"""
 
         self.sync_reviews(requirement_id)
-        initial_status = self.store.load(requirement_id)["meta"].get("status")
+        initial_meta = self.store.load(requirement_id)["meta"]
+        initial_status = initial_meta.get("status")
+        manual_test_required = bool(initial_meta.get("manual_test_required"))
+        final_next_action = (
+            "等待明确要求的人工测试或验收。"
+            if manual_test_required
+            else next_action
+        )
         if initial_status in {"in_review", "done"}:
             return FinalizeResult(
                 False,
@@ -567,7 +689,7 @@ class AutomationRuntime:
             requirement_id,
             phase="verification" if not passed else "review",
             completed=completed,
-            next_action=next_action if passed else "修复失败的自动验证后重新 finalize。",
+            next_action=final_next_action if passed else "修复失败的自动验证后重新 finalize。",
             verification=summary,
             task_ids=task_ids,
         )
@@ -628,7 +750,17 @@ class AutomationRuntime:
                 task_ids,
                 blockers=review.blockers,
             )
-        # 先固化 handoff/Git 事实，再生成 Review Packet；否则卡片会缺少最终证据。
+        final_task_ids = tuple(dict.fromkeys(review_candidates))
+        if final_task_ids != task_ids:
+            attach_session(
+                self.store,
+                requirement_id,
+                session_id=session_id,
+                agent_name=self.agent_provider.name,
+                task_provider=provider,
+                task_ids=final_task_ids,
+            )
+        # 先固化 handoff/Git 事实，再完成或生成人工 Review Packet。
         data = self.store.load(requirement_id)
         git = collect_git_context(
             self.store.project_root,
@@ -646,25 +778,40 @@ class AutomationRuntime:
             session_id=session_id,
             completed=completed,
             files_changed=changed,
-            current_state=current_state or "实现与已知验证均已完成，等待用户确认。",
+            current_state=current_state or "实现、代码审阅与已知验证均已完成。",
             important_context=important_context,
-            next_action=next_action,
+            next_action=final_next_action,
         )
-        blockers, review_task = self._publish_review_packet(requirement_id, provider)
-        if blockers:
+        if manual_test_required:
+            blockers, review_task = self._publish_review_packet(requirement_id, provider)
+            if blockers:
+                self.store.touch_meta(requirement_id, status="in_progress")
+                return FinalizeResult(False, summary, final_task_ids, blockers=blockers)
+            self._finish_or_defer_session(
+                requirement_id, session_id, final_task_ids, provider
+            )
+            return FinalizeResult(
+                True,
+                summary,
+                final_task_ids,
+                requirement_in_review=True,
+                review_task_id=getattr(review_task, "id", None),
+            )
+        try:
+            if provider is not None:
+                complete_tasks(provider, final_task_ids)
+        except WorkspaceError as exc:
             self.store.touch_meta(requirement_id, status="in_progress")
-            return FinalizeResult(False, summary, task_ids, blockers=blockers)
-        end_session(
-            self.store,
+            return FinalizeResult(False, summary, final_task_ids, blockers=(str(exc),))
+        self.store.touch_meta(
             requirement_id,
-            session_id,
-            result="completed",
-            task_provider=provider,
+            status="done",
+            completion_mode="auto_after_verification",
         )
+        self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
         return FinalizeResult(
             True,
             summary,
-            task_ids,
-            requirement_in_review=True,
-            review_task_id=getattr(review_task, "id", None),
+            final_task_ids,
+            requirement_completed=True,
         )

@@ -14,7 +14,10 @@ import pytest
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.adapters.task import TaskProviderError
 from workspace_orchestrator.automation.git_sync import collect_git_context
-from workspace_orchestrator.automation.requirement_attach import discover_project_root
+from workspace_orchestrator.automation.requirement_attach import (
+    AutomationAmbiguity,
+    discover_project_root,
+)
 from workspace_orchestrator.automation.runtime import AutomationRuntime
 from workspace_orchestrator.automation.session_runtime import end_session
 from workspace_orchestrator.automation.task_attach import configured_task_provider
@@ -22,7 +25,7 @@ from workspace_orchestrator.cli import main
 from workspace_orchestrator.models import ReviewApprovalFact, Task
 from workspace_orchestrator.project_init import initialize_project
 from workspace_orchestrator.review_packet import build_review_packet, render_review_packet
-from workspace_orchestrator.workspace import WorkspaceStore
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
 def _git(path: Path, *args: str) -> None:
@@ -160,7 +163,7 @@ def _reviewable_runtime(
         encoding="utf-8",
     )
     store = WorkspaceStore(tmp_path)
-    requirement_id = store.create("Review Packet")
+    requirement_id = store.create("Review Packet", manual_test_required=True)
     provider = tasks or FakeTasks()
     runtime = AutomationRuntime(
         store,
@@ -209,7 +212,7 @@ def test_black_box_a_and_b_bootstrap_then_repeat_is_idempotent(
     assert "Git：" in first_snapshot and "最近提交" in first_snapshot
 
 
-def test_default_dashi_session_start_waits_for_first_user_request_before_task_creation(
+def test_default_dashi_session_start_creates_visible_work_card_then_reuses_it(
     tmp_path: Path,
 ) -> None:
     store = WorkspaceStore(tmp_path)
@@ -222,11 +225,13 @@ def test_default_dashi_session_start_waits_for_first_user_request_before_task_cr
     )
 
     runtime.bootstrap(requirement_id)
-    assert tasks.created == []
+    assert tasks.created == ["TASK-001"]
+    assert tasks.get_task("TASK-001").status == "todo"
     assert store.attached_requirement_id("thread-start") == requirement_id
 
     runtime.bootstrap(requirement_id, development_request="实现首个用户请求")
     assert tasks.created == ["TASK-001"]
+    assert tasks.get_task("TASK-001").status == "in_progress"
     assert tasks.links == [("TASK-001", "thread-start")]
 
 
@@ -292,7 +297,113 @@ def test_black_box_c_multiple_requirements_returns_ambiguity_without_mutation(
     assert all(store.load(item)["sessions"] == [] for item in ("REQ-001", "REQ-002"))
 
 
-def test_finalize_runs_known_verification_and_automates_review_handoff_detach(
+def test_explicit_new_requirement_request_creates_and_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    store.create("First")
+    store.create("Second")
+    tasks = FakeTasks()
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-new"}),
+        tasks,
+    )
+    prompt = "新增需求：参考 REQ-001 修复任务面板"
+
+    first = runtime.bootstrap(development_request=prompt, creation_key="turn-1")
+    second = runtime.bootstrap(development_request=prompt, creation_key="turn-1")
+
+    assert store.requirement_ids() == ("REQ-001", "REQ-002", "REQ-003")
+    created = store.load("REQ-003")
+    assert created["meta"]["creation_key"] == "turn-1"
+    assert created["meta"]["manual_test_required"] is False
+    assert "参考 REQ-001 修复任务面板" in created["requirement"]
+    assert store.attached_requirement_id("thread-new") == "REQ-003"
+    assert len(tasks.list_tasks("REQ-003")) == 1
+    assert "REQ-003" in first and "REQ-003" in second
+
+
+def test_manual_test_is_only_enabled_by_positive_request(tmp_path: Path) -> None:
+    tasks = FakeTasks()
+    store = WorkspaceStore(tmp_path)
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-manual"}),
+        tasks,
+    )
+
+    runtime.bootstrap(
+        development_request="新增需求：默认自动完成，除非明确要求人工测试",
+        creation_key="turn-default",
+    )
+    end_session(store, "REQ-001", "thread-manual", task_provider=tasks)
+    runtime.bootstrap(
+        development_request="新增需求：这次需要人工测试后再完成",
+        creation_key="turn-manual",
+    )
+
+    assert store.load("REQ-001")["meta"]["manual_test_required"] is False
+    assert store.load("REQ-002")["meta"]["manual_test_required"] is True
+
+    end_session(store, "REQ-002", "thread-manual", task_provider=tasks)
+    runtime.bootstrap(
+        development_request="新增需求：不需要人工测试，验证通过直接结束",
+        creation_key="turn-negative",
+    )
+    assert store.load("REQ-003")["meta"]["manual_test_required"] is False
+
+
+def test_taskboard_visibility_backfills_active_requirements_once(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("Only completed task")
+    second = store.create("No task")
+    done = store.create("Completed requirement")
+    store.touch_meta(done, status="done")
+    tasks = FakeTasks()
+    tasks.tasks[first] = [Task(id="TASK-OLD", title="Old", status="done")]
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-board"}),
+        tasks,
+    )
+
+    runtime.sync_taskboard_visibility()
+    runtime.sync_taskboard_visibility()
+
+    first_visible = [task for task in tasks.list_tasks(first) if task.status == "todo"]
+    second_visible = [task for task in tasks.list_tasks(second) if task.status == "todo"]
+    assert len(first_visible) == 1
+    assert len(second_visible) == 1
+    assert "requirement-work" in first_visible[0].labels
+    assert tasks.list_tasks(done) == ()
+
+    tasks.update_status(first_visible[0].id, "done")
+    runtime.sync_taskboard_visibility()
+    assert len([task for task in tasks.list_tasks(first) if task.status == "todo"]) == 1
+
+
+def test_taskboard_backfill_runs_before_multiple_requirement_ambiguity(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    first = store.create("First hidden")
+    second = store.create("Second hidden")
+    tasks = FakeTasks()
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-ambiguous-board"}),
+        tasks,
+    )
+
+    with pytest.raises(AutomationAmbiguity, match="ambiguity"):
+        runtime.bootstrap(development_request="普通修改")
+
+    assert len(tasks.list_tasks(first)) == 1
+    assert len(tasks.list_tasks(second)) == 1
+
+
+def test_finalize_runs_known_verification_and_auto_completes_by_default(
     tmp_path: Path,
 ) -> None:
     _init_git(tmp_path)
@@ -323,19 +434,32 @@ def test_finalize_runs_known_verification_and_automates_review_handoff_detach(
 
     data = store.load(requirement_id)
     assert result.passed is True
-    assert tasks.get_task("TASK-001").status == "in_review"
+    assert result.requirement_completed is True
+    assert tasks.get_task("TASK-001").status == "done"
     assert tasks.unlinks == [("TASK-001", "thread-final")]
     assert data["sessions"][0]["result"] == "completed"
     assert "- README.md" in data["handoff"]
     assert "状态：PASS" in data["verification"]
     assert "状态：TODO" not in data["verification"]
-    assert data["meta"]["status"] == "in_review"
+    assert data["meta"]["status"] == "done"
+    assert data["meta"]["completion_mode"] == "auto_after_verification"
     review_tasks = [
         task for task in tasks.list_tasks(requirement_id) if "requirement-review" in task.labels
     ]
-    assert len(review_tasks) == 1
-    assert review_tasks[0].status == "in_review"
-    assert result.review_task_id == review_tasks[0].id
+    assert review_tasks == []
+    assert result.review_task_id is None
+
+
+def test_concurrent_finalize_never_rolls_done_back_to_in_progress(tmp_path: Path) -> None:
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    store.touch_meta(requirement_id, manual_test_required=False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: runtime.finalize(requirement_id), range(2)))
+
+    assert sum(result.passed for result in results) == 1
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+    assert tasks.get_task("TASK-001").status == "done"
 
 
 def test_finalize_publishes_complete_idempotent_review_packet(tmp_path: Path) -> None:
@@ -1109,6 +1233,71 @@ def test_stop_auto_finishes_only_after_thread_commit_is_clean_and_pushed(
     assert tasks.unlinks == [("TASK-001", "thread-pushed")]
     assert store.load(requirement_id)["sessions"][0]["result"] == "completed"
     assert store.load(requirement_id)["meta"]["status"] != "done"
+
+
+def test_finalize_then_push_keeps_pending_record_until_stop_archives(
+    tmp_path: Path,
+) -> None:
+    _init_git(tmp_path)
+    initialize_project(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.workspace-orchestrator.automation]\n"
+        "verification-commands = [\n"
+        '  ["{python}", "-c", "print(\'pytest\')"],\n'
+        '  ["{python}", "-c", "print(\'ruff\')"],\n'
+        '  ["{python}", "-c", "print(\'integration\')"],\n'
+        "]\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "initialize")
+    _add_remote_and_push(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Finalize before push")
+    tasks = FakeTasks()
+    archived: list[str] = []
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(
+            environ={"CODEX_THREAD_ID": "thread-finalize-push"},
+            archive_runner=archived.append,
+        ),
+        tasks,
+    )
+    runtime.bootstrap(requirement_id, development_request="修改 README")
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "requirement.md",
+        data["requirement"].replace("- [ ] 定义验收标准", "- [x] 定义验收标准"),
+    )
+    store.write_text(data["path"] / "intent.md", data["intent"].replace("：PARTIAL", "：PASS"))
+
+    finalized = runtime.finalize(requirement_id)
+
+    assert finalized.passed and finalized.requirement_completed
+    assert store.load(requirement_id)["sessions"][0]["result"] == "pending_auto_finish"
+    resumed = runtime.bootstrap(development_request="提交并推送当前修改")
+    assert requirement_id in resumed
+    assert store.load(requirement_id)["sessions"][0]["result"] == "pending_auto_finish"
+    with pytest.raises(WorkspaceError, match="等待.*自动归档"):
+        runtime.bootstrap(
+            development_request="新增需求：不应在待归档 Thread 中创建",
+            creation_key="blocked-new",
+        )
+    assert store.requirement_ids() == (requirement_id,)
+    assert runtime.auto_finish_pushed_thread().completed is False
+    assert store.load(requirement_id)["sessions"][0]["result"] == "pending_auto_finish"
+
+    (tmp_path / "README.md").write_text("finalized and pushed\n", encoding="utf-8")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "finish requirement")
+    _git(tmp_path, "push")
+
+    completed = runtime.auto_finish_pushed_thread()
+    assert completed.completed is True
+    assert archived == ["thread-finalize-push"]
+    assert store.load(requirement_id)["sessions"][0]["result"] == "completed"
+    assert store.load(requirement_id)["meta"]["status"] == "done"
 
 
 def test_stop_auto_finish_can_be_disabled(tmp_path: Path) -> None:

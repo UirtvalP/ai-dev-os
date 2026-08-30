@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
+from workspace_orchestrator.automation.runtime import AutomationRuntime
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.context import bootstrap_session, build_snapshot, checkpoint, handoff
 from workspace_orchestrator.models import Task
@@ -431,7 +432,12 @@ def test_resume_ignores_legacy_project_principles(tmp_path: Path) -> None:
     assert "project principles" not in snapshot
 
 
-def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_lifecycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(AutomationRuntime, "sync_taskboard_visibility", lambda *_: ())
     root_args = ["--root", str(tmp_path)]
     assert main([*root_args, "new", "CLI demo", "--acceptance", "Snapshot is concise"]) == 0
     assert "已创建 REQ-001" in capsys.readouterr().out
@@ -549,8 +555,11 @@ def test_dead_process_releases_requirement_lock_immediately(tmp_path: Path) -> N
 
 
 def test_cli_can_configure_dashi_project(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(AutomationRuntime, "sync_taskboard_visibility", lambda *_: ())
     result = main(
         [
             "--root",
@@ -572,8 +581,11 @@ def test_cli_can_configure_dashi_project(
 
 
 def test_cli_uses_dashi_by_default_and_allows_explicit_disable(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(AutomationRuntime, "sync_taskboard_visibility", lambda *_: ())
     assert main(["--root", str(tmp_path), "new", "Default provider"]) == 0
     assert (
         main(

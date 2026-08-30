@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new.add_argument("--task-project", help="外部任务板项目 ID")
     new.add_argument(
+        "--manual-test",
+        action="store_true",
+        help="明确要求人工测试或验收；默认验证通过后自动完成 Requirement",
+    )
+    new.add_argument(
         "--complexity",
         choices=[item.value for item in WorkflowComplexity],
         default=None,
@@ -165,9 +170,12 @@ def run(args: argparse.Namespace) -> str:
             acceptance=args.acceptance,
             complexity=complexity,
             task_project_id=args.task_project,
+            manual_test_required=args.manual_test,
             **provider_options,
         )
-        return f"已创建 {requirement_id}"
+        visibility = AutomationRuntime(store, agent_provider).sync_taskboard_visibility()
+        suffix = "\n面板同步待重试：" + "；".join(visibility) if visibility else ""
+        return f"已创建 {requirement_id}{suffix}"
     if args.command == "current":
         return store.current_id()
     if args.command == "status":
@@ -220,7 +228,7 @@ def run(args: argparse.Namespace) -> str:
             current_state=args.current_state,
             important_context=args.important_context,
             next_action=(
-                args.next_action or "等待用户确认；Requirement 与 Task 均不得自动标记 done。"
+                args.next_action or "提交并推送后由 Stop Hook 自动归档 Thread。"
             ),
         )
         if not result.passed:
@@ -229,10 +237,17 @@ def run(args: argparse.Namespace) -> str:
                 f"自动收尾受阻，已保存 checkpoint：{args.requirement_id.upper()}\n"
                 f"{result.verification}\n阻塞项：\n{details}"
             )
+        requirement_status = (
+            "done（验证通过后自动完成）"
+            if result.requirement_completed
+            else "in_review（等待明确要求的人工测试）"
+            if result.requirement_in_review
+            else "等待审查门禁"
+        )
         return (
             f"已完成自动收尾：{args.requirement_id.upper()}\n"
-            f"Task 已进入 in_review：{', '.join(result.task_ids) or '无外部 Task'}\n"
-            f"Requirement：{'in_review' if result.requirement_in_review else '等待审查门禁'}\n"
+            f"Task：{', '.join(result.task_ids) or '无外部 Task'}\n"
+            f"Requirement：{requirement_status}\n"
             f"Requirement Review Task：{result.review_task_id or '未配置'}\n"
             f"{result.verification}"
         )
