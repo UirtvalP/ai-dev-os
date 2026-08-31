@@ -448,3 +448,12 @@ class DashiTaskProvider:
         if current.version is not None:
             args.extend(("--if-version", str(current.version)))
         self._json(*args)
+
+    def set_parent(self, task_id: str, parent_id: str) -> None:
+        current = self.get_task(task_id)
+        if current.parent_id == parent_id:
+            return
+        args = ["issue", "relation", "add", task_id, "--type", "parent", "--issue", parent_id]
+        if current.version is not None:
+            args.extend(("--if-version", str(current.version)))
+        self._json(*args)

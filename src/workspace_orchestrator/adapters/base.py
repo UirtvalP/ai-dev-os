@@ -33,6 +33,7 @@ class TaskProvider(Protocol):
     def set_git_context(
         self, task_id: str, branch: str | None = None, worktree: str | None = None
     ) -> None: ...
+    def set_parent(self, task_id: str, parent_id: str) -> None: ...
 
 
 class AgentProvider(Protocol):

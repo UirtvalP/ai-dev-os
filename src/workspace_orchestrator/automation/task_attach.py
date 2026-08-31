@@ -219,6 +219,28 @@ def ensure_requirement_board_task(
         raise BoardTaskSyncError(f"Requirement 工作卡同步失败：{exc}") from exc
 
 
+def ensure_requirement_task_parent(
+    store: WorkspaceStore, requirement_id: str, task_provider: TaskProvider | None
+) -> None:
+    """让 Requirement 空间成为开发 Task 的父节点；Thread 仍只绑定子 Task。"""
+
+    if task_provider is None:
+        return
+    data = store.load(requirement_id)
+    parent_id = str(data["meta"].get("requirement_space_task_id") or "")
+    if not parent_id:
+        return
+    setter = getattr(task_provider, "set_parent", None)
+    if not callable(setter):
+        return
+    try:
+        for task in task_provider.list_tasks(requirement_id):
+            if not is_requirement_space_task(task) and not is_requirement_review_task(task):
+                setter(task.id, parent_id)
+    except TaskProviderError as exc:
+        raise BoardTaskSyncError(f"Requirement 任务层级同步失败：{exc}") from exc
+
+
 def requirement_review_task(
     task_provider: TaskProvider,
     requirement_id: str,

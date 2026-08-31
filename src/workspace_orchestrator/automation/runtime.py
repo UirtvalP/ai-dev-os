@@ -42,6 +42,7 @@ from .task_attach import (
     ensure_requirement_board_task,
     ensure_requirement_review_task,
     ensure_requirement_space_task,
+    ensure_requirement_task_parent,
     move_tasks_to_review,
     select_tasks,
 )
@@ -142,8 +143,12 @@ class AutomationRuntime:
             try:
                 ensure_requirement_space_task(self.store, current_id, self._provider(current_id))
                 if self.store.load(current_id)["meta"].get("status") == "done":
+                    ensure_requirement_task_parent(
+                        self.store, current_id, self._provider(current_id)
+                    )
                     continue
                 ensure_requirement_board_task(self.store, current_id, self._provider(current_id))
+                ensure_requirement_task_parent(self.store, current_id, self._provider(current_id))
             except WorkspaceError as exc:
                 messages.append(f"{current_id}：{exc}")
         return tuple(messages)
