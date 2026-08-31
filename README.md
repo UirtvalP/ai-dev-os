@@ -206,7 +206,7 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 旧 Requirement 时会重新建立 dashi 当前绑定。dashi/taskctl 离线时 bootstrap 会保留本地恢复能力，
 在 `sessions.json` 记录尚未收敛的绑定/解绑，并在后续 bootstrap 自动重试；本地已有 Session 记录不会
 成为永久跳过外部同步的理由。
-每个未完成 Requirement 会幂等保持至少一张带 `requirement-work` 标签的主面板工作卡；历史漏项与
+每个未完成 Requirement 会幂等保持一张带 `requirement-space` 标签、且不绑定 Thread 的需求空间卡，以及至少一张带 `requirement-work` 标签的主面板工作卡。需求空间卡汇总状态、阶段、完成项、阻塞项和验证；用户把它移到 `done` 仅关闭该需求的面板可见性，不删除本地 Requirement 或历史任务。历史漏项与
 Provider 离线失败会在后续 bootstrap 补偿，并通过 Requirement 文件锁避免并发重复建卡。
 
 当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 安装的 `.codex/hooks.json` 在
@@ -293,7 +293,7 @@ Review 卡正文发布失败、关键证据缺失，或卡片 marker 与当前 r
 返回具体 blocker 并保持/恢复 `in_progress`；旧 revision 的 `done` 卡绝不会批准新证据。Packet 的
 验证区同时展示命令、状态和经过长度限制及路径清理的真实结果摘要，不会把状态行误当作执行结果。
 
-并发边界：V1 支持多个 Session 并发更新不同 Requirement，也支持不同 Requirement 的 Thread
+并发边界：V1 支持多个 Session 并发更新不同 Requirement，也支持同一 Requirement 下已明确分配给不同开发 Task 的多个 Session；后者必须使用不同 branch 和 worktree，同一 Task 同一时刻只能绑定一个活跃 Session。系统只执行这些确定性绑定门禁，不自动创建或调度多个 Agent。不同 Requirement 的 Thread
 在**已经分配好的各自 Git worktree** 中并发执行；它们共享主工作树 `.workspace`，但 Session、
 Requirement meta 与 Git worktree 绑定不会串线。V1 尚不自动创建、分配或回收每个 Requirement
 的 branch/worktree；需要用户或上层工具先完成隔离。自动并行 Agent 与完整 Worktree 生命周期仍是后续能力。

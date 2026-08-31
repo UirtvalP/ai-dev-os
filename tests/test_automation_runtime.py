@@ -19,7 +19,7 @@ from workspace_orchestrator.automation.requirement_attach import (
     discover_project_root,
 )
 from workspace_orchestrator.automation.runtime import AutomationRuntime
-from workspace_orchestrator.automation.session_runtime import end_session
+from workspace_orchestrator.automation.session_runtime import attach_session, end_session
 from workspace_orchestrator.automation.task_attach import configured_task_provider
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.models import ReviewApprovalFact, Task
@@ -43,9 +43,7 @@ def _init_git(path: Path) -> None:
 
 def _add_remote_and_push(path: Path) -> Path:
     remote = path.parent / f"{path.name}-remote.git"
-    subprocess.run(
-        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
     _git(path, "remote", "add", "origin", str(remote))
     _git(path, "push", "-u", "origin", "HEAD")
     return remote
@@ -373,14 +371,78 @@ def test_taskboard_visibility_backfills_active_requirements_once(tmp_path: Path)
 
     first_visible = [task for task in tasks.list_tasks(first) if task.status == "todo"]
     second_visible = [task for task in tasks.list_tasks(second) if task.status == "todo"]
-    assert len(first_visible) == 1
-    assert len(second_visible) == 1
-    assert "requirement-work" in first_visible[0].labels
-    assert tasks.list_tasks(done) == ()
+    assert len(first_visible) == 2
+    assert len(second_visible) == 2
+    assert sum("requirement-work" in task.labels for task in first_visible) == 1
+    assert sum("requirement-space" in task.labels for task in first_visible) == 1
+    done_spaces = tasks.list_tasks(done)
+    assert len(done_spaces) == 1
+    assert "requirement-space" in done_spaces[0].labels
 
     tasks.update_status(first_visible[0].id, "done")
     runtime.sync_taskboard_visibility()
     assert len([task for task in tasks.list_tasks(first) if task.status == "todo"]) == 1
+
+
+def test_requirement_space_can_be_closed_without_deleting_workspace(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("可回看需求")
+    tasks = FakeTasks()
+    runtime = AutomationRuntime(store, CodexAgentProvider(environ={}), tasks)
+
+    runtime.sync_taskboard_visibility()
+    space = next(
+        task for task in tasks.list_tasks(requirement_id) if "requirement-space" in task.labels
+    )
+    tasks.update_status(space.id, "done")
+    runtime.sync_taskboard_visibility()
+
+    assert store.path_for(requirement_id).is_dir()
+    assert store.load(requirement_id)["meta"]["requirement_space_closed"] is True
+    assert sum("requirement-space" in task.labels for task in tasks.list_tasks(requirement_id)) == 1
+
+
+def test_parallel_sessions_require_distinct_tasks_branches_and_worktrees(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("并行任务", task_provider=None)
+
+    attach_session(
+        store,
+        requirement_id,
+        session_id="thread-one",
+        agent_name="codex",
+        task_ids=("TASK-ONE",),
+        branch="codex/one",
+        worktree=str(tmp_path / "one"),
+    )
+    attach_session(
+        store,
+        requirement_id,
+        session_id="thread-two",
+        agent_name="codex",
+        task_ids=("TASK-TWO",),
+        branch="codex/two",
+        worktree=str(tmp_path / "two"),
+    )
+
+    with pytest.raises(WorkspaceError, match="同一 Requirement 的并行 Agent"):
+        attach_session(
+            store,
+            requirement_id,
+            session_id="thread-three",
+            agent_name="codex",
+            task_ids=("TASK-THREE",),
+        )
+    with pytest.raises(WorkspaceError, match="Task TASK-ONE"):
+        attach_session(
+            store,
+            requirement_id,
+            session_id="thread-four",
+            agent_name="codex",
+            task_ids=("TASK-ONE",),
+            branch="codex/four",
+            worktree=str(tmp_path / "four"),
+        )
 
 
 def test_taskboard_backfill_runs_before_multiple_requirement_ambiguity(
@@ -399,8 +461,8 @@ def test_taskboard_backfill_runs_before_multiple_requirement_ambiguity(
     with pytest.raises(AutomationAmbiguity, match="ambiguity"):
         runtime.bootstrap(development_request="普通修改")
 
-    assert len(tasks.list_tasks(first)) == 1
-    assert len(tasks.list_tasks(second)) == 1
+    assert len(tasks.list_tasks(first)) == 2
+    assert len(tasks.list_tasks(second)) == 2
 
 
 def test_finalize_runs_known_verification_and_auto_completes_by_default(
@@ -872,9 +934,7 @@ def test_missing_review_packet_blocks_review_ready_and_restores_retryable_state(
         def create_task(self, requirement_id: str, task: Task) -> Task:
             raise TaskProviderError("offline")
 
-    runtime = AutomationRuntime(
-        store, CodexAgentProvider(environ={}), OfflineCreateTasks()
-    )
+    runtime = AutomationRuntime(store, CodexAgentProvider(environ={}), OfflineCreateTasks())
 
     assert "Review Packet" in runtime.sync_reviews(requirement_id)[0]
     assert store.load(requirement_id)["meta"]["status"] == "in_progress"

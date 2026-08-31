@@ -69,7 +69,9 @@ class ReviewPacket:
 
 
 def _clean_items(values: Sequence[str]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(value.strip() for value in values if value.strip() and value != "无"))
+    return tuple(
+        dict.fromkeys(value.strip() for value in values if value.strip() and value != "无")
+    )
 
 
 def build_review_packet(
@@ -101,7 +103,9 @@ def build_review_packet(
         results = re.findall(r"(?im)^(?:Result|结果)[:：]\s*(.+)$", body)
         result = results[-1].strip() if results else "未记录结果摘要"
         verification.append(
-            ReviewVerification(name, commands, statuses[-1].upper() if statuses else "MISSING", result)
+            ReviewVerification(
+                name, commands, statuses[-1].upper() if statuses else "MISSING", result
+            )
         )
     git = git or {}
     scope = _clean_items(bullets(requirement.get("Scope", "")))
@@ -121,7 +125,7 @@ def build_review_packet(
     development_tasks = tuple(
         ReviewTaskEvidence(task.id, task.title, task.status)
         for task in sorted(tasks, key=lambda item: item.id)
-        if "requirement-review" not in task.labels
+        if "requirement-review" not in task.labels and "requirement-space" not in task.labels
     )
     diff_context = str(git.get("diff") or git.get("status") or "当前工作树无未提交修改。")
     return ReviewPacket(
@@ -144,7 +148,9 @@ def build_review_packet(
     )
 
 
-def validate_review_packet(packet: ReviewPacket, *, git_error: str | None = None) -> tuple[str, ...]:
+def validate_review_packet(
+    packet: ReviewPacket, *, git_error: str | None = None
+) -> tuple[str, ...]:
     blockers: list[str] = []
     if not packet.goal:
         blockers.append("Review Packet 缺少需求目标")
@@ -154,13 +160,15 @@ def validate_review_packet(packet: ReviewPacket, *, git_error: str | None = None
         blockers.append("Review Packet 缺少本次完成内容")
     if not packet.acceptance:
         blockers.append("Review Packet 缺少验收标准")
-    blockers.extend(f"Review Packet 验收未通过：{item.text}" for item in packet.acceptance if not item.passed)
+    blockers.extend(
+        f"Review Packet 验收未通过：{item.text}" for item in packet.acceptance if not item.passed
+    )
     if not packet.verification or not any(item.commands for item in packet.verification):
         blockers.append("Review Packet 缺少验证命令")
     blockers.extend(
         f"Review Packet 验证未通过：{item.name} [{item.status}]"
         for item in packet.verification
-        if item.status != "PASS"
+        if not item.status.startswith(("PASS", "SUPERSEDED"))
     )
     if packet.intent_status != "PASS":
         blockers.append(f"Review Packet 意图一致性未通过：{packet.intent_status}")
@@ -177,18 +185,23 @@ def render_review_packet(packet: ReviewPacket, revision: int) -> str:
     def lines(values: Sequence[str], *, indent: str = "") -> str:
         return "\n".join(f"{indent}- {value}" for value in values) or f"{indent}无"
 
-    acceptance = "\n".join(
-        f"- [{'x' if item.passed else ' '}] {item.text}" for item in packet.acceptance
-    ) or "无"
-    verification = "\n".join(
-        f"- {item.name}：{item.status}\n"
-        + (lines(item.commands, indent="  ") if item.commands else "  无命令")
-        + f"\n  结果：{item.result}"
-        for item in packet.verification
-    ) or "无"
-    tasks = "\n".join(
-        f"- {item.id} [{item.status}] {item.title}" for item in packet.development_tasks
-    ) or "无"
+    acceptance = (
+        "\n".join(f"- [{'x' if item.passed else ' '}] {item.text}" for item in packet.acceptance)
+        or "无"
+    )
+    verification = (
+        "\n".join(
+            f"- {item.name}：{item.status}\n"
+            + (lines(item.commands, indent="  ") if item.commands else "  无命令")
+            + f"\n  结果：{item.result}"
+            for item in packet.verification
+        )
+        or "无"
+    )
+    tasks = (
+        "\n".join(f"- {item.id} [{item.status}] {item.title}" for item in packet.development_tasks)
+        or "无"
+    )
     commits = lines(packet.commits, indent="  ")
     return (
         f"<!-- ai-dev-os-review-packet:v1 requirement={packet.requirement_id} "

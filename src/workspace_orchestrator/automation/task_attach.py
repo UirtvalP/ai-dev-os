@@ -19,6 +19,7 @@ from .requirement_attach import AutomationAmbiguity
 
 REQUIREMENT_REVIEW_LABEL = "requirement-review"
 REQUIREMENT_WORK_LABEL = "requirement-work"
+REQUIREMENT_SPACE_LABEL = "requirement-space"
 BOARD_VISIBLE_STATUSES = {"todo", "ready", "in_progress", "blocked", "in_review"}
 
 
@@ -67,6 +68,92 @@ def is_requirement_review_task(task: Task) -> bool:
     return REQUIREMENT_REVIEW_LABEL in task.labels
 
 
+def is_requirement_space_task(task: Task) -> bool:
+    """需求空间只承载人类可读状态，绝不能作为开发任务执行。"""
+
+    return REQUIREMENT_SPACE_LABEL in task.labels
+
+
+def _requirement_space_content(store: WorkspaceStore, requirement_id: str) -> str:
+    data = store.load(requirement_id)
+    meta = data["meta"]
+    requirement = markdown_sections(data["requirement"])
+    state = markdown_sections(data["state"])
+    verification = markdown_sections(data["verification"])
+    verification_summary = (
+        "\n\n".join(f"### {name}\n{body.strip()}" for name, body in verification.items()) or "无"
+    )
+    return (
+        f"# {requirement_id} 需求空间\n\n"
+        f"## 目标\n\n{requirement.get('Goal', meta['title']).strip()}\n\n"
+        f"## 当前状态\n\n- 状态：{meta['status']}\n"
+        f"- 阶段：{state.get('Phase', '未知').strip() or '未知'}\n"
+        f"- 最近更新：{meta.get('updated_at', '未知')}\n\n"
+        f"## 已完成\n\n{state.get('Completed', '无').strip() or '无'}\n\n"
+        f"## 待处理\n\n{state.get('Pending', '无').strip() or '无'}\n\n"
+        f"## 阻塞项\n\n{state.get('Blocked', '无').strip() or '无'}\n\n"
+        f"## 验证\n\n{verification_summary}\n\n---\n\n"
+        "将此卡移至 `done` 仅表示关闭该需求空间的面板可见性；"
+        "不会删除 Requirement、开发任务或历史记录。"
+    )
+
+
+def ensure_requirement_space_task(
+    store: WorkspaceStore, requirement_id: str, task_provider: TaskProvider | None
+) -> Task | None:
+    """幂等投影不绑定 Thread 的 Requirement 概览卡。"""
+
+    if task_provider is None:
+        return None
+    try:
+        with store.provider_locked(requirement_id):
+            data = store.load(requirement_id)
+            meta = data["meta"]
+            tasks = tuple(task_provider.list_tasks(requirement_id))
+            expected_id = str(meta.get("requirement_space_task_id") or "")
+            current = next((task for task in tasks if task.id == expected_id), None)
+            if current is None:
+                matches = [task for task in tasks if is_requirement_space_task(task)]
+                if len(matches) > 1:
+                    raise WorkspaceError(
+                        f"需求 {requirement_id} 存在多个 Requirement 空间卡："
+                        + ", ".join(task.id for task in matches)
+                    )
+                current = matches[0] if matches else None
+            if current is not None and current.status == "done":
+                store.touch_meta(
+                    requirement_id,
+                    requirement_space_task_id=current.id,
+                    requirement_space_closed=True,
+                )
+                return current
+            if current is None:
+                if meta.get("requirement_space_closed"):
+                    return None
+                current = task_provider.create_task(
+                    requirement_id,
+                    Task(
+                        id="new",
+                        title=f"[需求空间] {requirement_id} {meta['title']}",
+                        description=_requirement_space_content(store, requirement_id),
+                        status="todo",
+                        labels=(REQUIREMENT_SPACE_LABEL,),
+                    ),
+                )
+            else:
+                # `publish_review` 是现有 dashi 的通用正文 CAS；兼容旧 Provider 时
+                # 仍保留卡片，只在下一次支持正文更新的同步中刷新摘要。
+                publish = getattr(task_provider, "publish_review", None)
+                if callable(publish):
+                    current = publish(current.id, _requirement_space_content(store, requirement_id))
+            store.touch_meta(
+                requirement_id, requirement_space_task_id=current.id, requirement_space_closed=False
+            )
+            return current
+    except TaskProviderError as exc:
+        raise BoardTaskSyncError(f"Requirement 空间同步失败：{exc}") from exc
+
+
 def ensure_requirement_board_task(
     store: WorkspaceStore,
     requirement_id: str,
@@ -85,7 +172,7 @@ def ensure_requirement_board_task(
             tasks = tuple(
                 task
                 for task in task_provider.list_tasks(requirement_id)
-                if not is_requirement_review_task(task)
+                if not is_requirement_review_task(task) and not is_requirement_space_task(task)
             )
             expected_id = str(meta.get("requirement_task_id") or "")
             visible = tuple(task for task in tasks if task.status in BOARD_VISIBLE_STATUSES)
@@ -208,7 +295,7 @@ def select_tasks(
         tasks = tuple(
             task
             for task in task_provider.list_tasks(requirement_id)
-            if not is_requirement_review_task(task)
+            if not is_requirement_review_task(task) and not is_requirement_space_task(task)
         )
         by_id = {task.id: task for task in tasks}
         # 已有 Session↔Task 绑定优先复用；显式 Task 只用于尚未绑定的 Session。
@@ -230,8 +317,7 @@ def select_tasks(
                 work_cards = [
                     task
                     for task in tasks
-                    if REQUIREMENT_WORK_LABEL in task.labels
-                    and task.status in {"todo", "ready"}
+                    if REQUIREMENT_WORK_LABEL in task.labels and task.status in {"todo", "ready"}
                 ]
                 if len(work_cards) == 1:
                     selected = (work_cards[0].id,)

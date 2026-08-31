@@ -78,6 +78,23 @@ def test_review_enters_in_review_but_never_done(tmp_path: Path) -> None:
     assert store.load(requirement_id)["meta"]["status"] == "in_review"
 
 
+def test_review_keeps_superseded_historical_verification_as_non_blocking(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "requirement.md",
+        data["requirement"].replace("- [ ] Feature works", "- [x] Feature works"),
+    )
+    store.write_text(
+        data["path"] / "verification.md",
+        "## Historical verification\n\nStatus: SUPERSEDED（archived）\n\n## Current verification\n\nStatus: PASS\n",
+    )
+    mark_intent_review_pass(store, requirement_id)
+
+    assert review_requirement(store, requirement_id).passed is True
+
+
 def test_review_requires_explicit_user_confirmation_before_done(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Demo", acceptance=["Feature works"], task_provider=None)

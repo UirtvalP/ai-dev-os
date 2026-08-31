@@ -41,6 +41,7 @@ from .task_attach import (
     configured_task_provider,
     ensure_requirement_board_task,
     ensure_requirement_review_task,
+    ensure_requirement_space_task,
     move_tasks_to_review,
     select_tasks,
 )
@@ -99,9 +100,7 @@ class AutomationRuntime:
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
         )
-        return build_review_packet(
-            self.store, requirement_id, tasks=tasks, git=git
-        ).fingerprint
+        return build_review_packet(self.store, requirement_id, tasks=tasks, git=git).fingerprint
 
     def sync_reviews(self, requirement_id: str | None = None) -> tuple[str, ...]:
         """同步所有待审查结果和离线待补偿状态，不创建或完成 Review 卡。"""
@@ -117,9 +116,7 @@ class AutomationRuntime:
             current_fingerprint = None
             if provider is not None:
                 try:
-                    current_fingerprint = self._current_packet_fingerprint(
-                        current_id, provider
-                    )
+                    current_fingerprint = self._current_packet_fingerprint(current_id, provider)
                 except WorkspaceError:
                     current_fingerprint = None
             message = sync_requirement_review_outcome(
@@ -132,22 +129,21 @@ class AutomationRuntime:
                 messages.append(message)
         return tuple(messages)
 
-    def sync_taskboard_visibility(
-        self, skip_requirement_id: str | None = None
-    ) -> tuple[str, ...]:
-        """幂等补偿活动 Requirement 的主面板工作卡；Provider 离线不破坏本地状态。"""
+    def sync_taskboard_visibility(self, skip_requirement_id: str | None = None) -> tuple[str, ...]:
+        """幂等补偿需求空间与活动工作卡；Provider 离线不破坏本地状态。"""
 
         messages: list[str] = []
         skipped = skip_requirement_id.upper() if skip_requirement_id else None
         for current_id in self.store.requirement_ids(
-            statuses={"draft", "ready", "in_progress", "blocked", "in_review"}
+            statuses={"draft", "ready", "in_progress", "blocked", "in_review", "done"}
         ):
             if current_id == skipped:
                 continue
             try:
-                ensure_requirement_board_task(
-                    self.store, current_id, self._provider(current_id)
-                )
+                ensure_requirement_space_task(self.store, current_id, self._provider(current_id))
+                if self.store.load(current_id)["meta"].get("status") == "done":
+                    continue
+                ensure_requirement_board_task(self.store, current_id, self._provider(current_id))
             except WorkspaceError as exc:
                 messages.append(f"{current_id}：{exc}")
         return tuple(messages)
@@ -169,10 +165,7 @@ class AutomationRuntime:
         new_request = parse_new_requirement_request(development_request)
         if pending_requirement_id and (
             new_request is not None
-            or (
-                requirement_id is not None
-                and requirement_id.upper() != pending_requirement_id
-            )
+            or (requirement_id is not None and requirement_id.upper() != pending_requirement_id)
         ):
             raise WorkspaceError(
                 f"当前 Thread 正在等待 {pending_requirement_id} 的提交推送后自动归档；"
@@ -370,9 +363,7 @@ class AutomationRuntime:
         if not git.get("upstream"):
             return AutoFinishResult(False, "当前分支没有上游", requirement_id, task_ids)
         if not git.get("pushed"):
-            return AutoFinishResult(
-                False, "当前提交尚未与上游完全同步", requirement_id, task_ids
-            )
+            return AutoFinishResult(False, "当前提交尚未与上游完全同步", requirement_id, task_ids)
         provider = self._provider(requirement_id)
         complete_tasks(provider, task_ids)
         try:
@@ -387,9 +378,7 @@ class AutomationRuntime:
             task_provider=provider,
             allowed_results=("in_progress", "pending_auto_finish"),
         )
-        return AutoFinishResult(
-            True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids
-        )
+        return AutoFinishResult(True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids)
 
     def checkpoint(
         self,
@@ -655,9 +644,7 @@ class AutomationRuntime:
         initial_status = initial_meta.get("status")
         manual_test_required = bool(initial_meta.get("manual_test_required"))
         final_next_action = (
-            "等待明确要求的人工测试或验收。"
-            if manual_test_required
-            else next_action
+            "等待明确要求的人工测试或验收。" if manual_test_required else next_action
         )
         if initial_status in {"in_review", "done"}:
             return FinalizeResult(
@@ -709,6 +696,7 @@ class AutomationRuntime:
                     task.id
                     for task in related_tasks
                     if "requirement-review" not in task.labels
+                    and "requirement-space" not in task.labels
                     and task.status not in {"in_review", "done"}
                 )
         try:
@@ -787,9 +775,7 @@ class AutomationRuntime:
             if blockers:
                 self.store.touch_meta(requirement_id, status="in_progress")
                 return FinalizeResult(False, summary, final_task_ids, blockers=blockers)
-            self._finish_or_defer_session(
-                requirement_id, session_id, final_task_ids, provider
-            )
+            self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
             return FinalizeResult(
                 True,
                 summary,

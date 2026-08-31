@@ -384,8 +384,7 @@ class WorkspaceStore:
                         existing_path.is_dir()
                         and re.fullmatch(r"REQ-\d{3,}", existing_path.name)
                         and meta_path.is_file()
-                        and self.read_json(meta_path).get("creation_key")
-                        == normalized_creation_key
+                        and self.read_json(meta_path).get("creation_key") == normalized_creation_key
                     ):
                         return existing_path.name
             requirement_id = self.next_id()
@@ -393,19 +392,19 @@ class WorkspaceStore:
             path.mkdir(parents=True, exist_ok=False)
             timestamp = now_iso()
             meta = {
-            "id": requirement_id,
-            "title": title,
-            "status": RequirementStatus.DRAFT.value,
-            "complexity": complexity.value,
-            "workflow": complexity.value,
-            "created_at": timestamp,
-            "updated_at": timestamp,
-            "task_provider": selected_provider,
-            "task_project_id": selected_project_id,
-            "task_provider_explicitly_disabled": selected_provider is None,
-            "manual_test_required": manual_test_required,
-            "agent_provider": "codex",
-            "git": {"branch": None, "worktree": None},
+                "id": requirement_id,
+                "title": title,
+                "status": RequirementStatus.DRAFT.value,
+                "complexity": complexity.value,
+                "workflow": complexity.value,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "task_provider": selected_provider,
+                "task_project_id": selected_project_id,
+                "task_provider_explicitly_disabled": selected_provider is None,
+                "manual_test_required": manual_test_required,
+                "agent_provider": "codex",
+                "git": {"branch": None, "worktree": None},
             }
             if normalized_creation_key:
                 meta["creation_key"] = normalized_creation_key
@@ -413,32 +412,32 @@ class WorkspaceStore:
             criteria = acceptance or ["定义验收标准"]
             checked = "\n".join(f"- [ ] {item}" for item in criteria)
             self.write_text(
-            path / "requirement.md",
-            "# 需求\n\n"
-            f"## 目标\n\n{goal or title}\n\n"
-            "## 背景\n\n\n\n## 范围\n\n\n\n## 非目标\n\n\n\n"
-            f"## 验收标准\n\n{checked}\n",
+                path / "requirement.md",
+                "# 需求\n\n"
+                f"## 目标\n\n{goal or title}\n\n"
+                "## 背景\n\n\n\n## 范围\n\n\n\n## 非目标\n\n\n\n"
+                f"## 验收标准\n\n{checked}\n",
             )
             self.write_text(path / "intent.md", initial_intent(title, goal))
             self.write_text(
-            path / "state.md",
-            "# 状态\n\n## 阶段\n\ndraft（草稿）\n\n## 已完成\n\n无\n\n"
-            "## 进行中\n\n无\n\n## 待处理\n\n- 定义范围和计划\n\n"
-            "## 已阻塞\n\n无\n\n## 下一步行动\n\n定义范围和验收标准。\n",
+                path / "state.md",
+                "# 状态\n\n## 阶段\n\ndraft（草稿）\n\n## 已完成\n\n无\n\n"
+                "## 进行中\n\n无\n\n## 待处理\n\n- 定义范围和计划\n\n"
+                "## 已阻塞\n\n无\n\n## 下一步行动\n\n定义范围和验收标准。\n",
             )
             self.write_text(path / "plan.md", "# 计划\n\n- [ ] 定义范围和计划\n")
             self.write_text(path / "decisions.md", "# 决策\n\n尚未记录决策。\n")
             self.write_text(
-            path / "verification.md",
-            "# 验证\n\n## 单元测试\n\n状态：TODO\n\n"
-            "## 类型检查\n\n状态：TODO\n\n## 集成测试\n\n状态：TODO\n",
+                path / "verification.md",
+                "# 验证\n\n## 单元测试\n\n状态：TODO\n\n"
+                "## 类型检查\n\n状态：TODO\n\n## 集成测试\n\n状态：TODO\n",
             )
             self.write_text(
-            path / "handoff.md",
-            "# 交接\n\n## 上次会话\n\n无\n\n## 已完成\n\n无\n\n"
-            "## 已修改文件\n\n无\n\n## 当前状态\n\n工作区已创建。\n\n"
-            "## 重要上下文\n\n无\n\n## 建议的下一步行动\n\n"
-            "定义范围和验收标准。\n\n## 已知问题\n\n无\n",
+                path / "handoff.md",
+                "# 交接\n\n## 上次会话\n\n无\n\n## 已完成\n\n无\n\n"
+                "## 已修改文件\n\n无\n\n## 当前状态\n\n工作区已创建。\n\n"
+                "## 重要上下文\n\n无\n\n## 建议的下一步行动\n\n"
+                "定义范围和验收标准。\n\n## 已知问题\n\n无\n",
             )
             self.write_json(path / "sessions.json", [])
         return requirement_id
@@ -546,7 +545,16 @@ class WorkspaceStore:
                 stream.write(value.rstrip() + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
+            # Windows 上另一个刚释放文件锁的进程仍可能短暂持有目标句柄；
+            # 原子替换保持不变，只对该瞬时共享冲突作有限重试。
+            for attempt in range(20):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
         finally:
             try:
                 temporary.unlink()

@@ -48,7 +48,9 @@ def require_current_review_packet(
         or meta.get("review_packet_fingerprint") != fingerprint
         or current_packet_fingerprint != fingerprint
     ):
-        raise WorkspaceError("Review Packet 已陈旧：marker、revision 或 fingerprint 与当前事实不一致")
+        raise WorkspaceError(
+            "Review Packet 已陈旧：marker、revision 或 fingerprint 与当前事实不一致"
+        )
     return review_task
 
 
@@ -100,10 +102,12 @@ def request_requirement_changes(
         return
     pending = False
     try:
-        from .automation.task_attach import is_requirement_review_task
+        from .automation.task_attach import is_requirement_review_task, is_requirement_space_task
 
         expected_id = data["meta"].get("requirement_review_task_id")
         for task in task_provider.list_tasks(requirement_id):
+            if is_requirement_space_task(task):
+                continue
             is_review = task.id == expected_id if expected_id else is_requirement_review_task(task)
             if is_review:
                 if update_review_task and task.status != "in_progress":
@@ -130,6 +134,7 @@ def sync_requirement_review_outcome(
         from .automation.task_attach import (
             ReviewTaskSyncError,
             is_requirement_review_task,
+            is_requirement_space_task,
             requirement_review_task,
         )
 
@@ -139,9 +144,16 @@ def sync_requirement_review_outcome(
             if status == "in_progress" and data["meta"].get("pending_task_review_reopen"):
                 expected_id = data["meta"].get("requirement_review_task_id")
                 for task in task_provider.list_tasks(requirement_id):
-                    if task.status == "in_review" or (
-                        (task.id == expected_id if expected_id else is_requirement_review_task(task))
-                        and task.status != "in_progress"
+                    if not is_requirement_space_task(task) and (
+                        task.status == "in_review"
+                        or (
+                            (
+                                task.id == expected_id
+                                if expected_id
+                                else is_requirement_review_task(task)
+                            )
+                            and task.status != "in_progress"
+                        )
                     ):
                         task_provider.update_status(task.id, "in_progress")
                 store.touch_meta(requirement_id, pending_task_review_reopen=False)
@@ -251,7 +263,9 @@ def review_requirement(
     transition: bool = True,
 ) -> ReviewResult:
     with store.locked(requirement_id):
-        return _review_requirement_locked(store, requirement_id, task_provider, transition=transition)
+        return _review_requirement_locked(
+            store, requirement_id, task_provider, transition=transition
+        )
 
 
 def _review_requirement_locked(
@@ -279,17 +293,30 @@ def _review_requirement_locked(
     statuses = re.findall(r"(?im)^(?:Status|状态)[:：]\s*(\S+)", "\n".join(verification.values()))
     if not statuses:
         blockers.append("缺少验证状态")
-    blockers.extend(f"验证未通过：{status}" for status in statuses if status.upper() != "PASS")
+    # Historical evidence may be retained after a newer implementation replaces
+    # it.  A SUPERSEDED section is explicitly archival rather than a failed
+    # verification and must not prevent the current PASS evidence from closing
+    # an otherwise complete requirement.
+    blockers.extend(
+        f"验证未通过：{status}"
+        for status in statuses
+        if not status.upper().startswith(("PASS", "SUPERSEDED"))
+    )
 
     if task_provider is not None:
         try:
-            from .automation.task_attach import is_requirement_review_task
+            from .automation.task_attach import (
+                is_requirement_review_task,
+                is_requirement_space_task,
+            )
 
             tasks = task_provider.list_tasks(requirement_id)
             blockers.extend(
                 f"任务尚未达到可审查状态：{task.id} [{task.status}]"
                 for task in tasks
-                if not is_requirement_review_task(task) and task.status not in {"in_review", "done"}
+                if not is_requirement_review_task(task)
+                and not is_requirement_space_task(task)
+                and task.status not in {"in_review", "done"}
             )
         except TaskProviderError as exc:
             blockers.append(f"任务 Provider 不可用：{exc}")
@@ -315,9 +342,7 @@ def confirm_requirement_done(
     if not user_confirmed:
         raise WorkspaceError("必须提供用户明确确认，Requirement 才能进入 done")
     before = store.load(requirement_id)["meta"]
-    require_current_review_packet(
-        store, requirement_id, task_provider, current_packet_fingerprint
-    )
+    require_current_review_packet(store, requirement_id, task_provider, current_packet_fingerprint)
     with store.locked(requirement_id):
         meta = store.load(requirement_id)["meta"]
         if meta.get("status") == "done":

@@ -7,7 +7,7 @@
 - 将 `V1架构.md` 作为 V1 范围与验收标准的依据。
 - 必须阅读用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`、项目级 `PROJECT_INTENT.md` 和当前需求的 `intent.md`，
   并将其视为强制意图约束，而不是可选背景资料。
-- 默认采用能够安全完成任务的最轻工作流。
+- 默认采用能够安全完成任务的最轻工作流。用户已经明确要求执行、而请求明显超出当前 Requirement 意图时，默认新建 Requirement 并继续执行，不再为此二次确认；仅在无法判断是否为新范围时才说明依据。
 - 在外部集成之前，优先完成恢复（Restore）、检查点（Checkpoint）、交接（Handoff）和上下文快照（Context Snapshot）。
 - 核心层不得依赖 dashi-taskboard、Codex、Multica、Obsidian 或 Git 的具体实现。
 - 保留现有用户文件以及人类可读的 Markdown/JSON 状态。

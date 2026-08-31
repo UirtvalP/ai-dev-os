@@ -24,7 +24,11 @@ from workspace_orchestrator.project_config import (
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 from .session_runtime import end_session
-from .task_attach import configured_task_provider, is_requirement_review_task
+from .task_attach import (
+    configured_task_provider,
+    is_requirement_review_task,
+    is_requirement_space_task,
+)
 
 STATE_FILE = "dispatcher.json"
 LOG_DIRECTORY = "dispatcher-logs"
@@ -237,6 +241,7 @@ class AutoDispatcher:
                 if (
                     task.status != "in_progress"
                     or is_requirement_review_task(task)
+                    or is_requirement_space_task(task)
                     or task.binding_session_id
                     or _active_workspace_session(self.store, requirement_id, task.id)
                 ):

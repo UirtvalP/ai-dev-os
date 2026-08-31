@@ -72,6 +72,27 @@ def attach_session(
         timestamp = now_iso()
         existing = next((item for item in sessions if item["id"] == session_id), None)
         normalized = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        # 同一 Requirement 可有多个 Agent，但只能处理不同 Task，且并行写入必须隔离。
+        # 这里是确定性门禁，不负责创建或分配 worktree。
+        for active in sessions:
+            if active.get("id") == session_id or active.get("result") != "in_progress":
+                continue
+            active_tasks = set(active.get("task_ids", ()))
+            if not active_tasks or not normalized:
+                continue
+            overlap = active_tasks.intersection(normalized)
+            if overlap:
+                raise WorkspaceError(
+                    f"Task {', '.join(sorted(overlap))} 已由活跃 Session {active['id']} 处理"
+                )
+            active_worktree = str(active.get("worktree") or "")
+            active_branch = str(active.get("branch") or "")
+            if not worktree or not branch or not active_worktree or not active_branch:
+                raise WorkspaceError(
+                    "同一 Requirement 的并行 Agent 必须为不同 Task 配置独立 branch 与 worktree"
+                )
+            if worktree == active_worktree or branch == active_branch:
+                raise WorkspaceError("同一 Requirement 的并行 Agent 不能共享 branch 或 worktree")
         if existing:
             previous = existing.get("task_ids", [])
             was_active = existing.get("result") == "in_progress"
