@@ -333,6 +333,79 @@ def test_dashi_adapter_uses_json_contract() -> None:
     assert commands == [("taskctl", "issue", "list", "--project", "ai-dev-os", "--json")]
 
 
+def test_dashi_v2_conversation_attribution_is_not_an_active_thread_binding() -> None:
+    """真实 schema v2 create payload 的顶层 Thread 归属不得阻止 Dispatcher。"""
+
+    payload = {
+        "tasks": [
+            {
+                "id": "opaque-1",
+                "identifier": "AID-1",
+                "projectId": "ai-dev-os",
+                "title": "由 Main 委派",
+                "status": "in_progress",
+                "labels": ["requirement:REQ-001"],
+                "threadId": "thread-main",
+                "threadBinding": None,
+                "legacyLocalThreadId": "thread-main",
+                "conversationRefs": [
+                    {
+                        "threadId": "thread-main",
+                        "legacyLocal": True,
+                        "source": "task",
+                    }
+                ],
+                "version": 1,
+            }
+        ],
+        "schemaVersion": 2,
+    }
+    provider = DashiTaskProvider(
+        project_id="ai-dev-os",
+        runner=lambda _: json.dumps(payload),
+        executable="taskctl",
+    )
+
+    task = provider.list_tasks("REQ-001")[0]
+
+    assert task.session_ids == ("thread-main",)
+    assert task.binding_session_id is None
+
+
+def test_dashi_v2_explicit_thread_binding_wins_over_conversation_attribution() -> None:
+    payload = {
+        "tasks": [
+            {
+                "id": "opaque-1",
+                "identifier": "AID-1",
+                "title": "运行中的 Worker",
+                "status": "in_progress",
+                "labels": ["requirement:REQ-001"],
+                "threadId": "thread-main",
+                "legacyLocalThreadId": "thread-main",
+                "threadBinding": {
+                    "threadId": "thread-worker",
+                    "codexProjectId": "project-1",
+                    "codexProjectKind": "local",
+                    "codexHostId": "host-1",
+                    "workspacePath": "D:/code/AI Dev OS",
+                },
+            }
+        ],
+        "schemaVersion": 2,
+    }
+    provider = DashiTaskProvider(
+        runner=lambda _: json.dumps(payload),
+        executable="taskctl",
+    )
+
+    task = provider.list_tasks("REQ-001")[0]
+
+    assert task.binding_session_id == "thread-worker"
+    assert task.binding_codex_project_id == "project-1"
+    assert task.binding_workspace_path == "D:/code/AI Dev OS"
+
+
 def test_dashi_adapter_starts_service_once_before_first_command() -> None:
     starts: list[str] = []
 

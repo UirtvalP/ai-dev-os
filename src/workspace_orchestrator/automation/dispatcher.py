@@ -78,6 +78,29 @@ def _write_state(store: WorkspaceStore, state: dict[str, Any]) -> None:
 def _pid_alive(pid: object) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        # Windows 的 os.kill(pid, 0) 在已退出进程上仍可能成功；直接读取
+        # process exit code，避免把 stopping/stale PID 永久误判为存活。
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        open_process.restype = ctypes.c_void_p
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        get_exit_code.restype = ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+        handle = open_process(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            return bool(get_exit_code(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+        finally:
+            close_handle(handle)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -95,6 +118,16 @@ def _config(store: WorkspaceStore) -> ProjectConfig:
 
 def _task_key(task: Task) -> str:
     return task.raw_id or task.id
+
+
+def _task_state_allows_dispatch(task: Task, previous: dict[str, Any] | None) -> bool:
+    """同一 Task version 的终态不得在状态查询中重新伪装成 queued。"""
+
+    return not (
+        previous
+        and previous.get("version") == task.version
+        and previous.get("result") not in {"dispatching", "cancel_requested"}
+    )
 
 
 def _active_workspace_session(
@@ -222,6 +255,29 @@ class AutoDispatcher:
             state["tasks"] = tasks
             _write_state(self.store, state)
 
+    def _claim(self, task: Task, requirement_id: str) -> bool:
+        """与 queued cancel 共用同一文件锁，保证启动边界只有一方获胜。"""
+
+        with self.store.locked():
+            state = _read_state(self.store)
+            tasks = dict(state.get("tasks") or {})
+            current = dict(tasks.get(_task_key(task)) or {})
+            if current.get("result") == "cancel_requested":
+                return False
+            current.update(
+                task_id=task.id,
+                raw_id=task.raw_id,
+                version=task.version,
+                activity_updated_at=task.activity_updated_at,
+                updated_at=now_iso(),
+                result="dispatching",
+                requirement_id=requirement_id,
+            )
+            tasks[_task_key(task)] = current
+            state["tasks"] = tasks
+            _write_state(self.store, state)
+        return True
+
     def _candidate(self) -> DispatchCandidate | None:
         config = _config(self.store)
         if config.task_provider != "dashi" or not config.auto_execute_in_progress:
@@ -247,11 +303,7 @@ class AutoDispatcher:
                 ):
                     continue
                 previous = self._task_state(task)
-                if (
-                    previous
-                    and previous.get("version") == task.version
-                    and previous.get("result") != "dispatching"
-                ):
+                if not _task_state_allows_dispatch(task, previous):
                     continue
                 path = _execution_path(self.store, task, data["meta"])
                 try:
@@ -302,13 +354,16 @@ class AutoDispatcher:
         if candidate is None:
             return "idle"
         task = candidate.task
+        if not self._claim(task, candidate.requirement_id):
+            refreshed = _block_task(candidate.task_provider, task, "任务已按 Main 请求取消，未启动 Worker。")
+            self._remember(refreshed, result="cancelled")
+            return "cancelled"
         if not candidate.execution_path.is_dir():
             message = f"自动执行失败：任务工作目录不存在：{candidate.execution_path}"
             refreshed = _block_task(candidate.task_provider, task, message)
             self._remember(refreshed, result="blocked", error=message)
             return "blocked"
 
-        self._remember(task, result="dispatching", requirement_id=candidate.requirement_id)
         result = self.executor.execute(
             candidate.execution_path,
             _prompt(candidate),
@@ -431,17 +486,42 @@ def start_dispatcher(store: WorkspaceStore, *, explicit: bool = False) -> dict[s
 
 
 def stop_dispatcher(store: WorkspaceStore) -> dict[str, Any]:
-    state = _read_state(store)
-    pid = state.get("pid")
-    if _pid_alive(pid):
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except OSError:
-            pass
     with store.locked():
         state = _read_state(store)
-        state.update(pid=None, status="stopped", stopped_at=now_iso())
+        pid = state.get("pid")
+        alive = _pid_alive(pid)
+        active_task_ids = tuple(
+            str(value.get("task_id") or key)
+            for key, value in dict(state.get("tasks") or {}).items()
+            if isinstance(value, dict)
+            if value.get("result") in {"dispatching", "running"}
+        )
+        if alive and active_task_ids:
+            raise WorkspaceError(
+                "Dispatcher 正在执行 Task，V1 不支持运行中中断："
+                + ", ".join(active_task_ids)
+            )
+        if not alive:
+            state.update(pid=None, status="stopped", stopped_at=now_iso())
+            _write_state(store, state)
+            return dispatcher_status(store)
+        state.update(status="stopping", stop_requested_at=now_iso())
         _write_state(store, state)
+
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.monotonic() + 5.0
+    while _pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _pid_alive(pid):
+        raise WorkspaceError("Dispatcher 停止超时；已保持 stopping 状态，未启动第二个 Worker")
+    with store.locked():
+        state = _read_state(store)
+        if state.get("pid") == pid:
+            state.update(pid=None, status="stopped", stopped_at=now_iso())
+            _write_state(store, state)
     return dispatcher_status(store)
 
 

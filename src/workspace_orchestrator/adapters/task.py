@@ -134,7 +134,12 @@ def _relation_ids(values: Sequence[object]) -> tuple[str, ...]:
 
 def _task(data: dict[str, Any]) -> Task:
     development = data.get("developmentContext") or {}
-    thread_binding = data.get("threadBinding") or {}
+    # schema v2 的顶层 threadId / legacyLocalThreadId 只表示 conversation
+    # attribution；只有显式 threadBinding 才代表当前执行绑定。旧 payload
+    # 完全没有 threadBinding 字段时，才回退读取顶层字段以保持兼容。
+    has_explicit_thread_binding = "threadBinding" in data
+    raw_thread_binding = data.get("threadBinding")
+    thread_binding = raw_thread_binding if isinstance(raw_thread_binding, dict) else {}
     relations = data.get("relations") or {}
     refs = data.get("conversationRefs") or []
     session_ids = tuple(dict.fromkeys(str(ref["threadId"]) for ref in refs if ref.get("threadId")))
@@ -162,8 +167,8 @@ def _task(data: dict[str, Any]) -> Task:
         session_ids=session_ids,
         binding_session_id=(
             thread_binding.get("threadId")
-            or data.get("threadId")
-            or data.get("legacyLocalThreadId")
+            if has_explicit_thread_binding
+            else data.get("threadId") or data.get("legacyLocalThreadId")
         ),
         binding_codex_project_id=thread_binding.get("codexProjectId"),
         binding_codex_project_kind=thread_binding.get("codexProjectKind"),

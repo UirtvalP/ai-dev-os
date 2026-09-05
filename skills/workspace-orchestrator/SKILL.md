@@ -19,6 +19,14 @@ description: 跨越可替换的 Codex 会话恢复并推进持久化 AI 开发�
 会由本地 Dispatcher 自动启动或恢复 Codex。新 Session 的 Hook Snapshot 仍是事实来源；Agent 不得
 再次启动 Dispatcher 或重复认领 Task。Requirement Review 卡不属于自动执行目标。
 
+交互式 Main Thread 是轻量控制面。tiny 工作可直接执行；normal、complex、research 的实际代码阅读、
+实现与长验证优先通过 `workspace delegate REQ-ID --title ... --description ...` 持久化后立即返回，
+不得同步等待 `CodexExecProvider`。Worker 运行时 Main 继续接收消息，可用 `workspace worker-status`
+查询结构化状态，或用 `workspace cancel TASK-ID` 取消尚未启动的 queued Task；V1 不支持即时中断运行中的
+Worker。补充约束先写入 Task/Workspace，必要时在 Worker 启动前取消并
+依据新 Snapshot 恢复；不得复制 Main 完整 conversation、实时注入私有协议、递归创建 Worker或并行启动
+第二个 write Worker。
+
 兼容回退命令保持为 `workspace bootstrap REQ-ID --request "用户当前开发请求"` 或 `workspace bootstrap --request "用户当前开发请求"`；多个活动 Task 时不得猜测。
 
 ## 执行

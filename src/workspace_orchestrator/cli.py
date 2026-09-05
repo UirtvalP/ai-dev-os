@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .adapters.agent import CodexAgentProvider
+from .automation.delegation import delegate_task, request_cancel, worker_status
 from .automation.requirement_attach import AutomationAmbiguity, discover_project_root
 from .automation.runtime import AutomationRuntime
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
@@ -109,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--important-context")
     finalize.add_argument("--next-action")
 
+    delegate = commands.add_parser("delegate", help="非阻塞委派开发 Task 给后台单 Worker")
+    delegate.add_argument("requirement_id")
+    delegate.add_argument("--title", required=True)
+    delegate.add_argument("--description", required=True)
+    delegate.add_argument("--priority")
+    commands.add_parser("worker-status", help="查询后台 Worker 与 queued Task")
+    cancel = commands.add_parser("cancel", help="取消尚未启动的 queued Dispatcher Task")
+    cancel.add_argument("task_id")
+
     review = commands.add_parser("review", help="检查验收与验证门禁")
     review.add_argument("requirement_id")
     confirm = commands.add_parser("confirm", help="记录用户明确确认并完成已审查 Requirement")
@@ -161,14 +172,18 @@ def _doctor(store: WorkspaceStore) -> str:
     else:
         lines.append("活跃 Session 多重绑定：无")
     pending = []
-    for requirement_id in store.requirement_ids(statuses={"draft", "ready", "in_progress", "blocked", "in_review"}):
+    for requirement_id in store.requirement_ids(
+        statuses={"draft", "ready", "in_progress", "blocked", "in_review"}
+    ):
         data = store.load(requirement_id)
         verification = data["verification"]
         if "未配置已知验证命令" in verification:
             pending.append(requirement_id)
     if pending:
         lines.append("未配置已知验证命令：" + ", ".join(pending))
-        lines.append("建议：为这些需求补充确定性验证命令或明确标记人工验收；不要据此自动标记 done。")
+        lines.append(
+            "建议：为这些需求补充确定性验证命令或明确标记人工验收；不要据此自动标记 done。"
+        )
     else:
         lines.append("未配置已知验证命令：无")
     lines.append("收敛预览：本命令不修改 Session、Requirement、Task 或 Git 状态。")
@@ -228,6 +243,22 @@ def run(args: argparse.Namespace) -> str:
             task_ids=args.task_ids,
             development_request=args.development_request,
         ).rstrip()
+    if args.command == "delegate":
+        return json.dumps(
+            delegate_task(
+                store,
+                args.requirement_id,
+                title=args.title,
+                description=args.description,
+                priority=args.priority,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    if args.command == "worker-status":
+        return json.dumps(worker_status(store), ensure_ascii=False, indent=2)
+    if args.command == "cancel":
+        return json.dumps(request_cancel(store, args.task_id), ensure_ascii=False, indent=2)
     if args.command == "checkpoint":
         checkpoint(
             store,
@@ -260,9 +291,7 @@ def run(args: argparse.Namespace) -> str:
             completed=args.completed,
             current_state=args.current_state,
             important_context=args.important_context,
-            next_action=(
-                args.next_action or "提交并推送后由 Stop Hook 自动归档 Thread。"
-            ),
+            next_action=(args.next_action or "提交并推送后由 Stop Hook 自动归档 Thread。"),
         )
         if not result.passed:
             details = "\n".join(f"- {item}" for item in result.blockers)
