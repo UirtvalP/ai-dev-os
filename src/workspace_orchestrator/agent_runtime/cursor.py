@@ -11,7 +11,7 @@ import json
 import os
 import shutil
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +44,7 @@ class CursorAcpRuntime:
         event_sink: EventSink | None = None,
         environ: Mapping[str, str] | None = None,
         timeout_seconds: float = 30,
+        client_factory: Callable[..., JsonRpcStdioClient] = JsonRpcStdioClient,
     ) -> None:
         self.command = tuple(command) if command is not None else (
             executable or shutil.which("agent") or shutil.which("cursor-agent") or "agent", "acp"
@@ -53,6 +54,7 @@ class CursorAcpRuntime:
         for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDECODE", "CLAUDE_SESSION_ID"):
             self.environ.pop(key, None)
         self.timeout_seconds = timeout_seconds
+        self.client_factory = client_factory
         self._client: JsonRpcStdioClient | None = None
         self._request: AgentRunRequest | None = None
         self._session: RuntimeSessionRef | None = None
@@ -69,7 +71,7 @@ class CursorAcpRuntime:
 
     def describe(self) -> RuntimeDescriptor:
         available = bool(self.command and shutil.which(self.command[0]))
-        capabilities = ["start", "message", "interrupt", "events"]
+        capabilities = ["start", "message", "interrupt", "events", "profile:read-only"]
         if self._capabilities.get("loadSession") is True:
             capabilities.append("resume")
         return RuntimeDescriptor(
@@ -108,7 +110,7 @@ class CursorAcpRuntime:
         if not self.describe().available:
             return self._failure("unavailable", "未找到 Cursor Agent CLI")
         self._request = request
-        self._client = JsonRpcStdioClient(
+        self._client = self.client_factory(
             self.command, cwd=request.workspace_path, environ=self.environ,
             jsonrpc=True, on_notification=self._notification,
             on_server_request=self._server_request,
@@ -154,6 +156,8 @@ class CursorAcpRuntime:
             return self._failure("unavailable", "未找到 Cursor Agent CLI")
         if request.bypass_hook_trust:
             return self._failure("unsupported", "Cursor ACP 不支持绕过 Hook 信任")
+        if request.reasoning_effort is not None:
+            return self._failure("unsupported", "Cursor ACP 尚未协商 reasoning effort 控制")
         if request.sandbox != "read-only":
             return self._failure("unsupported", "Cursor ACP 不能提供所请求的 OS sandbox",
                                  sandbox=request.sandbox)

@@ -2,29 +2,35 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from .agent_runtime.contracts import EventSink, RuntimeDescriptor
 from .agent_runtime.events import RuntimeEventStore
 from .agent_runtime.execution import RuntimeExecutor
 from .agent_runtime.ports import AgentExecutionPort, AgentRuntimePort
+from .agent_runtime.stdio import JsonRpcStdioClient
 from .project_config import default_project_config, load_project_config
 from .workspace import WorkspaceError, WorkspaceStore
 
 
-def create_runtime(name: str, *, event_sink: EventSink | None = None) -> AgentRuntimePort:
+def create_runtime(
+    name: str, *, event_sink: EventSink | None = None,
+    client_factory: Callable[..., JsonRpcStdioClient] = JsonRpcStdioClient,
+) -> AgentRuntimePort:
     """显式选择已实现 Adapter；智能选择与插件注册属于后续 Policy 阶段。"""
 
     if name == "codex":
         from .agent_runtime.codex import CodexRuntime
 
-        return CodexRuntime(event_sink=event_sink)
+        return CodexRuntime(event_sink=event_sink, client_factory=client_factory)
     if name == "cursor":
         from .agent_runtime.cursor import CursorAcpRuntime
 
-        return CursorAcpRuntime(event_sink=event_sink)
+        return CursorAcpRuntime(event_sink=event_sink, client_factory=client_factory)
     if name == "claude":
         from .agent_runtime.claude import ClaudeCliRuntime
 
-        return ClaudeCliRuntime(event_sink=event_sink)
+        return ClaudeCliRuntime(event_sink=event_sink, client_factory=client_factory)
     raise WorkspaceError(f"未配置的 Agent Runtime：{name}")
 
 

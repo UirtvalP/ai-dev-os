@@ -88,6 +88,7 @@ class AgentRunRequest:
     requirement_id: str | None = None
     task_id: str | None = None
     schema_version: int = SCHEMA_VERSION
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

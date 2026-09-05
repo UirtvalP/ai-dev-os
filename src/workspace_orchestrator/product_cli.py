@@ -75,6 +75,26 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
     events.add_argument("--after", type=int, default=0, help="排他事件序号（默认：0）")
     events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
+    orchestration = commands.add_parser("orchestration", help="V2 单写者计划、执行与恢复控制面")
+    orchestration_commands = orchestration.add_subparsers(dest="orchestration_command", required=True)
+    for action, description in (
+        ("status", "读取本地编排状态，不启动 Worker"),
+        ("plan", "从结构化 JSON 冻结本需求执行计划，不启动 Worker"),
+        ("run", "前台续租并执行至候选或阻塞；不会完成 Requirement"),
+    ):
+        command = orchestration_commands.add_parser(action, help=description)
+        command.add_argument("requirement_id", help="已经存在的 Requirement ID")
+        command.add_argument("--root", type=Path, default=Path.cwd())
+        if action != "status":
+            command.add_argument("--owner", required=True, help="操作员/控制器唯一身份")
+            command.add_argument("--max-workers", type=int, default=1)
+            command.add_argument("--allow-worktree-root", type=Path, action="append", default=[])
+            command.add_argument("--allow-network", action="store_true",
+                                 help="显式允许隔离域联网；不宣称已实现域名过滤")
+        if action == "plan":
+            command.add_argument("--file", type=Path, required=True, help="PlanningRequest JSON 文件")
+        elif action == "run":
+            command.add_argument("--timeout", type=float, default=300, help="本次前台服务最长秒数")
     dispatcher = commands.add_parser(
         "dispatcher", help="管理 Task → Agent 自动执行 Dispatcher"
     )
@@ -175,6 +195,46 @@ def _format_project(project: RegisteredProject) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "orchestration":
+        from .orchestration.contracts import PlanningRequest, PolicyError
+        from .orchestration_composition import (
+            configured_projection,
+            configured_supervisor,
+            control_store,
+            run_supervisor,
+        )
+
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        if args.orchestration_command == "status":
+            orchestration_result = control_store(store, args.requirement_id).snapshot()
+        else:
+            supervisor = configured_supervisor(
+                store, args.requirement_id, owner=args.owner, max_workers=args.max_workers,
+                allow_network=args.allow_network,
+                allowed_worktree_roots=tuple(path.absolute() for path in args.allow_worktree_root),
+            )
+            try:
+                if args.orchestration_command == "plan":
+                    if args.file.stat().st_size > 1024 * 1024:
+                        raise WorkspaceError("计划 JSON 超出 1 MiB 限制")
+                    request = PlanningRequest.from_dict(json.loads(args.file.read_text(encoding="utf-8")))
+                    if request.requirement_id != args.requirement_id:
+                        raise WorkspaceError("计划 Requirement ID 与命令目标不一致")
+                    supervisor.acquire()
+                    try:
+                        supervisor.initialize(request)
+                    finally:
+                        supervisor.close()
+                    orchestration_result = supervisor.status()
+                else:
+                    orchestration_result = run_supervisor(
+                        supervisor, timeout_seconds=args.timeout,
+                        projection=configured_projection(store, args.requirement_id),
+                    )
+            except (ValueError, PolicyError) as exc:
+                raise WorkspaceError(f"编排请求被拒绝：{exc}") from exc
+        return json.dumps(orchestration_result, ensure_ascii=False, indent=2)
     if args.command == "runtime":
         if args.runtime_command == "list":
             return json.dumps(
@@ -244,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
             store = WorkspaceStore(project_root, execution_root=execution_root)
             return serve_dispatcher(store, configured_executor(store))
         output = run(args)
-    except (OSError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
+    except (OSError, ValueError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     print(output)

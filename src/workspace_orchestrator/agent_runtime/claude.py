@@ -12,7 +12,7 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from uuid import uuid4
 
@@ -45,6 +45,7 @@ class ClaudeCliRuntime:
         event_sink: EventSink | None = None,
         environ: Mapping[str, str] | None = None,
         timeout_seconds: float = 30,
+        client_factory: Callable[..., JsonRpcStdioClient] = JsonRpcStdioClient,
     ) -> None:
         self.command = tuple(command) if command is not None else (
             executable or shutil.which("claude") or "claude",
@@ -54,6 +55,7 @@ class ClaudeCliRuntime:
         for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDECODE", "CLAUDE_SESSION_ID"):
             self.environ.pop(key, None)
         self.timeout_seconds = timeout_seconds
+        self.client_factory = client_factory
         self._client: JsonRpcStdioClient | None = None
         self._request: AgentRunRequest | None = None
         self._session: RuntimeSessionRef | None = None
@@ -73,7 +75,7 @@ class ClaudeCliRuntime:
         available = bool(self.command and shutil.which(self.command[0]))
         return RuntimeDescriptor(
             self.runtime_id, "Claude CLI", self._version, available,
-            ("start", "resume", "message", "interrupt", "events"), self._models,
+            ("start", "resume", "message", "interrupt", "events", "profile:read-only"), self._models,
             "仅 Read/Grep/Glob 工具与默认拒绝；不提供 OS 级读隔离" if available
             else "未找到 Claude CLI；未安装或未配置可执行路径",
         )
@@ -147,6 +149,8 @@ class ClaudeCliRuntime:
                                  sandbox=request.sandbox)
         if request.bypass_hook_trust:
             return self._failure("unsupported", "Claude CLI 不支持绕过 Hook 信任")
+        if request.reasoning_effort is not None:
+            return self._failure("unsupported", "Claude CLI 尚未协商 reasoning effort 控制")
         if not request.prompt.strip():
             return self._failure("invalid_request", "消息不能为空")
         self._request = request
@@ -160,7 +164,7 @@ class ClaudeCliRuntime:
         ]
         if request.model:
             command.append(f"--model={request.model}")
-        self._client = JsonRpcStdioClient(
+        self._client = self.client_factory(
             command, cwd=request.workspace_path, environ=self.environ, raw_mode=True,
             on_message=self._message, on_error=self._on_error,
         )

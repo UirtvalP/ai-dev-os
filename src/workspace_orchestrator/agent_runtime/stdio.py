@@ -10,15 +10,47 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self, cast
+from typing import IO, Any, Protocol, Self, cast
 
 JsonObject = dict[str, Any]
 MessageHandler = Callable[[JsonObject], None]
+
+
+class RuntimeProcess(Protocol):
+    """由受信 Launcher 创建的文本管道进程；不接受 Worker 自报句柄。"""
+
+    @property
+    def pid(self) -> int: ...
+    @property
+    def stdin(self) -> IO[str] | None: ...
+    @property
+    def stdout(self) -> IO[str] | None: ...
+    @property
+    def stderr(self) -> IO[str] | None: ...
+    def poll(self) -> int | None: ...
+    def wait(self, timeout: float | None = None) -> int: ...
+    def kill(self) -> None: ...
+
+
+class ProcessFactory(Protocol):
+    """Windows 必须返回挂起进程；POSIX 必须返回独立的进程组 leader。"""
+
+    def __call__(
+        self, command: Sequence[str], *, cwd: Path | None, env: Mapping[str, str] | None,
+    ) -> RuntimeProcess: ...
+
+
+def _close_process_resources(process: RuntimeProcess) -> None:
+    """树已停止后释放可替换 Launcher 持有的 token、profile 等额外资源。"""
+    closer = getattr(process, "close", None)
+    if callable(closer):
+        closer()
 
 
 if sys.platform == "win32":
@@ -59,6 +91,15 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _JobAccounting(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_longlong), ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
     def _windows_kernel() -> Any:
         """只绑定公开的 Win32 Job/Toolhelp/Thread API，不使用私有 NtAPI。"""
 
@@ -70,6 +111,10 @@ if sys.platform == "win32":
             ),
             "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
             "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "QueryInformationJobObject": (
+                [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p],
+                wintypes.BOOL,
+            ),
             "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
             "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
             "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)], wintypes.BOOL),
@@ -112,7 +157,7 @@ class _Pending:
 class _ProcessTree:
     """POSIX 独立进程组；Windows 先纳入 Job 再恢复挂起的新进程。"""
 
-    def __init__(self, process: subprocess.Popen[str]) -> None:
+    def __init__(self, process: RuntimeProcess) -> None:
         self.process = process
         self._job: Any = None
         self._kernel: Any = None
@@ -184,9 +229,25 @@ class _ProcessTree:
     def kill(self) -> None:
         if sys.platform == "win32":
             if self._job is not None:
-                self._kernel.TerminateJobObject(self._job, 1)
-                self._kernel.CloseHandle(self._job)
-                self._job = None
+                job = self._job
+                try:
+                    if not self._kernel.TerminateJobObject(job, 1):
+                        raise OSError(ctypes.get_last_error(), "无法确认 Runtime 进程树终止")
+                    deadline = time.monotonic() + 5
+                    while True:
+                        accounting = _JobAccounting()
+                        if not self._kernel.QueryInformationJobObject(
+                            job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+                        ):
+                            raise OSError(ctypes.get_last_error(), "无法确认 Runtime Job 已清空")
+                        if accounting.ActiveProcesses == 0:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise OSError("Runtime Job 子进程仍未全部终止")
+                        time.sleep(0.01)
+                finally:
+                    self._kernel.CloseHandle(job)
+                    self._job = None
         else:
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
@@ -213,6 +274,7 @@ class JsonRpcStdioClient:
         raw_mode: bool = False,
         on_message: MessageHandler | None = None,
         on_error: Callable[[RpcTransportError], None] | None = None,
+        process_factory: ProcessFactory | None = None,
     ) -> None:
         if not command:
             raise ValueError("Runtime 命令不能为空")
@@ -225,7 +287,8 @@ class JsonRpcStdioClient:
         self.raw_mode = raw_mode
         self.on_message = on_message
         self.on_error = on_error
-        self._process: subprocess.Popen[str] | None = None
+        self.process_factory = process_factory
+        self._process: RuntimeProcess | None = None
         self._tree: _ProcessTree | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
@@ -273,21 +336,28 @@ class JsonRpcStdioClient:
                 else:
                     creationflags = 0
                     executable = self.command[0]
-                process = subprocess.Popen(
-                    (executable, *self.command[1:]),
-                    cwd=self.cwd,
-                    env=self.environ,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="strict",
-                    bufsize=1,
-                    start_new_session=sys.platform != "win32",
-                    creationflags=creationflags,
-                )
+                process: RuntimeProcess
+                if self.process_factory is None:
+                    process = subprocess.Popen(
+                        (executable, *self.command[1:]),
+                        cwd=self.cwd, env=self.environ,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, encoding="utf-8", errors="strict", bufsize=1,
+                        start_new_session=sys.platform != "win32", creationflags=creationflags,
+                    )
+                else:
+                    process = self.process_factory(
+                        (executable, *self.command[1:]), cwd=self.cwd, env=self.environ,
+                    )
                 self._process = process
+                if self.process_factory is not None and sys.platform == "win32" and getattr(
+                    process, "requires_job_resume", False,
+                ) is not True:
+                    raise OSError("隔离 Launcher 必须原子创建挂起进程，禁止降级为普通 Popen")
+                if sys.platform != "win32" and os.getpgid(process.pid) != process.pid:
+                    raise OSError("隔离 Launcher 必须创建独立进程组")
+                if any(stream is None for stream in (process.stdin, process.stdout, process.stderr)):
+                    raise OSError("隔离 Launcher 必须提供完整 UTF-8 文本管道")
                 self._tree = _ProcessTree(process)
             except BaseException as exc:
                 if self._process is not None:
@@ -299,6 +369,7 @@ class JsonRpcStdioClient:
                     for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
                         if stream:
                             stream.close()
+                    _close_process_resources(self._process)
                 if not isinstance(exc, OSError):
                     raise
                 self._failure = RpcTransportError("unavailable", f"Runtime 启动失败：{exc}")
@@ -484,6 +555,7 @@ class JsonRpcStdioClient:
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream:
                     stream.close()
+            _close_process_resources(process)
 
     def __enter__(self) -> Self:
         self.start()

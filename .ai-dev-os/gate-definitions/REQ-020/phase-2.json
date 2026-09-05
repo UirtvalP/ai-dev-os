@@ -17,6 +17,7 @@
         ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
         ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
         ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "scripts/worker_isolation_smoke.py"],
         ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
         ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
         ["uv", "lock", "--check"],

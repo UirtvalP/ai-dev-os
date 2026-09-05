@@ -29,7 +29,7 @@ from .stdio import JsonObject, JsonRpcStdioClient, RpcResponseError, RpcTranspor
 
 _CAPABILITIES = (
     "start", "resume", "read", "message", "steer", "interrupt", "archive",
-    "events", "models", "approval_response",
+    "events", "models", "approval_response", "profile:read-only", "profile:workspace-write",
 )
 _APPROVAL_METHODS = {
     "item/commandExecution/requestApproval", "item/fileChange/requestApproval"
@@ -362,8 +362,12 @@ class CodexRuntime:
         return result
 
     def send_message(self, session: RuntimeSessionRef, text: str) -> RuntimeOperationResult:
+        overrides: JsonObject = {}
+        if self._request and self._request.reasoning_effort is not None:
+            overrides["effort"] = self._request.reasoning_effort
         result = self._operation(session, "turn/start", {
             "input": [{"type": "text", "text": text}],
+            **overrides,
         })
         if not result.ok:
             return result
