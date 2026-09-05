@@ -6,10 +6,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from workspace_orchestrator.adapters.base import TaskProvider
+from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.adapters.task import (
     DashiTaskProvider,
-    TaskProviderError,
     ensure_taskboard_service,
 )
 from workspace_orchestrator.models import Task

@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -78,7 +79,7 @@ def ensure_taskboard_service() -> None:
     environment = os.environ.copy()
     environment["CODEX_TASKBOARD_HOST"] = "127.0.0.1"
     environment["CODEX_TASKBOARD_PORT"] = str(port)
-    if os.name == "nt":
+    if sys.platform == "win32":
         command = (os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher))
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP

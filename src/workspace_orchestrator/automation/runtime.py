@@ -10,6 +10,7 @@ from workspace_orchestrator.adapters.agent import AgentProviderError
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
 from workspace_orchestrator.project_config import load_project_config
 from workspace_orchestrator.review import (
+    ReviewResult,
     confirm_requirement_done,
     request_requirement_changes,
     review_requirement,
@@ -443,7 +444,7 @@ class AutomationRuntime:
             current_packet_fingerprint=fingerprint,
         )
 
-    def review(self, requirement_id: str):
+    def review(self, requirement_id: str) -> ReviewResult:
         """在组合层注入 Provider 后执行 Core review gate。"""
 
         before = self.store.load(requirement_id)["meta"].get("status")
@@ -686,12 +687,12 @@ class AutomationRuntime:
             task_ids=task_ids,
         )
         if not passed:
-            blockers = tuple(
+            verification_blockers = tuple(
                 item.output or f"验证命令失败：{' '.join(item.command)}"
                 for item in results
                 if not item.passed
             ) or ("未配置已知验证命令",)
-            return FinalizeResult(False, summary, task_ids, blockers=blockers)
+            return FinalizeResult(False, summary, task_ids, blockers=verification_blockers)
         provider = self._provider(requirement_id)
         review_candidates = list(task_ids)
         if provider is not None:
@@ -776,10 +777,10 @@ class AutomationRuntime:
             next_action=final_next_action,
         )
         if manual_test_required:
-            blockers, review_task = self._publish_review_packet(requirement_id, provider)
-            if blockers:
+            packet_blockers, review_task = self._publish_review_packet(requirement_id, provider)
+            if packet_blockers:
                 self.store.touch_meta(requirement_id, status="in_progress")
-                return FinalizeResult(False, summary, final_task_ids, blockers=blockers)
+                return FinalizeResult(False, summary, final_task_ids, blockers=packet_blockers)
             self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
             return FinalizeResult(
                 True,

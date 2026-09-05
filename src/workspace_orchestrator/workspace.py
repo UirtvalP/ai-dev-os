@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,8 +74,29 @@ _LOCK_STATE = threading.local()
 _PROJECT_DEFAULT = object()
 
 
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_descriptor(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+
+    def _unlock_descriptor(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_descriptor(descriptor: int) -> None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_descriptor(descriptor: int) -> None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 @contextmanager
-def _file_lock(path: Path, *, timeout: float = 10.0):
+def _file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
     """提供同进程可重入、进程退出后自动释放的跨进程文件锁。"""
 
     # 不根据锁文件当前是否存在重新解析路径；Windows 对“创建前/创建后”的
@@ -96,41 +119,25 @@ def _file_lock(path: Path, *, timeout: float = 10.0):
 
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR)
-        if os.path.getsize(path) == 0:
-            os.write(descriptor, b"0")
         deadline = time.monotonic() + timeout
         while True:
             try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_descriptor(descriptor)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
                     os.close(descriptor)
                     raise WorkspaceError(f"等待工作区文件锁超时：{path}")
                 time.sleep(0.02)
+        if os.path.getsize(path) == 0:
+            os.write(descriptor, b"0")
         counts[key] = 1
         try:
             yield
         finally:
             counts.pop(key, None)
             try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                _unlock_descriptor(descriptor)
             finally:
                 os.close(descriptor)
 
@@ -227,7 +234,7 @@ class WorkspaceStore:
         return self.root / normalized
 
     @contextmanager
-    def locked(self, requirement_id: str | None = None):
+    def locked(self, requirement_id: str | None = None) -> Iterator[None]:
         """锁定整个 Workspace 或单个 Requirement 的复合更新。"""
 
         name = ".workspace.lock" if requirement_id is None else f".{requirement_id.upper()}.lock"
@@ -235,14 +242,14 @@ class WorkspaceStore:
             yield
 
     @contextmanager
-    def provider_locked(self, requirement_id: str):
+    def provider_locked(self, requirement_id: str) -> Iterator[None]:
         """串行同一 Requirement 的 Review Provider 同步，不扩大本地 RMW 临界区。"""
 
         with _file_lock(self.root / f".{requirement_id.upper()}.provider.lock"):
             yield
 
     @contextmanager
-    def finalize_locked(self, requirement_id: str):
+    def finalize_locked(self, requirement_id: str) -> Iterator[None]:
         """串行同一 Requirement 的完整 finalize；进程退出时由 OS 自动释放。"""
 
         with _file_lock(self.root / f".{requirement_id.upper()}.finalize.lock"):
@@ -479,15 +486,15 @@ class WorkspaceStore:
                 and meta.get("task_project_id")
                 == default_project_config(self.project_root).task_project_id
             ):
-                config = load_project_config(self.working_root) or load_project_config(
+                active_config = load_project_config(self.working_root) or load_project_config(
                     self.project_root
                 )
-                if config and (
-                    meta.get("task_provider") != config.task_provider
-                    or meta.get("task_project_id") != config.task_project_id
+                if active_config and (
+                    meta.get("task_provider") != active_config.task_provider
+                    or meta.get("task_project_id") != active_config.task_project_id
                 ):
-                    meta["task_provider"] = config.task_provider
-                    meta["task_project_id"] = config.task_project_id
+                    meta["task_provider"] = active_config.task_provider
+                    meta["task_project_id"] = active_config.task_project_id
                     meta.pop("requirement_review_task_id", None)
                     meta.pop("review_comment_count", None)
                     meta["updated_at"] = now_iso()
@@ -516,7 +523,7 @@ class WorkspaceStore:
     def touch_meta(self, requirement_id: str, **changes: object) -> dict[str, Any]:
         with self.locked(requirement_id):
             path = self.path_for(requirement_id) / "meta.json"
-            meta = self.read_json(path)
+            meta: dict[str, Any] = self.read_json(path)
             meta.update(changes)
             meta["updated_at"] = now_iso()
             self.write_json(path, meta)

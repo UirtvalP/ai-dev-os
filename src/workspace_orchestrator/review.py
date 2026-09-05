@@ -9,6 +9,7 @@ from datetime import datetime
 
 from .adapters.base import TaskProvider, TaskProviderError
 from .intent import INTENT_CHECK_LABELS, IntentStatus, review_intent
+from .models import Task
 from .workspace import WorkspaceError, WorkspaceStore, bullets, markdown_sections, replace_section
 
 
@@ -17,7 +18,7 @@ def require_current_review_packet(
     requirement_id: str,
     task_provider: TaskProvider | None,
     current_packet_fingerprint: str | None,
-):
+) -> Task | None:
     """对配置 Provider 的 Requirement 强制核对已发布 Packet 与当前事实。"""
 
     data = store.load(requirement_id)

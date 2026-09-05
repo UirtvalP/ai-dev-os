@@ -1,10 +1,10 @@
 """Provider 协议与后续具体适配器。"""
 
 from .agent import CodexAgentProvider, CodexExecProvider, CodexExecutionResult
-from .base import AgentProvider, GitProvider, KnowledgeProvider, TaskProvider
+from .base import AgentProvider, GitProvider, KnowledgeProvider, TaskProvider, TaskProviderError
 from .git import GitError, LocalGitProvider
 from .package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
-from .task import DashiTaskProvider, TaskProviderError
+from .task import DashiTaskProvider
 
 __all__ = [
     "AgentProvider",

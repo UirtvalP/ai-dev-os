@@ -1,10 +1,12 @@
 import json
 import multiprocessing
+import os
 import time
 from pathlib import Path
 
 import pytest
 
+from workspace_orchestrator import workspace as workspace_module
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.automation.runtime import AutomationRuntime
 from workspace_orchestrator.cli import main
@@ -39,6 +41,28 @@ def _hold_requirement_lock(root: str, requirement_id: str, ready: object) -> Non
     with store.locked(requirement_id):
         ready.set()  # type: ignore[attr-defined]
         time.sleep(30)
+
+
+def test_lock_file_is_initialized_only_after_lock_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "first-use.lock"
+    descriptors: list[int] = []
+    observed_sizes: list[int] = []
+    lock_descriptor = workspace_module._lock_descriptor
+
+    def observe_lock_file(descriptor: int) -> None:
+        descriptors.append(descriptor)
+        observed_sizes.append(os.fstat(descriptor).st_size)
+        lock_descriptor(descriptor)
+
+    monkeypatch.setattr(workspace_module, "_lock_descriptor", observe_lock_file)
+
+    with workspace_module._file_lock(lock_path):
+        assert os.fstat(descriptors[0]).st_size == 1
+
+    assert observed_sizes == [0]
+    assert lock_path.read_bytes() == b"0"
 
 
 def test_create_initializes_complete_human_readable_workspace(tmp_path: Path) -> None:

@@ -205,20 +205,21 @@ def run(args: argparse.Namespace) -> str:
             if args.complexity
             else route_workflow(" ".join(filter(None, (args.title, args.goal)))).complexity
         )
-        provider_options: dict[str, object] = {}
-        if args.no_task_provider:
-            provider_options["task_provider"] = None
-        elif args.task_provider:
-            provider_options["task_provider"] = args.task_provider
-        requirement_id = store.create(
-            args.title,
-            goal=args.goal,
-            acceptance=args.acceptance,
-            complexity=complexity,
-            task_project_id=args.task_project,
-            manual_test_required=args.manual_test,
-            **provider_options,
-        )
+        create_options = {
+            "goal": args.goal,
+            "acceptance": args.acceptance,
+            "complexity": complexity,
+            "task_project_id": args.task_project,
+            "manual_test_required": args.manual_test,
+        }
+        if args.no_task_provider or args.task_provider:
+            requirement_id = store.create(
+                args.title,
+                task_provider=None if args.no_task_provider else str(args.task_provider),
+                **create_options,
+            )
+        else:
+            requirement_id = store.create(args.title, **create_options)
         visibility = AutomationRuntime(store, agent_provider).sync_taskboard_visibility()
         suffix = "\n面板同步待重试：" + "；".join(visibility) if visibility else ""
         return f"已创建 {requirement_id}{suffix}"
@@ -286,43 +287,44 @@ def run(args: argparse.Namespace) -> str:
         )
         return f"已交接 {args.requirement_id.upper()}"
     if args.command == "finalize":
-        result = AutomationRuntime(store, agent_provider).finalize(
+        finalize_result = AutomationRuntime(store, agent_provider).finalize(
             args.requirement_id,
             completed=args.completed,
             current_state=args.current_state,
             important_context=args.important_context,
             next_action=(args.next_action or "提交并推送后由 Stop Hook 自动归档 Thread。"),
         )
-        if not result.passed:
-            details = "\n".join(f"- {item}" for item in result.blockers)
+        if not finalize_result.passed:
+            details = "\n".join(f"- {item}" for item in finalize_result.blockers)
             raise WorkspaceError(
                 f"自动收尾受阻，已保存 checkpoint：{args.requirement_id.upper()}\n"
-                f"{result.verification}\n阻塞项：\n{details}"
+                f"{finalize_result.verification}\n阻塞项：\n{details}"
             )
         requirement_status = (
             "done（验证通过后自动完成）"
-            if result.requirement_completed
+            if finalize_result.requirement_completed
             else "in_review（等待明确要求的人工测试）"
-            if result.requirement_in_review
+            if finalize_result.requirement_in_review
             else "等待审查门禁"
         )
         return (
             f"已完成自动收尾：{args.requirement_id.upper()}\n"
-            f"Task：{', '.join(result.task_ids) or '无外部 Task'}\n"
+            f"Task：{', '.join(finalize_result.task_ids) or '无外部 Task'}\n"
             f"Requirement：{requirement_status}\n"
-            f"Requirement Review Task：{result.review_task_id or '未配置'}\n"
-            f"{result.verification}"
+            f"Requirement Review Task：{finalize_result.review_task_id or '未配置'}\n"
+            f"{finalize_result.verification}"
         )
     if args.command == "review":
-        result = AutomationRuntime(store, agent_provider).review(args.requirement_id)
-        if result.passed:
+        review_result = AutomationRuntime(store, agent_provider).review(args.requirement_id)
+        if review_result.passed:
             return (
-                f"意图审查：{result.intent_status}\n"
+                f"意图审查：{review_result.intent_status}\n"
                 f"可进入审查：{args.requirement_id.upper()} 已处于 in_review 状态"
             )
-        details = "\n".join(f"- {blocker}" for blocker in result.blockers)
+        details = "\n".join(f"- {blocker}" for blocker in review_result.blockers)
         raise WorkspaceError(
-            f"意图审查：{result.intent_status}\n审查受阻：{args.requirement_id.upper()}\n{details}"
+            f"意图审查：{review_result.intent_status}\n"
+            f"审查受阻：{args.requirement_id.upper()}\n{details}"
         )
     if args.command == "confirm":
         AutomationRuntime(store, agent_provider).confirm(

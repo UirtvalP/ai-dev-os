@@ -6,9 +6,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from workspace_orchestrator.adapters.base import TaskProvider
+from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.adapters.git import GitError, LocalGitProvider
-from workspace_orchestrator.adapters.task import TaskProviderError
+from workspace_orchestrator.models import Task
 
 
 def git_root(
@@ -36,10 +36,16 @@ def collect_git_context(
     try:
         provider = LocalGitProvider(root)
         status = provider.push_status()
+        raw_changes = status.get("changes", ())
+        changes = (
+            tuple(str(item) for item in raw_changes)
+            if isinstance(raw_changes, (list, tuple))
+            else ()
+        )
         return {
             **status,
             "worktree": bound_worktree or status["worktree"],
-            "status": "\n".join(status["changes"]),
+            "status": "\n".join(changes),
             "commits": provider.recent_commits(3),
             "changed_files": provider.changed_files(),
             "diff": provider.diff(),
@@ -59,19 +65,19 @@ def collect_git_context(
 def sync_task_git_context(
     task_provider: TaskProvider | None,
     task_ids: Sequence[str],
-    tasks: Sequence[object],
+    tasks: Sequence[Task],
     git: dict[str, Any],
 ) -> None:
     """仅在外部 Task 的 Git 绑定确有差异时写入。"""
 
     if task_provider is None or not git.get("branch"):
         return
-    by_id = {getattr(task, "id", None): task for task in tasks}
+    by_id = {task.id: task for task in tasks}
     for task_id in dict.fromkeys(task_ids):
         task = by_id.get(task_id)
         if task and (
-            getattr(task, "branch", None) == git.get("branch")
-            and getattr(task, "worktree", None) == git.get("worktree")
+            task.branch == git.get("branch")
+            and task.worktree == git.get("worktree")
         ):
             continue
         try:

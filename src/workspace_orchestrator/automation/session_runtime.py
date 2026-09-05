@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider
-from workspace_orchestrator.adapters.task import TaskProviderError
+from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 

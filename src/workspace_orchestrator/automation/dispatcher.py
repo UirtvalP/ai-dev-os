@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from workspace_orchestrator.adapters.agent import CodexExecProvider, CodexExecutionResult
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
@@ -75,7 +75,7 @@ def _write_state(store: WorkspaceStore, state: dict[str, Any]) -> None:
     store.write_json(_state_path(store), state)
 
 
-def _pid_alive(pid: object) -> bool:
+def _pid_alive(pid: object) -> TypeGuard[int]:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if os.name == "nt":
@@ -457,7 +457,7 @@ def start_dispatcher(store: WorkspaceStore, *, explicit: bool = False) -> dict[s
     )
     creationflags = 0
     popen_options: dict[str, Any] = {"start_new_session": True}
-    if os.name == "nt":
+    if sys.platform == "win32":
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.DETACHED_PROCESS
@@ -505,11 +505,13 @@ def stop_dispatcher(store: WorkspaceStore) -> dict[str, Any]:
             state.update(pid=None, status="stopped", stopped_at=now_iso())
             _write_state(store, state)
             return dispatcher_status(store)
+        if not isinstance(pid, int):
+            raise WorkspaceError("Dispatcher PID 状态无效；已拒绝发送停止信号")
         state.update(status="stopping", stop_requested_at=now_iso())
         _write_state(store, state)
 
     try:
-        os.kill(int(pid), signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
     deadline = time.monotonic() + 5.0

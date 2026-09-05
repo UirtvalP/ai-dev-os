@@ -156,13 +156,13 @@ def request_cancel(store: WorkspaceStore, task_id: str) -> dict[str, Any]:
 
     with store.locked():
         state = _read_state(store)
-        tasks = dict(state.get("tasks") or {})
-        runtime = dict(tasks.get(key) or {})
+        task_states = dict(state.get("tasks") or {})
+        runtime = dict(task_states.get(key) or {})
         if runtime.get("result") in {"dispatching", "running"} or task.binding_session_id:
             raise WorkspaceError(
                 f"Task {task.id} 的 Worker 已运行；V1 只能取消尚未启动的 queued Task"
             )
-        tasks[key] = {
+        task_states[key] = {
             **runtime,
             "task_id": task.id,
             "raw_id": task.raw_id,
@@ -170,6 +170,6 @@ def request_cancel(store: WorkspaceStore, task_id: str) -> dict[str, Any]:
             "result": "cancel_requested",
             "cancel_requested_at": now_iso(),
         }
-        state["tasks"] = tasks
+        state["tasks"] = task_states
         _write_state(store, state)
     return {"status": "cancel_requested", "task_id": task.id}

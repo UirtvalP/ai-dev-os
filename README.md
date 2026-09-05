@@ -43,6 +43,7 @@ templates/workspace/          人类可读的 Workspace 文件模板
 skills/workspace-orchestrator Codex 工作流 Skill
 tests/                        核心生命周期测试
 V1架构.md                     完整 V1 架构与验收标准
+V2实施主计划.md               V2 多 Agent 软件交付操作系统的阶段门禁与实施计划
 参考项目边界.md               可借鉴抽象与禁止复制的边界
 ROADMAP.md                    第一版实施路线图
 ```

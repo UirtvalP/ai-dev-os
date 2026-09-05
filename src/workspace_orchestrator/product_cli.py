@@ -168,7 +168,7 @@ def _format_project(project: RegisteredProject) -> str:
 def run(args: argparse.Namespace) -> str:
     if args.command == "init":
         result = initialize_project(args.path)
-        registry = _sync_registry_after_local_success(result.root, action="接入")
+        registry_message = _sync_registry_after_local_success(result.root, action="接入")
         status = start_dispatcher(
             WorkspaceStore(result.root, execution_root=result.root)
         )
@@ -177,21 +177,21 @@ def run(args: argparse.Namespace) -> str:
             if status.get("running") or status.get("status") == "starting"
             else f"\nDispatcher：{status.get('status', '未启动')}。"
         )
-        return _format_result(result, action="已接入") + f"\n{registry}" + suffix
+        return _format_result(result, action="已接入") + f"\n{registry_message}" + suffix
     if args.command == "upgrade":
         return _format_upgrade_result(UvToolInstaller().upgrade(args.source))
     if args.command == "migrate":
         result = migrate_project(args.path)
-        registry = _sync_registry_after_local_success(result.root, action="迁移")
-        return _format_result(result, action="项目格式已迁移") + f"\n{registry}"
+        registry_message = _sync_registry_after_local_success(result.root, action="迁移")
+        return _format_result(result, action="项目格式已迁移") + f"\n{registry_message}"
     if args.command == "project":
-        registry = GlobalProjectRegistry()
+        project_registry = GlobalProjectRegistry()
         if args.project_command == "list":
-            return _format_project_list(registry.list())
+            return _format_project_list(project_registry.list())
         if args.project_command == "show":
-            return _format_project(registry.show(args.project_id))
+            return _format_project(project_registry.show(args.project_id))
         if args.project_command == "unregister":
-            project = registry.unregister(args.project_id)
+            project = project_registry.unregister(args.project_id)
             return (
                 f"已取消全局登记：{project.id}（{project.name}）\n"
                 "项目文件、.workspace、Git 与 dashi Task 均未删除。"
