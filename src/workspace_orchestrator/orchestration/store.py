@@ -207,8 +207,9 @@ class OrchestrationStore:
             info = path.lstat()
         except FileNotFoundError:
             return
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or getattr(info, "st_file_attributes", 0) & 0x400):
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise OrchestrationStoreError(f"Supervisor 文件不能使用重定向路径：{path.name}")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise OrchestrationStoreError(f"Supervisor 文件必须是独立普通文件：{path.name}")
 
     def _read(self) -> dict[str, Any]:

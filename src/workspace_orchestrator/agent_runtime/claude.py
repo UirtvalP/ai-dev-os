@@ -459,7 +459,9 @@ class ClaudeCliRuntime:
         return self._failure("unsupported", "权限请求已默认拒绝，不接受迟到的授权回复")
 
     def close(self) -> None:
-        self._closed = True
-        if self._client:
-            self._client.close()
-        self._close_discovery()
+        # 关闭和发现/启动必须串行；清理异常仍保留引用，后续 close 可重试。
+        with self._discovery_lock:
+            self._closed = True
+            if self._client:
+                self._client.close()
+            self._close_discovery()

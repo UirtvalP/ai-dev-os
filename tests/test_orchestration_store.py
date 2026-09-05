@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -65,6 +67,20 @@ def test_epoch_guard_serializes_takeover_until_start_boundary_exits(tmp_path):
                 check()
             assert not future.done()
         assert future.result(timeout=5).fence == lease.fence + 1
+
+
+@pytest.mark.parametrize("mode,attributes", [(stat.S_IFLNK | 0o777, 0), (stat.S_IFREG | 0o600, 0x400)])
+def test_redirect_error_classification_without_platform_link_privileges(tmp_path, monkeypatch, mode, attributes):
+    store = OrchestrationStore(tmp_path / "control")
+    target = store.root / "state.lock"
+    original = Path.lstat
+    def observed(path):
+        if path == target:
+            return SimpleNamespace(st_mode=mode, st_nlink=1, st_file_attributes=attributes)
+        return original(path)
+    monkeypatch.setattr(Path, "lstat", observed)
+    with pytest.raises(OrchestrationStoreError, match="重定向"):
+        store._check_file(target)
 
 
 def _state_path(root: Path) -> Path:

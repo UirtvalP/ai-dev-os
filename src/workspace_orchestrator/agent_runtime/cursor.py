@@ -445,7 +445,9 @@ class CursorAcpRuntime:
         return self._failure("unsupported", "权限请求已默认拒绝，不接受迟到的授权回复")
 
     def close(self) -> None:
-        self._closed = True
-        if self._client:
-            self._client.close()
-        self._close_discovery()
+        # 与 describe/start 共用可重入锁，不能在探测连接启动前清除其回收拥有者。
+        with self._discovery_lock:
+            self._closed = True
+            if self._client:
+                self._client.close()
+            self._close_discovery()

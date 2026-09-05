@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -260,3 +261,68 @@ def test_closed_adapter_describe_does_not_start_discovery(name):
     runtime = adapter(name, clients, [])
     runtime.close()
     assert not runtime.describe().available and clients == []
+
+
+@pytest.mark.parametrize("name", ["cursor", "claude"])
+def test_concurrent_close_waits_for_discovery_and_reaps_fixture(monkeypatch, name):
+    clients: list[RecordingClient] = []
+    runtime = adapter(name, clients, [])
+    module = sys.modules[type(runtime).__module__]
+    temporary_directory = module.TemporaryDirectory
+    discovery_paused = threading.Event()
+    continue_discovery = threading.Event()
+    close_started = threading.Event()
+    close_returned = threading.Event()
+    failures: list[BaseException] = []
+
+    def paused_directory(*args, **kwargs):
+        # _discover 已登记 probe，但尚未分配目录或启动子进程。
+        discovery_paused.set()
+        assert continue_discovery.wait(5), "test did not release discovery"
+        return temporary_directory(*args, **kwargs)
+
+    def discover():
+        try:
+            runtime.describe()
+        except BaseException as error:  # noqa: BLE001 -- 把线程异常传回测试主线程断言。
+            failures.append(error)
+
+    def close():
+        close_started.set()
+        try:
+            runtime.close()
+            close_returned.set()
+        except BaseException as error:  # noqa: BLE001 -- 把线程异常传回测试主线程断言。
+            failures.append(error)
+
+    monkeypatch.setattr(module, "TemporaryDirectory", paused_directory)
+    discovery_thread = threading.Thread(target=discover, daemon=True)
+    close_thread = threading.Thread(target=close, daemon=True)
+    try:
+        discovery_thread.start()
+        assert discovery_paused.wait(5)
+        owner = runtime._discovery
+        assert owner is not None and clients == []
+        close_thread.start()
+        assert close_started.wait(5)
+        # 旧实现此处提前返回并清空 owner，放行后 fixture 进程便失去回收者。
+        assert not close_returned.wait(0.1)
+        assert runtime._discovery is owner
+        continue_discovery.set()
+        discovery_thread.join(timeout=5)
+        close_thread.join(timeout=5)
+        assert not discovery_thread.is_alive() and not close_thread.is_alive()
+        assert close_returned.is_set() and failures == []
+        assert runtime._closed and runtime._discovery is None and runtime._discovery_root is None
+        assert len(clients) == 1
+        assert_discovery_only(name, clients[0])
+        assert not runtime.describe().available and len(clients) == 1
+    finally:
+        continue_discovery.set()
+        discovery_thread.join(timeout=5)
+        if close_thread.ident is not None:
+            close_thread.join(timeout=5)
+        runtime.close()
+        # 测试即使在有竞态的旧实现上失败，也不遗留无拥有者的 fixture。
+        for client in clients:
+            client.close()
