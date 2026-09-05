@@ -27,12 +27,34 @@ from pathlib import Path
 from typing import Any
 
 
+def _require_windows(message: str) -> None:
+    """运行时平台检查独立于类型检查器的静态平台分支。"""
+    if sys.platform != "win32":
+        raise WorkerIsolationError("platform_unavailable", message)
+
+
+def _open_pipe_handle(handle: int, mode: int) -> int:
+    """只有 Windows 分支引用 msvcrt/二进制描述符常量。"""
+    if sys.platform == "win32":
+        import msvcrt
+
+        return msvcrt.open_osfhandle(handle, mode | os.O_BINARY)
+    raise WorkerIsolationError("platform_unavailable", "Windows 管道描述符仅支持 Windows")
+
+
+def _windows_library(name: str) -> Any:
+    if sys.platform == "win32":
+        import ctypes
+
+        return ctypes.WinDLL(name, use_last_error=True)
+    raise WorkerIsolationError("platform_unavailable", "Windows 动态库仅支持 Windows")
+
+
 @lru_cache(maxsize=1)
 def _win32() -> Any:
     """绑定稳定公开的 Win32 API；不调用 Codex setup 或实验性 SandboxEngine。"""
 
-    if sys.platform != "win32":
-        raise WorkerIsolationError("platform_unavailable", "AppContainer 仅支持 Windows")
+    _require_windows("AppContainer 仅支持 Windows")
     import ctypes
     from ctypes import wintypes as wt
     from types import SimpleNamespace
@@ -88,12 +110,11 @@ def _win32() -> Any:
             ("Reserved", wt.DWORD),
         ]
 
-    dll = ctypes.WinDLL
     kernel, userenv, advapi = (
-        dll(name, use_last_error=True) for name in ("kernel32", "userenv", "advapi32")
+        _windows_library(name) for name in ("kernel32", "userenv", "advapi32")
     )
-    kernelbase = dll("kernelbase", use_last_error=True)
-    ole32 = dll("ole32", use_last_error=True)
+    kernelbase = _windows_library("kernelbase")
+    ole32 = _windows_library("ole32")
     void = ctypes.c_void_p
     signatures = (
         (
@@ -306,8 +327,7 @@ def stage_python_runtime(task_root: Path) -> Path:
     对上千个测试文件授予/回收 ACL；不包含 site-packages、凭据或用户配置。
     """
 
-    if sys.platform != "win32":
-        raise WorkerIsolationError("platform_unavailable", "原生 Python staging 仅支持 Windows")
+    _require_windows("原生 Python staging 仅支持 Windows")
     task = _physical_path(task_root)
     # 当前解释器安装可能由 uv 通过 junction 暴露；先解析真实只读源，再检查域交叠。
     source = _physical_path(Path(sys.base_prefix).resolve(strict=True))
@@ -680,11 +700,9 @@ class AppContainerProcess:
                 parent_handles.append(int(parent))
                 if not api.kernel.SetHandleInformation(parent, 1, 0):
                     raise OSError(c.get_last_error(), "禁止继承控制面管道失败")
-            import msvcrt
-
             for index, handle in enumerate(tuple(parent_handles)):
                 mode = os.O_WRONLY if index == 0 else os.O_RDONLY
-                descriptor = msvcrt.open_osfhandle(handle, mode | os.O_BINARY)
+                descriptor = _open_pipe_handle(handle, mode)
                 binary_stream = os.fdopen(descriptor, "wb" if index == 0 else "rb", buffering=0)
                 stream = io.TextIOWrapper(
                     binary_stream, encoding="utf-8", newline="", write_through=True

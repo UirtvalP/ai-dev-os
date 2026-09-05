@@ -26,6 +26,22 @@ from workspace_orchestrator.orchestration.isolation import (
 WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="真实 Windows LPAC 测试")
 
 
+def test_windows_api_helpers_reject_other_platforms_before_attribute_access(monkeypatch):
+    from types import SimpleNamespace
+
+    from workspace_orchestrator.orchestration import isolation
+
+    monkeypatch.setattr(isolation, "sys", SimpleNamespace(platform="linux"))
+    for function, arguments in (
+        (isolation._require_windows, ("Windows only",)),
+        (isolation._windows_library, ("kernel32",)),
+        (isolation._open_pipe_handle, (0, 0)),
+    ):
+        with pytest.raises(isolation.WorkerIsolationError) as caught:
+            function(*arguments)
+        assert caught.value.code == "platform_unavailable"
+
+
 def _spec(tmp_path: Path) -> tuple[WorkerIsolationSpec, Path]:
     for name in ("task", "protected", "controller", "tools"):
         (tmp_path / name).mkdir()
