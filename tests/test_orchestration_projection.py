@@ -81,7 +81,8 @@ def snapshot(revision: int, node_revision: int, status: str) -> dict[str, Any]:
 
 def projection(tmp_path: Path, provider: FakeProvider, **kwargs: Any) -> TaskProjection:
     return TaskProjection(OrchestrationStore(tmp_path / "projection"), cast(TaskProvider, provider),
-                          kwargs.get("bindings", {"T1": "P1"}))
+                          kwargs.get("bindings", {"T1": "P1"}),
+                          ownership_check=kwargs.get("ownership_check", lambda *args: None))
 
 
 def test_offline_local_source_advances_and_recovery_writes_only_latest_target(tmp_path: Path) -> None:

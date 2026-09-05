@@ -12,6 +12,8 @@ import os
 import shutil
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
@@ -68,18 +70,77 @@ class CursorAcpRuntime:
         self._models: tuple[ModelDescriptor, ...] = ()
         self._version = "未协商"
         self._closed = False
+        self._discovery_attempted = False
+        self._discovery_error: str | None = None
+        self._discovery: CursorAcpRuntime | None = None
+        self._discovery_root: TemporaryDirectory[str] | None = None
+        self._discovery_lock = threading.RLock()
 
     def describe(self) -> RuntimeDescriptor:
-        available = bool(self.command and shutil.which(self.command[0]))
-        capabilities = ["start", "message", "interrupt", "events", "profile:read-only"]
+        installed = self._installed()
+        with self._discovery_lock:
+            if installed and not self._closed and self._client is None and not self._discovery_attempted:
+                self._discover()
+        available = installed and not self._closed and bool(self._models) and self._discovery is None
+        capabilities = ["start", "message", "interrupt", "events", "models", "profile:read-only"]
         if self._capabilities.get("loadSession") is True:
             capabilities.append("resume")
+        reason = "仅支持 ACP ask 只读模式和权限拒绝，不提供 OS 级读隔离"
+        if not installed:
+            reason = "未找到 Cursor Agent CLI；未安装或未配置可执行路径"
+        elif not available:
+            reason = self._discovery_error or "Cursor 已关闭或未报告可用模型"
         return RuntimeDescriptor(
             self.runtime_id, "Cursor ACP", self._version, available,
-            tuple(capabilities), self._models,
-            "仅支持 ACP ask 只读模式和权限拒绝，不提供 OS 级读隔离" if available
-            else "未找到 Cursor Agent CLI；未安装或未配置可执行路径",
+            tuple(capabilities), self._models if available else (), reason,
         )
+
+    def _installed(self) -> bool:
+        return bool(self.command and shutil.which(self.command[0]))
+
+    def _close_discovery(self) -> None:
+        # 关闭失败仍保留拥有者，禁止描述成功或另起实际 Worker；close() 可以重试清理。
+        if self._discovery is not None:
+            self._discovery.close()
+        if self._discovery_root is not None:
+            self._discovery_root.cleanup()
+        self._discovery = None
+        self._discovery_root = None
+
+    def _discover(self) -> None:
+        """ACP 的模型配置在 session/new 返回；独立会话不发送任何 prompt。
+
+        https://agentclientprotocol.com/protocol/v1/session-config-options
+        """
+        self._discovery_attempted = True
+        probe = CursorAcpRuntime(
+            self.command, environ=self.environ, timeout_seconds=self.timeout_seconds,
+            client_factory=self.client_factory,
+        )
+        self._discovery = probe
+        try:
+            self._discovery_root = TemporaryDirectory(prefix="ai-dev-os-cursor-discovery-")
+            try:
+                root = Path(self._discovery_root.name)
+                failed = probe._connect(root)
+                if failed:
+                    assert failed.error
+                    raise RpcTransportError(failed.error.code, failed.error.message)
+                result = probe._connection().request(
+                    "session/new", {"cwd": str(root.resolve()), "mcpServers": []},
+                    timeout=self.timeout_seconds,
+                )
+                if not isinstance(result.get("sessionId"), str) or not result["sessionId"]:
+                    raise RpcTransportError("protocol_error", "Cursor 发现未返回有效 sessionId")
+                probe._update_models(result)
+                if not probe._models:
+                    raise RpcTransportError("protocol_error", "Cursor 发现未报告可用模型")
+            finally:
+                self._close_discovery()
+            self._models, self._version = probe._models, probe._version
+            self._capabilities = probe._capabilities
+        except Exception as exc:  # noqa: BLE001 -- 探测失败不能阻断其他 Runtime 发现或伪造能力。
+            self._discovery_error = f"Cursor 模型发现失败：{exc}"
 
     def _failure(self, code: str, message: str, **details: Any) -> RuntimeOperationResult:
         status: OperationStatus = "unsupported" if code == "unsupported" else (
@@ -106,12 +167,13 @@ class CursorAcpRuntime:
                 turn_id=turn_id,
             ))
 
-    def _connect(self, request: AgentRunRequest) -> RuntimeOperationResult | None:
-        if not self.describe().available:
+    def _connect(self, workspace_path: Path) -> RuntimeOperationResult | None:
+        if not self._installed():
             return self._failure("unavailable", "未找到 Cursor Agent CLI")
-        self._request = request
+        # 实际连接必须重新协商，不能使用发现连接的模型/配置作为本次会话事实。
+        self._models, self._config, self._capabilities = (), [], {}
         self._client = self.client_factory(
-            self.command, cwd=request.workspace_path, environ=self.environ,
+            self.command, cwd=workspace_path, environ=self.environ,
             jsonrpc=True, on_notification=self._notification,
             on_server_request=self._server_request,
         )
@@ -142,17 +204,19 @@ class CursorAcpRuntime:
         return self._client
 
     def start(self, request: AgentRunRequest) -> RuntimeOperationResult:
-        return self._open(request, resumed=False)
+        with self._discovery_lock:
+            return self._open(request, resumed=False)
 
     def resume(self, request: AgentRunRequest) -> RuntimeOperationResult:
         if not request.resume_session_id:
             return self._failure("invalid_request", "恢复 Cursor Session 必须提供 session_id")
-        return self._open(request, resumed=True)
+        with self._discovery_lock:
+            return self._open(request, resumed=True)
 
     def _open(self, request: AgentRunRequest, *, resumed: bool) -> RuntimeOperationResult:
-        if self._closed or self._client is not None:
+        if self._closed or self._client is not None or self._discovery is not None:
             return self._failure("invalid_state", "该 Runtime 已启动或已关闭，请使用独立实例")
-        if not self.describe().available:
+        if not self._installed():
             return self._failure("unavailable", "未找到 Cursor Agent CLI")
         if request.bypass_hook_trust:
             return self._failure("unsupported", "Cursor ACP 不支持绕过 Hook 信任")
@@ -162,7 +226,8 @@ class CursorAcpRuntime:
             return self._failure("unsupported", "Cursor ACP 不能提供所请求的 OS sandbox",
                                  sandbox=request.sandbox)
         try:
-            failed = self._connect(request)
+            self._request = request
+            failed = self._connect(request.workspace_path)
             if failed:
                 self.close()
                 return failed
@@ -224,6 +289,8 @@ class CursorAcpRuntime:
                 continue
             for option in item.get("options", []):
                 if isinstance(option, dict) and isinstance(option.get("value"), str):
+                    if not option["value"].strip() or any(model.id == option["value"] for model in models):
+                        raise RpcTransportError("protocol_error", "Cursor 模型 ID 为空或重复")
                     models.append(ModelDescriptor(
                         option["value"], str(option.get("name", option["value"])),
                         is_default=option["value"] == item.get("currentValue"), metadata=option,
@@ -381,3 +448,4 @@ class CursorAcpRuntime:
         self._closed = True
         if self._client:
             self._client.close()
+        self._close_discovery()

@@ -13,6 +13,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
@@ -20,6 +21,7 @@ from typing import IO, Any, Protocol, Self, cast
 
 JsonObject = dict[str, Any]
 MessageHandler = Callable[[JsonObject], None]
+StartGuard = Callable[[], AbstractContextManager[Callable[[], None]]]
 
 
 class RuntimeProcess(Protocol):
@@ -157,7 +159,7 @@ class _Pending:
 class _ProcessTree:
     """POSIX 独立进程组；Windows 先纳入 Job 再恢复挂起的新进程。"""
 
-    def __init__(self, process: RuntimeProcess) -> None:
+    def __init__(self, process: RuntimeProcess, before_resume: Callable[[], None] | None = None) -> None:
         self.process = process
         self._job: Any = None
         self._kernel: Any = None
@@ -176,6 +178,7 @@ class _ProcessTree:
                     raise OSError(ctypes.get_last_error(), "无法设置 Runtime Job 关闭回收策略")
                 if not kernel.AssignProcessToJobObject(job, int(cast(Any, process)._handle)):
                     raise OSError(ctypes.get_last_error(), "无法隔离 Runtime 进程树")
+                self._before_resume = before_resume
                 self._resume_suspended()
             except BaseException:
                 self.kill()
@@ -221,6 +224,8 @@ class _ProcessTree:
             try:
                 if kernel.GetProcessIdOfThread(thread) != self.process.pid:
                     raise OSError("Runtime 初始线程归属发生变化")
+                if self._before_resume is not None:
+                    self._before_resume()
                 if kernel.ResumeThread(thread) != 1:
                     raise OSError(ctypes.get_last_error(), "无法安全恢复 Runtime 初始线程")
             finally:
@@ -230,24 +235,24 @@ class _ProcessTree:
         if sys.platform == "win32":
             if self._job is not None:
                 job = self._job
-                try:
-                    if not self._kernel.TerminateJobObject(job, 1):
-                        raise OSError(ctypes.get_last_error(), "无法确认 Runtime 进程树终止")
-                    deadline = time.monotonic() + 5
-                    while True:
-                        accounting = _JobAccounting()
-                        if not self._kernel.QueryInformationJobObject(
-                            job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
-                        ):
-                            raise OSError(ctypes.get_last_error(), "无法确认 Runtime Job 已清空")
-                        if accounting.ActiveProcesses == 0:
-                            break
-                        if time.monotonic() >= deadline:
-                            raise OSError("Runtime Job 子进程仍未全部终止")
-                        time.sleep(0.01)
-                finally:
-                    self._kernel.CloseHandle(job)
-                    self._job = None
+                # 失败保留 Job 句柄以便重试并确认整棵树为空，不能把失败变成幂等成功。
+                if not self._kernel.TerminateJobObject(job, 1):
+                    raise OSError(ctypes.get_last_error(), "无法确认 Runtime 进程树终止")
+                deadline = time.monotonic() + 5
+                while True:
+                    accounting = _JobAccounting()
+                    if not self._kernel.QueryInformationJobObject(
+                        job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+                    ):
+                        raise OSError(ctypes.get_last_error(), "无法确认 Runtime Job 已清空")
+                    if accounting.ActiveProcesses == 0:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise OSError("Runtime Job 子进程仍未全部终止")
+                    time.sleep(0.01)
+                if not self._kernel.CloseHandle(job):
+                    raise OSError(ctypes.get_last_error(), "无法释放已清空的 Runtime Job")
+                self._job = None
         else:
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
@@ -275,6 +280,7 @@ class JsonRpcStdioClient:
         on_message: MessageHandler | None = None,
         on_error: Callable[[RpcTransportError], None] | None = None,
         process_factory: ProcessFactory | None = None,
+        start_guard: StartGuard | None = None,
     ) -> None:
         if not command:
             raise ValueError("Runtime 命令不能为空")
@@ -288,6 +294,7 @@ class JsonRpcStdioClient:
         self.on_message = on_message
         self.on_error = on_error
         self.process_factory = process_factory
+        self.start_guard = start_guard
         self._process: RuntimeProcess | None = None
         self._tree: _ProcessTree | None = None
         self._reader: threading.Thread | None = None
@@ -301,6 +308,7 @@ class JsonRpcStdioClient:
         self._next_id = 0
         self._failure: RpcTransportError | None = None
         self._closed = False
+        self._cleanup_complete = False
         self._stderr: deque[str] = deque(maxlen=128)
 
     @property
@@ -316,11 +324,22 @@ class JsonRpcStdioClient:
         return self._failure
 
     @property
+    def cleanup_complete(self) -> bool:
+        """仅在整棵进程树终止且额外资源全部回收后为真，与连接已关闭不同。"""
+        return self._cleanup_complete
+
+    @property
     def stderr_tail(self) -> str:
         with self._lock:
             return "".join(self._stderr)
 
     def start(self) -> None:
+        # 授权锁覆盖进程创建、Job 分配及 ResumeThread；续租/接管不能与启动交错。
+        guard = self.start_guard() if self.start_guard else nullcontext(lambda: None)
+        with guard as check:
+            self._start_guarded(check)
+
+    def _start_guarded(self, check: Callable[[], None]) -> None:
         with self._lock:
             if self._closed:
                 raise RpcTransportError("closed", "Runtime 连接已关闭")
@@ -337,6 +356,7 @@ class JsonRpcStdioClient:
                     creationflags = 0
                     executable = self.command[0]
                 process: RuntimeProcess
+                check()
                 if self.process_factory is None:
                     process = subprocess.Popen(
                         (executable, *self.command[1:]),
@@ -358,7 +378,8 @@ class JsonRpcStdioClient:
                     raise OSError("隔离 Launcher 必须创建独立进程组")
                 if any(stream is None for stream in (process.stdin, process.stdout, process.stderr)):
                     raise OSError("隔离 Launcher 必须提供完整 UTF-8 文本管道")
-                self._tree = _ProcessTree(process)
+                self._tree = (_ProcessTree(process, before_resume=check) if self.start_guard
+                              else _ProcessTree(process))
             except BaseException as exc:
                 if self._process is not None:
                     if self._tree is not None:
@@ -532,7 +553,7 @@ class JsonRpcStdioClient:
     def close(self) -> None:
         with self._close_lock:
             with self._lock:
-                if self._closed:
+                if self._cleanup_complete:
                     return
                 self._closed = True
             self._fail(RpcTransportError("closed", "Runtime 连接已关闭"))
@@ -542,6 +563,7 @@ class JsonRpcStdioClient:
                 pass  # 进程树终止会打断阻塞的 writer。
             process = self._process
             if process is None:
+                self._cleanup_complete = True
                 return
             # 先回收整棵树，再关闭 reader 管道，避免后代持有句柄导致 close 永久阻塞。
             if self._tree:
@@ -556,6 +578,7 @@ class JsonRpcStdioClient:
                 if stream:
                     stream.close()
             _close_process_resources(process)
+            self._cleanup_complete = True
 
     def __enter__(self) -> Self:
         self.start()

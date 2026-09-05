@@ -13,6 +13,8 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
@@ -70,15 +72,62 @@ class ClaudeCliRuntime:
         self._version = "未协商"
         self._closed = False
         self._initialized = False
+        self._discovery_attempted = False
+        self._discovery_error: str | None = None
+        self._discovery: ClaudeCliRuntime | None = None
+        self._discovery_root: TemporaryDirectory[str] | None = None
+        self._discovery_lock = threading.RLock()
 
     def describe(self) -> RuntimeDescriptor:
-        available = bool(self.command and shutil.which(self.command[0]))
+        installed = self._installed()
+        with self._discovery_lock:
+            if installed and not self._closed and self._client is None and not self._discovery_attempted:
+                self._discover()
+        available = installed and not self._closed and bool(self._models) and self._discovery is None
+        reason = "仅 Read/Grep/Glob 工具与默认拒绝；不提供 OS 级读隔离"
+        if not installed:
+            reason = "未找到 Claude CLI；未安装或未配置可执行路径"
+        elif not available:
+            reason = self._discovery_error or "Claude 已关闭或未报告可用模型"
         return RuntimeDescriptor(
             self.runtime_id, "Claude CLI", self._version, available,
-            ("start", "resume", "message", "interrupt", "events", "profile:read-only"), self._models,
-            "仅 Read/Grep/Glob 工具与默认拒绝；不提供 OS 级读隔离" if available
-            else "未找到 Claude CLI；未安装或未配置可执行路径",
+            ("start", "resume", "message", "interrupt", "events", "models", "profile:read-only"),
+            self._models if available else (), reason,
         )
+
+    def _installed(self) -> bool:
+        return bool(self.command and shutil.which(self.command[0]))
+
+    def _close_discovery(self) -> None:
+        if self._discovery is not None:
+            self._discovery.close()
+        if self._discovery_root is not None:
+            self._discovery_root.cleanup()
+        self._discovery = None
+        self._discovery_root = None
+
+    def _discover(self) -> None:
+        """SDK initialize 控制响应提供 models，无需 user 消息或 LLM 轮次。
+
+        协议来源：anthropics/claude-agent-sdk-python 的 _internal/query.py。
+        """
+        self._discovery_attempted = True
+        probe = ClaudeCliRuntime(
+            self.command, environ=self.environ, timeout_seconds=self.timeout_seconds,
+            client_factory=self.client_factory,
+        )
+        self._discovery = probe
+        try:
+            self._discovery_root = TemporaryDirectory(prefix="ai-dev-os-claude-discovery-")
+            try:
+                probe._connect(Path(self._discovery_root.name), session_id=str(uuid4()), discovery=True)
+                if not probe._models:
+                    raise RpcTransportError("protocol_error", "Claude 发现未报告可用模型")
+            finally:
+                self._close_discovery()
+            self._models, self._version = probe._models, probe._version
+        except Exception as exc:  # noqa: BLE001 -- 探测失败返回不可用，不伪造模型或影响其他 Runtime。
+            self._discovery_error = f"Claude 模型发现失败：{exc}"
 
     def _failure(self, code: str, message: str, **details: Any) -> RuntimeOperationResult:
         status: OperationStatus = "unsupported" if code == "unsupported" else (
@@ -132,17 +181,48 @@ class ClaudeCliRuntime:
                 self._controls.pop(request_id, None)
 
     def start(self, request: AgentRunRequest) -> RuntimeOperationResult:
-        return self._open(request, resumed=False)
+        with self._discovery_lock:
+            return self._open(request, resumed=False)
 
     def resume(self, request: AgentRunRequest) -> RuntimeOperationResult:
         if not request.resume_session_id:
             return self._failure("invalid_request", "恢复 Claude Session 必须提供 session_id")
-        return self._open(request, resumed=True)
+        with self._discovery_lock:
+            return self._open(request, resumed=True)
+
+    def _connect(
+        self, workspace_path: Path, *, session_id: str, resumed: bool = False,
+        model: str | None = None, discovery: bool = False,
+    ) -> dict[str, Any]:
+        self._expected_session = session_id
+        self._models = ()
+        command = [
+            *self.command, "--print", "--output-format", "stream-json", "--verbose",
+            "--input-format", "stream-json", "--include-partial-messages",
+            "--permission-mode", "plan", "--permission-prompt-tool", "stdio",
+            "--tools", "" if discovery else "Read,Grep,Glob", "--strict-mcp-config",
+            "--mcp-config", '{"mcpServers":{}}',
+            f"--resume={session_id}" if resumed else f"--session-id={session_id}",
+        ]
+        if discovery:
+            command.append("--no-session-persistence")
+        if model:
+            command.append(f"--model={model}")
+        self._client = self.client_factory(
+            command, cwd=workspace_path, environ=self.environ, raw_mode=True,
+            on_message=self._message, on_error=self._on_error,
+        )
+        self._client.start()
+        initialized = self._control({"subtype": "initialize", "hooks": None})
+        self._initialized = True
+        self._version = "未报告"  # 不能为发现版本而发送 user 消息以获取 system/init。
+        self._read_models(initialized)
+        return initialized
 
     def _open(self, request: AgentRunRequest, *, resumed: bool) -> RuntimeOperationResult:
-        if self._closed or self._client is not None:
+        if self._closed or self._client is not None or self._discovery is not None:
             return self._failure("invalid_state", "该 Runtime 已启动或已关闭，请使用独立实例")
-        if not self.describe().available:
+        if not self._installed():
             return self._failure("unavailable", "未找到 Claude CLI")
         if request.sandbox != "read-only":
             return self._failure("unsupported", "Claude CLI 不能提供所请求的 OS sandbox",
@@ -154,25 +234,12 @@ class ClaudeCliRuntime:
         if not request.prompt.strip():
             return self._failure("invalid_request", "消息不能为空")
         self._request = request
-        self._expected_session = str(request.resume_session_id) if resumed else str(uuid4())
-        command = [
-            *self.command, "--print", "--output-format", "stream-json", "--verbose",
-            "--input-format", "stream-json", "--include-partial-messages",
-            "--permission-mode", "plan", "--permission-prompt-tool", "stdio",
-            "--tools", "Read,Grep,Glob", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-            f"--resume={self._expected_session}" if resumed else f"--session-id={self._expected_session}",
-        ]
-        if request.model:
-            command.append(f"--model={request.model}")
-        self._client = self.client_factory(
-            command, cwd=request.workspace_path, environ=self.environ, raw_mode=True,
-            on_message=self._message, on_error=self._on_error,
-        )
         try:
-            self._client.start()
-            initialized = self._control({"subtype": "initialize", "hooks": None})
-            self._initialized = True
-            self._read_models(initialized)
+            initialized = self._connect(
+                request.workspace_path,
+                session_id=str(request.resume_session_id) if resumed else str(uuid4()),
+                resumed=resumed, model=request.model,
+            )
             if request.model and request.model not in {model.id for model in self._models}:
                 self.close()
                 return self._failure("unsupported", "Claude 未发现指定模型；未发送首轮消息",
@@ -200,9 +267,11 @@ class ClaudeCliRuntime:
         models = payload.get("models", [])
         if not isinstance(models, list):
             raise RpcTransportError("protocol_error", "Claude 模型列表必须是数组")
-        result = []
+        result: list[ModelDescriptor] = []
         for model in models:
             if isinstance(model, dict) and isinstance(model.get("value"), str):
+                if not model["value"].strip() or any(item.id == model["value"] for item in result):
+                    raise RpcTransportError("protocol_error", "Claude 模型 ID 为空或重复")
                 result.append(ModelDescriptor(
                     model["value"], str(model.get("displayName", model["value"])),
                     metadata=model,
@@ -393,3 +462,4 @@ class ClaudeCliRuntime:
         self._closed = True
         if self._client:
             self._client.close()
+        self._close_discovery()

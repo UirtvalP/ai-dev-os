@@ -16,6 +16,7 @@ from typing import Any, TypeGuard
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.agent_runtime.contracts import AgentRunResult
 from workspace_orchestrator.agent_runtime.ports import AgentExecutionPort
+from workspace_orchestrator.execution_ownership import ExecutionOwnership, ExecutionOwnershipError
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import (
@@ -260,6 +261,7 @@ class AutoDispatcher:
 
         GateStore(self.store).require_task_active(requirement_id, task.id)
         with self.store.locked():
+            ExecutionOwnership(self.store).require_v1(task)
             state = _read_state(self.store)
             tasks = dict(state.get("tasks") or {})
             current = dict(tasks.get(_task_key(task)) or {})
@@ -295,6 +297,10 @@ class AutoDispatcher:
             except TaskProviderError:
                 continue
             for task in tasks:
+                try:
+                    ExecutionOwnership(self.store).require_v1(task)
+                except ExecutionOwnershipError:
+                    continue
                 if (
                     task.status != "in_progress"
                     or is_requirement_review_task(task)
@@ -366,13 +372,15 @@ class AutoDispatcher:
     def run_once(self) -> str:
         try:
             candidate = self._candidate()
-        except PhaseGateError:
+        except (PhaseGateError, ExecutionOwnershipError):
             return "blocked"
         if candidate is None:
             return "idle"
         task = candidate.task
         try:
             claimed = self._claim(task, candidate.requirement_id)
+        except ExecutionOwnershipError:
+            return "blocked"
         except PhaseGateError as exc:
             refreshed = _block_task(
                 candidate.task_provider,
@@ -391,6 +399,10 @@ class AutoDispatcher:
             self._remember(refreshed, result="blocked", error=message)
             return "blocked"
 
+        try:
+            ExecutionOwnership(self.store).require_v1(task)
+        except ExecutionOwnershipError:
+            return "blocked"
         result = self.executor.execute(
             candidate.execution_path,
             _prompt(candidate),

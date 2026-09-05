@@ -10,7 +10,8 @@ import copy
 import math
 import re
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -62,6 +63,8 @@ class _ActiveAttempt:
     turn_id: str | None = None
     thread: threading.Thread | None = None
     transport: JsonRpcStdioClient | None = None
+    pending_result: WorkerObservation | None = None
+    persistence_error: str | None = None
 
 
 class RuntimeWorkerPort:
@@ -78,6 +81,7 @@ class RuntimeWorkerPort:
         launcher: IsolationLauncher, protected_roots: tuple[Path, ...],
         readonly_tools: tuple[Path, ...] = (), allow_network: bool = False,
         candidate_reader: Callable[[TaskSpec], tuple[str, str]] | None = None,
+        authority_guard: Callable[[int], AbstractContextManager[Callable[[], None]]] | None = None,
         timeout_seconds: float = 7200,
     ) -> None:
         if (not requirement_id.strip() or isinstance(timeout_seconds, bool)
@@ -92,6 +96,7 @@ class RuntimeWorkerPort:
         )))
         self.readonly_tools, self.allow_network = readonly_tools, allow_network
         self.candidate_reader, self.timeout_seconds = candidate_reader, timeout_seconds
+        self.authority_guard = authority_guard
         self.store = OrchestrationStore(self.root / "ledger")
         self.events = RuntimeEventStore(self.root / "events")
         self._owner = f"runtime-port-{uuid4()}"
@@ -118,7 +123,7 @@ class RuntimeWorkerPort:
         )
 
     def _mutate(self, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
-        with self._guard:
+        with self._guard, self.store.transaction():
             lease = self.store.acquire(self._owner, ttl_seconds=30)
             try:
                 result: dict[str, Any] = self.store.mutate(lease, change)["data"]
@@ -215,6 +220,12 @@ class RuntimeWorkerPort:
         if record is None:
             raise PolicyError("attempt_missing", "尝试不在可信执行账本中")
         observation = WorkerObservation.from_dict(record["observation"])
+        active = self._active.get(attempt_id)
+        if active is not None and active.persistence_error:
+            return WorkerObservation(
+                attempt_id, observation.fence, "unknown", session_id=observation.session_id,
+                error_class="persistence_unconfirmed", summary=active.persistence_error,
+            )
         if observation.state not in _TERMINAL and attempt_id not in self._active:
             return WorkerObservation(
                 attempt_id, observation.fence, "unknown", session_id=observation.session_id,
@@ -228,6 +239,24 @@ class RuntimeWorkerPort:
     ) -> None:
         runtime: AgentRuntimePort | None = None
         observation = WorkerObservation(attempt_id, active.fence, "unknown")
+
+        @contextmanager
+        def launch_guard() -> Iterator[Callable[[], None]]:
+            if self.authority_guard is None:
+                raise PolicyError("authority_missing", "Worker 启动必须绑定可信 Supervisor 租约")
+            with self._guard, self.store.transaction(), self.authority_guard(active.fence) as check:
+                def validate() -> None:
+                    check()
+                    data = self.store.snapshot()["data"]
+                    record = data.get("attempts", {}).get(attempt_id)
+                    if (data.get("highest_fence") != active.fence or record is None
+                            or record["fence"] != active.fence):
+                        raise PolicyError("stale_fence", "拒绝旧 Supervisor epoch 启动进程")
+                    if active.cancelled.is_set():
+                        raise PolicyError("cancelled", "Worker 已取消，拒绝恢复执行")
+
+                validate()
+                yield validate
 
         def process_factory(
             command: Sequence[str], *, cwd: Path | None, env: Mapping[str, str] | None,
@@ -263,9 +292,11 @@ class RuntimeWorkerPort:
             with active.guard:
                 if active.transport is not None:
                     raise PolicyError("duplicate_launch", "每个尝试只能创建一棵隔离进程树")
-                if "process_factory" in kwargs:
+                if "process_factory" in kwargs or "start_guard" in kwargs:
                     raise PolicyError("isolation_failure", "Runtime 不能覆盖可信隔离 Launcher")
-                transport = JsonRpcStdioClient(*args, **kwargs, process_factory=factory)
+                transport = JsonRpcStdioClient(
+                    *args, **kwargs, process_factory=factory, start_guard=launch_guard,
+                )
                 active.transport = transport
                 return transport
 
@@ -352,11 +383,23 @@ class RuntimeWorkerPort:
                 )
             try:
                 self._save(observation)
+            except Exception as exc:  # noqa: BLE001 -- 后台持久化失败必须可观察并保持占槽。
+                active.pending_result = observation
+                active.persistence_error = str(exc)
             finally:
                 active.finished.set()
 
     def poll(self, attempt_id: str, fence: int) -> WorkerObservation:
         self._mutate(lambda data: self._fence(data, fence))
+        active = self._active.get(attempt_id)
+        if active is not None and active.pending_result is not None:
+            try:
+                self._save(active.pending_result)
+            except Exception as exc:  # noqa: BLE001 -- 暂时无法提交结果，不猜测终态。
+                active.persistence_error = str(exc)
+            else:
+                active.pending_result = None
+                active.persistence_error = None
         return self._observation(attempt_id)
 
     def reconcile(self, attempt_id: str, fence: int) -> WorkerObservation:
@@ -377,7 +420,10 @@ class RuntimeWorkerPort:
         active.finished.wait(timeout=5)
         if active.finished.is_set():
             observation = self._observation(attempt_id)
-            if observation.state in _TERMINAL and observation.error_class != "cancelled":
+            cleaned = active.transport is not None and active.transport.cleanup_complete
+            if (observation.error_class != "cancelled" and (observation.state in _TERMINAL or (
+                observation.error_class == "cleanup_unconfirmed" and cleaned
+            ))):
                 self._save(WorkerObservation(
                     attempt_id, fence, "failed", error_class="cancelled",
                     session_id=observation.session_id, summary="已确认旧 Worker 进程树关闭并撤销候选",
@@ -386,5 +432,6 @@ class RuntimeWorkerPort:
 
     def close(self) -> None:
         for attempt_id, active in tuple(self._active.items()):
-            if not active.finished.is_set():
+            if (not active.finished.is_set() or active.persistence_error
+                    or self._observation(attempt_id).state not in _TERMINAL):
                 self.cancel(attempt_id, active.fence)

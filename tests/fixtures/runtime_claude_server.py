@@ -32,7 +32,11 @@ for raw in sys.stdin:
     if message.get("type") == "control_request":
         subtype = message["request"]["subtype"]
         if subtype == "initialize":
-            if MODE == "bad-control":
+            if MODE == "init-timeout":
+                continue
+            if MODE == "no-models":
+                control(message, {"models": []})
+            elif MODE == "bad-control":
                 send({"type": "control_response", "response": {
                     "request_id": message["request_id"], "subtype": "unexpected",
                 }})

@@ -120,6 +120,47 @@ def test_contract_roundtrip_preserves_unknown_nested_extensions() -> None:
         ExecutionPlan.from_dict({**serialized, "schema_version": True})
 
 
+def test_optional_task_sources_preserve_legacy_documents_and_policy_fingerprints() -> None:
+    original = task(extra={"future": {"keep": [True, None]}})
+    document = original.to_dict()
+    assert "source_task_ids" not in document
+    loaded = TaskSpec.from_dict(json.loads(json.dumps(document)))
+    assert loaded.source_task_ids == ()
+    assert loaded.to_dict() == document
+    assert fingerprint(loaded.to_dict()) == fingerprint(document)
+    request = PlanningRequest("REQ-020", "兼容旧计划", (loaded,))
+    plan, decision = RulePlanningPolicy().plan(request)
+    saved = json.loads(json.dumps(plan.to_dict()))
+    assert ExecutionPlan.from_dict(saved).to_dict() == saved
+    assert decision.input_fingerprint == fingerprint(request.to_dict())
+    assert decision.decision == saved
+    explicit_empty = TaskSpec.from_dict({**document, "source_task_ids": []})
+    assert explicit_empty == original and explicit_empty.to_dict() == document
+
+
+def test_explicit_task_sources_roundtrip_without_becoming_dag_dependencies() -> None:
+    derived = task("child", source_task_ids=("original-a", "original-b"),
+                   extra={"future": {"keep": [1, 2]}})
+    document = derived.to_dict()
+    assert document["source_task_ids"] == ["original-a", "original-b"]
+    assert TaskSpec.from_dict(json.loads(json.dumps(document))) == derived
+    plan = ExecutionPlan("derived", "REQ-020", "direct", (derived,))
+    assert ExecutionPlan.from_dict(plan.to_dict()) == plan
+    assert derived.depends_on == ()
+
+
+@pytest.mark.parametrize("sources", [None, "A", ["A"], ("A", "A"), ("",), (True,), ("A\n",)])
+def test_task_sources_require_unique_nonempty_string_tuple(sources: Any) -> None:
+    with pytest.raises(PolicyError, match="source_task_ids"):
+        task(source_task_ids=sources)
+
+
+@pytest.mark.parametrize("sources", [None, "A", ["A", "A"], [1], [""]])
+def test_decoded_task_sources_reject_ambiguous_authority(sources: Any) -> None:
+    with pytest.raises(PolicyError, match="source_task_ids"):
+        TaskSpec.from_dict({**task().to_dict(), "source_task_ids": sources})
+
+
 @pytest.mark.parametrize("complexity,effort", [("tiny", "low"), ("normal", "medium"), ("complex", "high")])
 def test_routing_uses_discovered_default_model_and_available_efforts(complexity: str, effort: str) -> None:
     specification = task(complexity=complexity)

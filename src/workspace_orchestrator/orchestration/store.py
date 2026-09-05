@@ -146,6 +146,30 @@ class OrchestrationStore:
             )
 
     @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """序列化同一账本的完整 acquire/mutate/release 操作；锁可同线程重入。"""
+        with self._locked():
+            yield
+
+    @contextmanager
+    def guard_epoch(self, owner: str, fence: int) -> Iterator[Callable[[], None]]:
+        """外部启动边界持锁，并在创建和恢复执行前重查当前租约时限。"""
+        _validate_owner(owner)
+        _nonnegative_integer(fence, "fence")
+        with self._locked():
+            def check() -> None:
+                state = self._read()
+                current = state["lease"]
+                if current is None or (current["owner"], current["fence"]) != (owner, fence):
+                    raise OrchestrationStoreError("Worker 启动所需的 Supervisor epoch 已失效")
+                _not_expired(SupervisorLease(**{
+                    key: current[key] for key in ("owner", "fence", "expires_at")
+                }), self._now(state))
+
+            check()
+            yield check
+
+    @contextmanager
     def _io_errors(self) -> Iterator[None]:
         try:
             yield
@@ -175,13 +199,16 @@ class OrchestrationStore:
         self._check_file(self.root / "state.lock")
 
     def _check_file(self, path: Path) -> None:
-        if path.is_symlink() or path.resolve().parent != self.root:
+        # 根路径已经逐级解析。不要 resolve 正被 Windows 字节锁锁住的普通文件，
+        # GetFinalPathNameByHandle 的临时访问失败不能误判成重定向。
+        if path.parent != self.root:
             raise OrchestrationStoreError(f"Supervisor 文件不能使用重定向路径：{path.name}")
         try:
-            info = path.stat()
+            info = path.lstat()
         except FileNotFoundError:
             return
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & 0x400):
             raise OrchestrationStoreError(f"Supervisor 文件必须是独立普通文件：{path.name}")
 
     def _read(self) -> dict[str, Any]:

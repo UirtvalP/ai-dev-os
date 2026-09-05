@@ -19,6 +19,8 @@ def response(request, result):
 
 
 def config():
+    if MODE == "no-models":
+        return {"configOptions": []}
     return {"configOptions": [{
         "id": "model", "name": "Model", "category": "model", "type": "select",
         "currentValue": current_model,
@@ -37,6 +39,10 @@ for raw in sys.stdin:
     method = message.get("method")
     params = message.get("params", {})
     if method == "initialize":
+        if MODE == "init-eof":
+            sys.exit(0)
+        if MODE == "init-timeout":
+            continue
         response(message, {
             "protocolVersion": 99 if MODE == "bad-version" else 1,
             "agentInfo": {"name": "hermetic-cursor", "version": "fixture-1"},

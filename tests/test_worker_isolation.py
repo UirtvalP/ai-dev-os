@@ -240,9 +240,8 @@ def test_creation_failure_removes_only_private_sid(tmp_path: Path) -> None:
         WindowsAppContainerIsolation(controller_roots=(controller,))._launch(
             spec, [str(executable)]
         )
-    # icacls may materialize SE_DACL_AUTO_INHERITED on this private new directory;
-    # all original entries must remain and the ephemeral package ACE must be gone.
-    assert _acl_state(spec.task_root).replace("D:AI", "D:") == original.replace("D:AI", "D:")
+    # 原始 ACE 和继承控制标志均须保留，不允许 icacls 物化额外的显式 ACE。
+    assert _acl_state(spec.task_root) == original
 
 
 @WINDOWS

@@ -132,6 +132,12 @@ def _json_value(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class TaskSpec(_Contract):
+    """source_task_ids 指向初始 PlanningRequest 的授权来源，不指向其他派生节点。
+
+    schema 1 增加可选来源字段；省略/空 tuple 保留旧文档的字节语义与指纹。
+    是否能安全省略由 Supervisor 按原节点身份或唯一初始来源判断。
+    """
+
     task_id: str
     title: str
     prompt: str
@@ -145,6 +151,7 @@ class TaskSpec(_Contract):
     preferred_runtime: str | None = None
     preferred_model: str | None = None
     preferred_effort: str | None = None
+    source_task_ids: tuple[str, ...] = ()
 
     def validate(self) -> None:
         _Contract.validate(self)
@@ -154,6 +161,7 @@ class TaskSpec(_Contract):
             raise PolicyError("invalid_contract", "Task prompt 不能为空")
         _strings(self.depends_on, "depends_on")
         _strings(self.required_capabilities, "required_capabilities")
+        _strings(self.source_task_ids, "source_task_ids")
         if self.task_id in self.depends_on:
             raise PolicyError("invalid_plan", "任务不得依赖自己")
         if self.complexity not in ("tiny", "normal", "complex") or type(self.write_required) is not bool:
@@ -166,10 +174,16 @@ class TaskSpec(_Contract):
 
     @classmethod
     def _decode(cls, values: dict[str, Any]) -> dict[str, Any]:
-        for name in ("depends_on", "required_capabilities"):
+        for name in ("depends_on", "required_capabilities", "source_task_ids"):
             if isinstance(values.get(name), list):
                 values[name] = tuple(values[name])
         return values
+
+    def to_dict(self) -> dict[str, Any]:
+        result = _Contract.to_dict(self)
+        if not self.source_task_ids:
+            result.pop("source_task_ids")
+        return result
 
 
 @dataclass(frozen=True, slots=True)

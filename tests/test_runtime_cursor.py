@@ -35,8 +35,8 @@ def test_cursor_streamed_turn_message_and_capabilities(tmp_path: Path) -> None:
     events: list[AgentEvent] = []
     adapter = runtime(events=events)
     try:
-        assert adapter.describe().models == ()
-        assert not adapter.describe().supports("resume")
+        assert {model.id for model in adapter.describe().models} == {"model-a", "model-b"}
+        assert adapter.describe().supports("resume")
         opened = adapter.start(request(tmp_path, model="model-b"))
         assert opened.ok and opened.session and opened.turn_id
         done = adapter.wait(opened.session, opened.turn_id, timeout_seconds=3)

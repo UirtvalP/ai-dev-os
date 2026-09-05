@@ -389,7 +389,7 @@ def test_foreground_runner_acquires_initializes_and_renews_before_every_tick(
     supervisor = RecordingSupervisor()
     result = composition.run_supervisor(supervisor, request=cli_workspace.planning,
                                         timeout_seconds=2, interval_seconds=0.1)
-    assert supervisor.events == ["acquire", "initialize", "renew", "tick", "renew", "tick", "close:cancel"]
+    assert supervisor.events == ["acquire", "initialize", "renew", "tick", "renew", "tick", "close:cancel", "status"]
     assert not supervisor.held
     assert result["data"]["nodes"]["T"]["status"] == "candidate_complete"
     assert loop_clock.sleeps == [0.1]
@@ -411,6 +411,42 @@ def test_foreground_unknown_cancellation_cannot_report_success(loop_clock: LoopC
         composition.run_supervisor(supervisor, timeout_seconds=0.1, interval_seconds=0.1)
     assert supervisor.held
     assert supervisor.state["data"]["nodes"]["T"]["active_attempt_id"] is not None
+
+
+@pytest.mark.parametrize("online", [True, False])
+def test_final_actual_cancelled_snapshot_reaches_projection_pump(
+    cli_workspace: CliWorkspace, loop_clock: LoopClock, tmp_path: Path, online: bool,
+) -> None:
+    from typing import cast
+
+    from test_orchestration_projection import FakeProvider
+
+    from workspace_orchestrator.adapters.base import TaskProvider
+    from workspace_orchestrator.orchestration.projection import TaskProjection, TaskProjectionPump
+    from workspace_orchestrator.orchestration.store import OrchestrationStore
+
+    setup = cli_workspace
+    setup.workers.finish_on_poll = False
+    supervisor = RequirementSupervisor(
+        composition.control_store(setup.workspace, setup.requirement_id), owner="foreground",
+        workers=setup.workers, runtimes=_descriptors,
+    )
+    provider = FakeProvider()
+    provider.online = online
+    ledger = OrchestrationStore(tmp_path / "final-projection")
+    pump = TaskProjectionPump(TaskProjection(
+        ledger, cast(TaskProvider, provider), {"task-1": "P1"},
+        ownership_check=lambda *args: None,  # 此处单独测试关闭投影，认领在交叉回归证明。
+    ))
+    state = composition.run_supervisor(supervisor, request=setup.planning,
+                                      timeout_seconds=0.2, interval_seconds=0.1, projection=pump)
+    assert state["data"]["nodes"]["task-1"]["status"] == "stopped"
+    entry = ledger.snapshot()["data"]["entries"]["task-1"]
+    assert entry["desired_status"] == "blocked"
+    if online:
+        assert pump.close(1) and provider.task.status == "blocked"
+    else:
+        assert not pump.close(1) and entry["state"] == "offline"
 
 
 @pytest.mark.parametrize("failure", ["initialize", "renew"])

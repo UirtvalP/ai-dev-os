@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -721,3 +722,378 @@ def test_executor_exception_keeps_unknown_verification_frozen_and_workspace_rese
     supervisor.tick()
     assert len(harness.workers.dispatches) == 1
     assert node(supervisor, "T2")["status"] == "pending"
+
+
+class SourcePlanner:
+    """保留审计绑定，可构造合法拆解与有意越权的策略输出。"""
+
+    def __init__(self, transform: Any) -> None:
+        self.transform = transform
+
+    def plan(self, incoming: PlanningRequest) -> tuple[ExecutionPlan, PolicyDecision]:
+        tasks = tuple(self.transform(incoming))
+        plan = ExecutionPlan("source-" + fingerprint([task.to_dict() for task in tasks]),
+                             incoming.requirement_id, "direct" if len(tasks) == 1 else "dag", tasks)
+        return plan, PolicyDecision("fixture.source-planner", "1", "受审计的任务来源分解",
+                                     fingerprint(incoming.to_dict()), plan.to_dict())
+
+
+def mixed_sources(harness: Harness) -> tuple[TaskSpec, TaskSpec]:
+    return (harness.task("readonly", retry_budget=0),
+            harness.task("writer", write_required=True, branch="feat/writer", retry_budget=2))
+
+
+@pytest.mark.parametrize("changes", [
+    {"write_required": True, "branch": "feat/elevated"}, {"retry_budget": 2},
+    {"write_required": True, "branch": "feat/elevated", "retry_budget": 2},
+    {"source_task_ids": ("writer",)},
+])
+def test_mixed_original_tasks_cannot_borrow_write_permission_or_retry_budget(
+    harness: Harness, changes: dict[str, Any]
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    planner = SourcePlanner(lambda incoming: (replace(incoming.tasks[0], **changes), incoming.tasks[1]))
+    supervisor = harness.supervisor(planner=planner, max_workers=2)
+    supervisor.acquire()
+    before = harness.store.snapshot()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.initialize(request(readonly, writer))
+    assert harness.store.snapshot() == before
+    assert harness.workers.dispatches == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("preferred_runtime", "fixture-runtime"), ("preferred_model", "reported-model"),
+    ("preferred_effort", "high"),
+])
+def test_default_planner_preserves_mixed_explicit_and_default_preferences(
+    harness: Harness, field: str, value: str
+) -> None:
+    explicit = harness.task("explicit", **{field: value})
+    default = harness.task("default")
+    supervisor = harness.supervisor(max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(explicit, default))
+    supervisor.tick()
+    assert node(supervisor, "explicit")["spec"][field] == value
+    assert node(supervisor, "default")["spec"][field] is None
+    assert len(harness.workers.dispatches) == 2
+
+
+def test_default_planner_handles_distinct_preferences_without_global_inheritance(harness: Harness) -> None:
+    first = harness.task("first", preferred_runtime="fixture-runtime", preferred_effort="low")
+    second = harness.task("second", preferred_runtime="other-runtime", preferred_effort="high")
+    default = harness.task("default")
+    descriptors = (runtime(), replace(runtime(), runtime_id="other-runtime"))
+    supervisor = harness.supervisor(max_workers=3, runtimes=descriptors)
+    supervisor.acquire()
+    supervisor.initialize(request(first, second, default))
+    supervisor.tick()
+    routed = {task.task_id: route for _, _, task, route in harness.workers.dispatches}
+    assert routed["first"].runtime_id == "fixture-runtime" and routed["first"].effort == "low"
+    assert routed["second"].runtime_id == "other-runtime" and routed["second"].effort == "high"
+    assert node(supervisor, "default")["spec"]["preferred_runtime"] is None
+    assert len(routed) == 3
+
+
+def test_mixed_task_retry_limits_remain_per_source_after_restore(harness: Harness) -> None:
+    readonly, writer = mixed_sources(harness)
+    supervisor = harness.supervisor(max_workers=2, recovery=AlwaysRetry())
+    supervisor.acquire()
+    supervisor.initialize(request(readonly, writer))
+    supervisor.tick()
+    harness.workers.observe("readonly", "failed", error_class="crash")
+    harness.workers.observe("writer", "failed", error_class="crash")
+    supervisor.tick()
+    assert node(supervisor, "readonly")["status"] == "stopped"
+    assert node(supervisor, "readonly")["retry_count"] == 0
+    assert len(node(supervisor, "readonly")["attempts"]) == 1
+    assert len(node(supervisor, "writer")["attempts"]) == 2
+    supervisor.close()
+    restored = RequirementSupervisor(
+        OrchestrationStore(harness.store.root, clock=harness.clock), owner="restored",
+        workers=harness.workers, runtimes=lambda: (runtime(),), clock=harness.clock,
+        protected_roots=harness.protected, max_workers=2,
+    )
+    state = restored.status()
+    assert state["data"]["nodes"]["readonly"]["spec"]["retry_budget"] == 0
+    assert state["data"]["nodes"]["writer"]["spec"]["retry_budget"] == 2
+    assert state["data"]["nodes"]["readonly"]["status"] == "stopped"
+
+
+@pytest.mark.parametrize("changes", [{"write_required": True, "branch": "feat/elevated"}, {"retry_budget": 2}])
+def test_restore_revalidates_mixed_authority_even_with_consistent_forged_plan_history(
+    harness: Harness, changes: dict[str, Any]
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    supervisor = harness.supervisor()
+    supervisor.acquire()
+    supervisor.initialize(request(readonly, writer))
+    supervisor.close()
+    path = harness.store.root / "state.json"
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    data = envelope["data"]
+    elevated = replace(readonly, **changes).to_dict()
+    data["plan"]["nodes"][0] = elevated
+    data["nodes"]["readonly"]["spec"] = elevated
+    data["plans"][0]["plan"] = data["plan"]
+    data["plans"][0]["decision"]["decision"] = data["plan"]
+    data["decisions"][0]["policy"]["decision"] = data["plan"]
+    raw = json.dumps(envelope).encode("utf-8")
+    path.write_bytes(raw)
+    restored = harness.supervisor(owner="restored")
+    with pytest.raises((WorkspaceError, ValueError)):
+        restored.status()
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("sources", [(), ("missing",)])
+def test_multiple_initial_tasks_require_explicit_valid_derived_source(
+    harness: Harness, sources: tuple[str, ...]
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    child = harness.task("child", source_task_ids=sources, retry_budget=0)
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",))
+    supervisor.acquire()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.initialize(request(readonly, writer))
+    assert harness.store.snapshot()["data"] == {}
+
+
+@pytest.mark.parametrize("sources", [("readonly",), ("readonly", "writer")])
+@pytest.mark.parametrize("changes", [
+    {"write_required": True, "branch": "feat/child"}, {"retry_budget": 1},
+])
+def test_derived_readonly_and_combined_sources_use_intersection_not_union(
+    harness: Harness, changes: dict[str, Any], sources: tuple[str, ...]
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    child = harness.task("child", source_task_ids=sources, retry_budget=0)
+    child = replace(child, **changes)
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",))
+    supervisor.acquire()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.initialize(request(readonly, writer))
+    assert harness.workers.dispatches == []
+
+
+def test_legal_combined_sources_keep_readonly_and_minimum_retry(harness: Harness) -> None:
+    readonly, writer = mixed_sources(harness)
+    child = harness.task("combined", source_task_ids=("readonly", "writer"), retry_budget=0)
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",))
+    supervisor.acquire()
+    supervisor.initialize(request(readonly, writer))
+    supervisor.tick()
+    executed = harness.workers.dispatches[0]
+    assert executed[2].source_task_ids == ("readonly", "writer")
+    assert executed[2].retry_budget == 0 and executed[3].sandbox == "read-only"
+
+
+@pytest.mark.parametrize("explicit_roots", [False, True])
+@pytest.mark.parametrize("rename", [False, True])
+def test_source_cannot_take_another_original_workspace_even_with_shared_allocation_pool(
+    harness: Harness, explicit_roots: bool, rename: bool
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    moved = replace(readonly, task_id="child" if rename else readonly.task_id,
+                    source_task_ids=("readonly",) if rename else (), worktree=writer.worktree)
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (moved,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",) if explicit_roots else ())
+    supervisor.acquire()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.initialize(request(readonly, writer))
+    assert harness.workers.dispatches == []
+
+
+@pytest.mark.parametrize("retire_first", [False, True])
+def test_replan_cannot_rebind_derived_identity_to_more_privileged_source(
+    harness: Harness, retire_first: bool
+) -> None:
+    readonly, writer = mixed_sources(harness)
+    child = harness.task("child", source_task_ids=("readonly",), retry_budget=0)
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",), replan_budget=2)
+    supervisor.acquire()
+    supervisor.initialize(request(readonly, writer))
+    supervisor.planner = RulePlanningPolicy()
+    if retire_first:
+        supervisor.replan(request(writer), evidence="保留历史，移除未执行派生节点")
+        assert node(supervisor, "child")["status"] == "retired"
+    rebound = replace(child, source_task_ids=("writer",), write_required=True,
+                      branch="feat/borrowed", retry_budget=2)
+    before = harness.store.snapshot()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.replan(request(rebound, writer), evidence="不能用 replan 转移授权")
+    assert harness.store.snapshot() == before
+
+
+def test_replan_cannot_steal_former_derived_directory_after_original_child_moves(harness: Harness) -> None:
+    readonly, writer = mixed_sources(harness)
+    child = harness.task("child", source_task_ids=("readonly",), retry_budget=0)
+    moved_root = Path(harness.task("new-child-root").worktree or "")
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",), replan_budget=2)
+    supervisor.acquire()
+    supervisor.initialize(request(readonly, writer))
+    supervisor.planner = RulePlanningPolicy()
+    moved = replace(child, worktree=str(moved_root))
+    supervisor.replan(request(moved), evidence="明确为同一来源重分配目录，历史仍保留")
+    stolen = replace(writer, task_id="other-child", source_task_ids=("writer",), worktree=child.worktree)
+    before = harness.store.snapshot()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.replan(request(moved, stolen), evidence="不能占用另一来源历史目录")
+    assert harness.store.snapshot() == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("preferred_runtime", "fixture-runtime"), ("preferred_model", "reported-model"),
+    ("preferred_effort", "high"),
+])
+def test_replan_cannot_convert_existing_default_preference_into_another_tasks_constraint(
+    harness: Harness, field: str, value: str
+) -> None:
+    explicit = harness.task("explicit", **{field: value})
+    default = harness.task("default")
+    supervisor = harness.supervisor()
+    supervisor.acquire()
+    supervisor.initialize(request(explicit, default))
+    before = harness.store.snapshot()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.replan(request(explicit, replace(default, **{field: value})), evidence="插件不能改写默认选择")
+    assert harness.store.snapshot() == before
+
+
+def test_conflicting_source_preferences_cannot_be_silently_merged(harness: Harness) -> None:
+    first = harness.task("first", preferred_runtime="fixture-runtime")
+    second = harness.task("second", preferred_runtime="other-runtime")
+    child = harness.task("child", source_task_ids=("first", "second"), preferred_runtime="fixture-runtime")
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (child,)),
+                                     allowed_worktree_roots=(harness.root / "tasks",))
+    supervisor.acquire()
+    with pytest.raises((WorkspaceError, ValueError), match="偏好"):
+        supervisor.initialize(request(first, second))
+
+
+def test_professional_planner_can_split_one_source_in_mixed_request_into_real_dag(harness: Harness) -> None:
+    source = harness.task("source", write_required=True, branch="feat/source", retry_budget=1,
+                          preferred_runtime="fixture-runtime", preferred_model="reported-model")
+    default = harness.task("default", retry_budget=0)
+    first_root = Path(harness.task("step-1").worktree or "")
+    second_root = Path(harness.task("step-2").worktree or "")
+    first = replace(source, task_id="step-1", worktree=str(first_root), source_task_ids=("source",))
+    second = replace(source, task_id="step-2", worktree=str(second_root), source_task_ids=("source",),
+                     depends_on=("step-1",))
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (first, second, default)),
+                                     allowed_worktree_roots=(harness.root / "tasks",), max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(source, default))
+    supervisor.tick()
+    assert {item[2].task_id for item in harness.workers.dispatches} == {"step-1", "default"}
+    candidate(harness, supervisor, "step-1")
+    supervisor.verify_task("step-1", COMMANDS, ENVIRONMENT)
+    supervisor.tick()
+    assert {item[2].task_id for item in harness.workers.dispatches} == {"step-1", "step-2", "default"}
+    for task_id in ("step-2", "default"):
+        candidate(harness, supervisor, task_id)
+        supervisor.verify_task(task_id, COMMANDS, ENVIRONMENT)
+    assert supervisor.status()["data"]["status"] == "ready_for_integration"
+    assert node(supervisor, "default")["spec"]["preferred_runtime"] is None
+    assert node(supervisor, "step-2")["spec"]["source_task_ids"] == ["source"]
+
+
+def test_derived_default_source_does_not_inherit_an_unrelated_tasks_preference(harness: Harness) -> None:
+    explicit = harness.task("explicit", preferred_runtime="fixture-runtime", preferred_effort="low")
+    default = harness.task("default")
+    child = harness.task("default-child", source_task_ids=("default",))
+    supervisor = harness.supervisor(planner=SourcePlanner(lambda incoming: (explicit, child)),
+                                     allowed_worktree_roots=(harness.root / "tasks",), max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(explicit, default))
+    supervisor.tick()
+    assert len(harness.workers.dispatches) == 2
+    assert node(supervisor, "default-child")["spec"]["preferred_runtime"] is None
+    assert node(supervisor, "default-child")["spec"]["preferred_effort"] is None
+
+
+@pytest.mark.parametrize("widen", [False, True])
+def test_explicit_nested_source_workspaces_keep_only_their_original_shared_scope(
+    harness: Harness, widen: bool
+) -> None:
+    parent = harness.task("parent", write_required=True, branch="feat/parent")
+    nested_path = Path(parent.worktree or "") / "nested"
+    nested_path.mkdir()
+    nested = replace(harness.task("nested"), worktree=str(nested_path))
+    planner = SourcePlanner(lambda incoming: (
+        replace(nested, worktree=parent.worktree) if widen else nested, parent,
+    ))
+    supervisor = harness.supervisor(planner=planner, allowed_worktree_roots=(harness.root / "tasks",), max_workers=2)
+    supervisor.acquire()
+    if widen:
+        with pytest.raises((WorkspaceError, ValueError)):
+            supervisor.initialize(request(nested, parent))
+        assert harness.workers.dispatches == []
+    else:
+        supervisor.initialize(request(nested, parent))
+        supervisor.tick()
+        assert len(harness.workers.dispatches) == 1
+        assert harness.workers.dispatches[0][2].task_id == "nested"
+
+
+def test_execution_claim_receives_checked_copies_before_plan_commit_and_dispatch(harness: Harness) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def claim(initial: PlanningRequest, plan: ExecutionPlan) -> None:
+        calls.append((initial.requirement_id, plan.plan_id))
+        if len(calls) == 1:
+            assert harness.store.snapshot()["data"] == {}
+        object.__setattr__(plan.nodes[0], "write_required", True)
+
+    task = harness.task()
+    supervisor = harness.supervisor(execution_claim=claim)
+    supervisor.acquire()
+    supervisor.initialize(request(task))
+    assert len(calls) == 1
+    assert node(supervisor)["spec"]["write_required"] is False
+    supervisor.initialize(request(task))
+    assert len(calls) == 2
+    supervisor.tick()
+    assert len(calls) >= 3
+    assert len(harness.workers.dispatches) == 1
+    assert harness.workers.dispatches[0][2].write_required is False
+
+
+def test_execution_claim_failure_keeps_uninitialized_plan_and_resumed_dispatch_closed(harness: Harness) -> None:
+    def unavailable(initial: PlanningRequest, plan: ExecutionPlan) -> None:
+        raise WorkspaceError("可信执行归属不可用")
+
+    task = harness.task()
+    supervisor = harness.supervisor(execution_claim=unavailable)
+    supervisor.acquire()
+    with pytest.raises(WorkspaceError, match="执行归属"):
+        supervisor.initialize(request(task))
+    assert harness.store.snapshot()["data"] == {}
+    supervisor.execution_claim = None
+    supervisor.initialize(request(task))
+    supervisor.close()
+    restored = harness.supervisor(owner="restored", execution_claim=unavailable)
+    restored.acquire()
+    with pytest.raises(WorkspaceError, match="执行归属"):
+        restored.tick()
+    assert harness.workers.dispatches == []
+    assert node(restored)["status"] == "pending"
+
+
+def test_rejected_source_plan_never_claims_execution_ownership(harness: Harness) -> None:
+    calls: list[str] = []
+    readonly, writer = mixed_sources(harness)
+    supervisor = harness.supervisor(
+        planner=SourcePlanner(lambda incoming: (replace(readonly, retry_budget=2), writer)),
+        execution_claim=lambda initial, plan: calls.append(plan.plan_id),
+    )
+    supervisor.acquire()
+    with pytest.raises((WorkspaceError, ValueError)):
+        supervisor.initialize(request(readonly, writer))
+    assert calls == []

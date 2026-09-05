@@ -27,6 +27,46 @@ class Clock:
         return self.value
 
 
+def test_epoch_guard_rechecks_expiry_without_mutating_revision(tmp_path):
+    clock = Clock()
+    store = OrchestrationStore(tmp_path / "guard", clock=clock)
+    lease = store.acquire("holder", ttl_seconds=5)
+    revision = store.snapshot()["revision"]
+    with store.guard_epoch("holder", lease.fence) as check:
+        check()
+        clock.value = 106
+        with pytest.raises(OrchestrationStoreError):
+            check()
+    assert store.snapshot()["revision"] == revision
+    newer = store.acquire("new-holder")
+    with pytest.raises(OrchestrationStoreError), store.guard_epoch("holder", lease.fence):
+        pytest.fail("旧 epoch 不得取得外部启动许可")
+    with store.guard_epoch("new-holder", newer.fence) as check:
+        check()
+
+
+def test_epoch_guard_serializes_takeover_until_start_boundary_exits(tmp_path):
+    import threading
+
+    clock = Clock()
+    first = OrchestrationStore(tmp_path / "guard", clock=clock)
+    lease = first.acquire("old", ttl_seconds=5)
+    second = OrchestrationStore(first.root, clock=clock)
+    waiting = threading.Event()
+    def takeover():
+        waiting.set()
+        return second.acquire("new")
+    with ThreadPoolExecutor(1) as pool:
+        with first.guard_epoch("old", lease.fence) as check:
+            clock.value = 106
+            future = pool.submit(takeover)
+            assert waiting.wait(3)
+            with pytest.raises(OrchestrationStoreError):
+                check()
+            assert not future.done()
+        assert future.result(timeout=5).fence == lease.fence + 1
+
+
 def _state_path(root: Path) -> Path:
     return root / "state.json"
 

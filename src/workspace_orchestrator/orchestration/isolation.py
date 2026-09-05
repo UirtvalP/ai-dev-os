@@ -142,6 +142,8 @@ def _win32() -> Any:
             wt.DWORD,
         ),
         (advapi, "GetAce", [void, wt.DWORD, void], wt.BOOL),
+        (advapi, "GetLengthSid", [void], wt.DWORD),
+        (advapi, "SetFileSecurityW", [wt.LPCWSTR, wt.DWORD, void], wt.BOOL),
         (
             advapi,
             "ConvertSecurityDescriptorToStringSecurityDescriptorW",
@@ -415,6 +417,59 @@ def _relevant_lpac_sids() -> frozenset[str]:
             api.kernel.LocalFree(derived[index])
         api.kernel.LocalFree(groups)
         api.kernel.LocalFree(derived)
+
+
+def _edit_private_sid(path: Path, sid: str, *, grant: bool) -> None:
+    """在静止的私有 Task 内修改唯一 SID；既有 ACE 的内容与顺序逐字节保留。"""
+    api = _win32()
+    c = api.ctypes
+    descriptor, dacl, package = c.c_void_p(), c.c_void_p(), c.c_void_p()
+    result = api.advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, c.byref(dacl), None, c.byref(descriptor),
+    )
+    if result:
+        raise WorkerIsolationError("acl_update_failed", f"读取 Task DACL 失败: {result}")
+    try:
+        if not dacl or not api.advapi.ConvertStringSidToSidW(sid, c.byref(package)):
+            raise WorkerIsolationError("acl_update_failed", "Task DACL 或临时 SID 无效")
+        sid_bytes = c.string_at(package, api.advapi.GetLengthSid(package))
+        header = c.string_at(dacl, 8)
+        count = struct.unpack_from("<H", header, 4)[0]
+        entries: list[bytes] = []
+        changed = False
+        for index in range(count):
+            pointer = c.c_void_p()
+            if not api.advapi.GetAce(dacl, index, c.byref(pointer)):
+                raise WorkerIsolationError("acl_update_failed", "读取 Task ACE 失败")
+            kind, _flags, size = struct.unpack("<BBH", c.string_at(pointer, 4))
+            entry = c.string_at(pointer, size)
+            if kind == 0 and entry[8:] == sid_bytes:
+                changed = True
+                continue
+            entries.append(entry)
+        if grant:
+            new = struct.pack("<BBHI", 0, 3 if path.is_dir() else 0,
+                              8 + len(sid_bytes), 0x1301BF) + sid_bytes
+            # 本次显式 allow 置于继承 ACE 之前，不重排任何原始 allow/deny。
+            position = next((i for i, entry in enumerate(entries) if entry[1] & 0x10), len(entries))
+            entries.insert(position, new)
+            changed = True
+        if not changed:
+            return
+        size = 8 + sum(map(len, entries))
+        if size > 65535:
+            raise WorkerIsolationError("acl_update_failed", "Task DACL 超出 Win32 长度限制")
+        acl = struct.pack("<BBHHH", header[0], header[1], size, len(entries), 0) + b"".join(entries)
+        control = struct.unpack_from("<H", c.string_at(descriptor, 4), 2)[0]
+        # 自相对描述符只包含 DACL；owner/group/SACL 未请求修改。
+        security = struct.pack("<BBHIIII", 1, 0, (control & 0x150C) | 0x8004, 0, 0, 0, 20) + acl
+        raw = c.create_string_buffer(security)
+        if not api.advapi.SetFileSecurityW(str(path), 4, raw):
+            raise WorkerIsolationError("acl_update_failed", f"更新 Task 私有 SID 失败: {c.get_last_error()}")
+    finally:
+        if package:
+            api.kernel.LocalFree(package)
+        api.kernel.LocalFree(descriptor)
 
 
 def _acl_state(path: Path, *, enforce: bool = True) -> str:
@@ -755,17 +810,15 @@ class AppContainerProcess:
 
     def _change_task_acl(self, *, grant: bool) -> None:
         root = _physical_path(self._spec.task_root)
-        system = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "icacls.exe"
-        args = [str(system), str(root)]
-        if grant:
-            args += ["/grant", f"*{self.sid}:(OI)(CI)M"]
-        else:
-            args += ["/remove:g", f"*{self.sid}"]
-        # /L 操作链接本身，不能通过 Worker 创建的链接修改域外目标。
-        args += ["/T", "/C", "/L", "/Q"]
-        result = subprocess.run(args, capture_output=True, timeout=30, check=False)
-        if result.returncode:
-            raise WorkerIsolationError("acl_update_failed", "Task 私有 SID ACE 更新失败")
+        # 不用 icacls 的自动继承重算：CI 的继承-only ACL 会被物化为额外显式 ACE。
+        # SetFileSecurityW 有意仅修改单个对象；逐一保留原 ACE 字节和继承标志，
+        # 只增删本次 SID，不能以整包旧 ACL 回滚覆盖 Task 后续的权限修改。
+        paths = [root]
+        for current, directories, files in os.walk(root, followlinks=False):
+            paths.extend(Path(current) / name for name in (*directories, *files))
+        for path in paths:
+            _physical_path(path, directory=path.is_dir())
+            _edit_private_sid(path, self.sid, grant=grant)
 
     def poll(self) -> int | None:
         if self.returncode is not None:

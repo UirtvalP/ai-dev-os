@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import threading
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -147,7 +148,8 @@ class TaskProjection:
     """
 
     def __init__(
-        self, store: OrchestrationStore, provider: TaskProvider, bindings: dict[str, str]
+        self, store: OrchestrationStore, provider: TaskProvider, bindings: dict[str, str], *,
+        ownership_check: Callable[[str, str, Task], None] | None = None,
     ) -> None:
         if not isinstance(bindings, dict) or any(
             not isinstance(key, str) or not key.strip() or not isinstance(value, str) or not value.strip()
@@ -158,6 +160,7 @@ class TaskProjection:
             raise TaskProjectionError("多个本地节点不能共用一张 Provider 卡片")
         self.store, self.provider = store, provider
         self.bindings = dict(bindings)
+        self.ownership_check = ownership_check
 
     def sync(self, supervisor_snapshot: dict[str, Any]) -> dict[str, Any]:
         """投影最新节点快照；每个节点每次最多一次 CAS，离线错误保留在独立账本。"""
@@ -275,6 +278,16 @@ class TaskProjection:
         except Exception as exc:  # noqa: BLE001 - 可替换 Provider 的异常统一保留为离线事实。
             self._save(lease, task_id, state="offline", last_error={"code": "provider_unavailable", "message": str(exc)})
             return
+        if entry["desired_status"] == "in_progress":
+            try:
+                if self.ownership_check is None:
+                    raise TaskProjectionError("可执行面板状态需要可信的 V2 持久认领")
+                self.ownership_check(self.store.snapshot()["data"]["requirement_id"], task_id, current)
+            except Exception as exc:  # noqa: BLE001 -- 未认领不能制造 V1 可执行状态。
+                self._save(lease, task_id, state="offline", last_error={
+                    "code": "execution_unclaimed", "message": str(exc),
+                })
+                return
         assert current.version is not None
         if current.status == "done":
             self._conflict(lease, task_id, current, "done 属于最终 Gate，投影不得覆盖或降级")

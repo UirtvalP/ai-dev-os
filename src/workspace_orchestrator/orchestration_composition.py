@@ -10,6 +10,7 @@ from typing import Any
 from .agent_runtime.codex import codex_command
 from .automation.task_attach import configured_task_provider
 from .composition import create_runtime, runtime_descriptors
+from .execution_ownership import ExecutionOwnership
 from .orchestration.contracts import PlanningRequest
 from .orchestration.isolation import WindowsAppContainerIsolation
 from .orchestration.projection import TaskProjection, TaskProjectionPump
@@ -51,11 +52,17 @@ def configured_supervisor(
         worker_root, requirement_id=requirement_id, runtime_factory=create_runtime,
         launcher=launcher, protected_roots=protected, readonly_tools=tuple(dict.fromkeys(tools)),
         allow_network=allow_network,
+        authority_guard=lambda fence: store.guard_epoch(owner, fence),
     )
     return RequirementSupervisor(
         store, owner=owner, workers=workers, runtimes=runtime_descriptors,
         max_workers=max_workers, protected_roots=protected,
         allowed_worktree_roots=allowed_worktree_roots,
+        execution_claim=lambda request, plan: ExecutionOwnership(workspace).claim_plan(
+            request, plan, lambda: configured_task_provider(
+                workspace.load(requirement_id)["meta"], workspace.project_root,
+            ),
+        ),
     )
 
 
@@ -90,7 +97,10 @@ def run_supervisor(
             supervisor.close(cancel_running=True)
         finally:
             if projection is not None:
-                projection.close(timeout=1)
+                try:
+                    projection.submit(supervisor.status())
+                finally:
+                    projection.close(timeout=1)
     return supervisor.status()
 
 
@@ -108,4 +118,5 @@ def configured_projection(
         return None
     return TaskProjectionPump(TaskProjection(
         OrchestrationStore(store.root.parent / "task-projection"), provider, bindings,
+        ownership_check=ExecutionOwnership(workspace).require_v2,
     ))

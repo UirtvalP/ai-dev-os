@@ -93,6 +93,7 @@ class RequirementSupervisor:
         clock: Callable[[], float] = time.time,
         allowed_worktree_roots: tuple[Path, ...] = (),
         max_plan_nodes: int = 64,
+        execution_claim: Callable[[PlanningRequest, ExecutionPlan], None] | None = None,
     ) -> None:
         _integer(max_workers, "max_workers", 1)
         _integer(replan_budget, "replan_budget")
@@ -111,6 +112,7 @@ class RequirementSupervisor:
             Path(__file__).resolve().parent.parent,
         )))
         self.allowed_worktree_roots = tuple(_path(path) for path in allowed_worktree_roots)
+        self.execution_claim = execution_claim
         self.lease: SupervisorLease | None = None
         self._verifications: set[str] = set()
 
@@ -134,10 +136,12 @@ class RequirementSupervisor:
         if _initialized(data):
             if fingerprint(data["initial_request"]) != fingerprint(request.to_dict()):
                 raise SupervisorError("already_initialized", "已有计划，变更必须使用有证据的 replan")
+            self._claim_execution(request, ExecutionPlan.from_dict(data["plan"]))
             return snapshot
         plan, decision = self.planner.plan(copy.deepcopy(request))
         _plan_output(request, plan, decision)
         authorization = {
+            # 保留既有摘要字段以兼容持久格式；单节点权限由 initial_request 来源独立授权。
             "write_allowed": any(task.write_required for task in request.tasks),
             "retry_budget": max(task.retry_budget for task in request.tasks),
             "replan_budget": self.replan_budget,
@@ -148,6 +152,7 @@ class RequirementSupervisor:
             "protected_roots": [str(path) for path in self.protected_roots],
         }
         self._authorize_plan(plan, request, authorization, {})
+        self._claim_execution(request, plan)
         now = self._now()
 
         def change(state: dict[str, Any]) -> None:
@@ -168,6 +173,8 @@ class RequirementSupervisor:
         """一次有限步长：先收敛已知 attempt，再按依赖与槽位发送新的持久意图。"""
 
         snapshot = self._active(require_plan=True)
+        self._claim_execution(PlanningRequest.from_dict(snapshot["data"]["initial_request"]),
+                              ExecutionPlan.from_dict(snapshot["data"]["plan"]))
         for task_id, node in snapshot["data"]["nodes"].items():
             if node["active_attempt_id"] is not None:
                 self._observe(task_id)
@@ -205,7 +212,9 @@ class RequirementSupervisor:
         plan, decision = self.planner.plan(copy.deepcopy(request))
         _plan_output(request, plan, decision)
         self._authorize_plan(plan, PlanningRequest.from_dict(data["initial_request"]),
-                             data["authorization"], data["nodes"])
+                             data["authorization"], data["nodes"],
+                             previous_plans=tuple(ExecutionPlan.from_dict(item["plan"]) for item in data["plans"]))
+        self._claim_execution(PlanningRequest.from_dict(data["initial_request"]), plan)
         before = fingerprint(data)
         now = self._now()
 
@@ -363,41 +372,43 @@ class RequirementSupervisor:
 
         return self.store.mutate(lease, checked)
 
+    def _claim_execution(self, initial: PlanningRequest, plan: ExecutionPlan) -> None:
+        """受信装配在发布可执行状态前建立 V2 归属；策略不能通过 extra 自证所有权。"""
+
+        if self.execution_claim is not None:
+            self._active()
+            self.execution_claim(copy.deepcopy(initial), copy.deepcopy(plan))
+
     def _authorize_plan(
         self, plan: ExecutionPlan, initial: PlanningRequest,
         authorization: dict[str, Any], previous: dict[str, Any],
+        *, previous_plans: tuple[ExecutionPlan, ...] = (),
     ) -> None:
         if plan.requirement_id != initial.requirement_id:
             raise SupervisorError("wrong_requirement", "Planner 不能改写 Requirement 身份")
         limit = min(self.max_plan_nodes, authorization["max_plan_nodes"])
         if len(set(previous) | {task.task_id for task in plan.nodes}) > limit:
             raise SupervisorError("plan_budget", "计划及历史 Task 总数超出授权上限")
-        requested = {task.task_id: task for task in initial.tasks}
         nodes = {task.task_id: task for task in plan.nodes}
         for task_id, node in previous.items():
             if _frozen(node) and (task_id not in nodes or nodes[task_id].to_dict() != node["spec"]):
                 raise SupervisorError("frozen_node", "不能移除或改写 accepted/活跃/未知验证节点")
+        bindings: dict[str, tuple[str, ...]] = {}
+        locations: list[tuple[Path, tuple[str, ...]]] = []
+        for historical_plan in previous_plans:
+            for historical_task in historical_plan.nodes:
+                _bind_source(historical_task, initial, authorization, bindings, locations)
+        for node in previous.values():
+            _bind_source(TaskSpec.from_dict(node["spec"]), initial, authorization, bindings, locations)
         for task in plan.nodes:
-            if task.write_required and not authorization["write_allowed"]:
-                raise SupervisorError("permission_expansion", "Planner 不能把只读授权升级为写权限")
-            if task.retry_budget > authorization["retry_budget"]:
-                raise SupervisorError("retry_budget", "Planner 不能扩大初始 retry budget")
-            for name in ("preferred_runtime", "preferred_model", "preferred_effort"):
-                original = requested.get(task.task_id)
-                expected = getattr(original, name) if original is not None else None
-                unique = {getattr(item, name) for item in initial.tasks if getattr(item, name) is not None}
-                if expected is None and len(unique) == 1:
-                    expected = next(iter(unique))
-                if expected is not None and getattr(task, name) != expected:
-                    raise SupervisorError("preference_changed", "Planner 不能改写显式 Runtime/model/effort 偏好")
-            self._authorize_task(task, authorization)
+            _bind_source(task, initial, authorization, bindings, locations)
+            self._authorize_task(task, authorization, initial)
 
-    def _authorize_task(self, task: TaskSpec, authorization: dict[str, Any]) -> Path:
+    def _authorize_task(
+        self, task: TaskSpec, authorization: dict[str, Any], initial: PlanningRequest
+    ) -> Path:
         path = _task_path(task)
-        roots = tuple(_path(Path(item)) for item in authorization["allowed_worktree_roots"])
-        exact = tuple(_path(Path(item)) for item in authorization["exact_worktrees"])
-        if not (any(path == root or root in path.parents for root in roots) if roots else path in exact):
-            raise SupervisorError("unauthorized_workspace", "Task worktree 不在初始授权范围")
+        _source_scope(task, initial, authorization, _authorize_source(task, initial))
         protected = (*self.protected_roots,
                      *(_path(Path(item)) for item in authorization["protected_roots"]))
         if any(_overlaps(path, item) for item in protected):
@@ -416,7 +427,7 @@ class RequirementSupervisor:
         return False
 
     def _isolation(self, task: TaskSpec, data: dict[str, Any]) -> WorkerIsolation:
-        path = self._authorize_task(task, data["authorization"])
+        path = self._authorize_task(task, data["authorization"], PlanningRequest.from_dict(data["initial_request"]))
         isolation = self.workers.isolation(copy.deepcopy(task))
         isolation.validate()
         if not isolation.enforced:
@@ -436,6 +447,8 @@ class RequirementSupervisor:
 
     def _dispatch(self, task: TaskSpec) -> None:
         data = self._active(require_plan=True)["data"]
+        self._claim_execution(PlanningRequest.from_dict(data["initial_request"]),
+                              ExecutionPlan.from_dict(data["plan"]))
         node = data["nodes"][task.task_id]
         if len(node["attempts"]) >= 1 + task.retry_budget + data["replan_count"]:
             self._block(task.task_id, "执行与重规划预算已耗尽", stopped=True)
@@ -703,6 +716,110 @@ def _frozen(node: dict[str, Any]) -> bool:
     return node["status"] == "accepted" or node["active_attempt_id"] is not None or _unknown_verification(node)
 
 
+def _source_ids(task: TaskSpec, initial: PlanningRequest) -> tuple[str, ...]:
+    """身份已存在时只能引用自身；多来源请求不能靠重命名猜测拆解授权。"""
+
+    originals = {item.task_id: item for item in initial.tasks}
+    sources: tuple[str, ...]
+    for original in initial.tasks:
+        if original.source_task_ids and original.source_task_ids != (original.task_id,):
+            raise SupervisorError("invalid_source", "初始授权 Task 不能借用其他 Task 的来源")
+    if task.task_id in originals:
+        sources = (task.task_id,)
+        if task.source_task_ids and task.source_task_ids != sources:
+            raise SupervisorError("source_changed", "已有 Task 不能更换授权来源")
+    elif task.source_task_ids:
+        sources = tuple(sorted(task.source_task_ids))
+    elif len(originals) == 1:
+        sources = tuple(originals)
+    else:
+        raise SupervisorError("source_required", "多个初始 Task 的派生节点必须明确 source_task_ids")
+    if any(source not in originals for source in sources):
+        raise SupervisorError("invalid_source", "source_task_ids 只能指向初始请求中的授权 Task")
+    return sources
+
+
+def _authorize_source(task: TaskSpec, initial: PlanningRequest) -> tuple[str, ...]:
+    sources = _source_ids(task, initial)
+    originals = {item.task_id: item for item in initial.tasks}
+    grants = tuple(originals[source] for source in sources)
+    if task.write_required and not all(source.write_required for source in grants):
+        raise SupervisorError("permission_expansion", "Planner 不能扩大此 Task 或任一来源的写权限")
+    if task.retry_budget > min(source.retry_budget for source in grants):
+        raise SupervisorError("retry_budget", "Planner 不能借用其他 Task 的 retry budget")
+    for name in ("preferred_runtime", "preferred_model", "preferred_effort"):
+        if task.task_id in originals:
+            # None 是此已有节点的默认路由选择，不从其他节点继承约束或偏好。
+            if getattr(task, name) != getattr(originals[task.task_id], name):
+                raise SupervisorError("preference_changed", "已有 Task 必须保留自己的显式或默认偏好")
+        else:
+            explicit = {getattr(source, name) for source in grants if getattr(source, name) is not None}
+            if len(explicit) > 1:
+                raise SupervisorError("source_preference_conflict", "来源存在互不兼容的显式偏好，不能合并为单个 Task")
+            if explicit and getattr(task, name) != next(iter(explicit)):
+                raise SupervisorError("preference_changed", "派生 Task 必须遵守其来源的显式偏好")
+    return sources
+
+
+def _scope_path(value: str) -> Path:
+    """来源授权的纯词法范围校验；启动前另行检查物理目录和重定向。"""
+
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise SupervisorError("unsafe_path", "来源授权目录必须是无父级跳转的绝对路径")
+    return path
+
+
+def _source_scope(
+    task: TaskSpec, initial: PlanningRequest, authorization: dict[str, Any], sources: tuple[str, ...],
+) -> Path:
+    if task.worktree is None:
+        raise SupervisorError("workspace_required", "执行计划必须为 Task 明确分配 worktree")
+    path = _scope_path(task.worktree)
+    own = tuple(_scope_path(item.worktree) for item in initial.tasks
+                if item.task_id in sources and item.worktree is not None)
+    roots = tuple(_scope_path(item) for item in authorization["allowed_worktree_roots"])
+    if not (any(path == root or root in path.parents for root in roots) if roots else path in own):
+        raise SupervisorError("unauthorized_workspace", "Task worktree 不在其来源对应的授权目录")
+    for other in initial.tasks:
+        if other.task_id not in sources and other.worktree is not None:
+            other_path = _scope_path(other.worktree)
+            # 操作员原本就显式共用的目录仍由互斥调度管理；Planner 不能制造新的串权。
+            if _overlaps(path, other_path):
+                shared = path if other_path == path or other_path in path.parents else other_path
+                if not any(shared == origin or origin in shared.parents for origin in own):
+                    raise SupervisorError("source_workspace_conflict", "派生 Task 不能占用其他来源的原始 worktree")
+    if any(_overlaps(path, _scope_path(item)) for item in authorization["protected_roots"]):
+        raise SupervisorError("protected_workspace", "来源授权不能覆盖受保护控制面")
+    return path
+
+
+def _bind_source(
+    task: TaskSpec, initial: PlanningRequest, authorization: dict[str, Any],
+    bindings: dict[str, tuple[str, ...]], locations: list[tuple[Path, tuple[str, ...]]],
+) -> None:
+    """按整个规划历史固定 Task 来源和派生目录归属，不因 retire/replan 清空。"""
+
+    sources = _authorize_source(task, initial)
+    if task.task_id in bindings and bindings[task.task_id] != sources:
+        raise SupervisorError("source_changed", "replan 不能改写已有派生 Task 的授权来源")
+    path = _source_scope(task, initial, authorization, sources)
+
+    def initially_shared(location: Path, owners: tuple[str, ...]) -> bool:
+        return any(item.task_id in owners and item.worktree is not None
+                   and (location == _scope_path(item.worktree) or _scope_path(item.worktree) in location.parents)
+                   for item in initial.tasks)
+
+    for previous_path, previous_sources in locations:
+        shared = path if previous_path == path or previous_path in path.parents else previous_path
+        if (previous_sources != sources and _overlaps(previous_path, path)
+                and not all(initially_shared(shared, owners) for owners in (sources, previous_sources))):
+            raise SupervisorError("source_workspace_conflict", "规划不能转移其他来源已经使用的派生目录")
+    bindings[task.task_id] = sources
+    if (path, sources) not in locations:
+        locations.append((path, sources))
+
+
 def _summary(data: dict[str, Any]) -> str:
     nodes = [data["nodes"][item["task_id"]] for item in data["plan"]["nodes"]]
     if all(node["status"] == "accepted" for node in nodes):
@@ -739,6 +856,8 @@ def _validate_data(data: dict[str, Any], fence: int) -> None:
         for name in ("allowed_worktree_roots", "exact_worktrees", "protected_roots"):
             if not isinstance(authorization[name], list) or any(not isinstance(item, str) for item in authorization[name]):
                 raise SupervisorError("invalid_state", "持久授权路径必须是字符串列表")
+        if authorization["exact_worktrees"] != [task.worktree for task in initial.tasks if task.worktree]:
+            raise SupervisorError("invalid_state", "原始 worktree 摘要与初始来源不一致")
         _integer(data["replan_count"], "replan_count")
         if data["replan_count"] > authorization["replan_budget"]:
             raise SupervisorError("invalid_state", "持久 replan_count 超出授权预算")
@@ -750,12 +869,16 @@ def _validate_data(data: dict[str, Any], fence: int) -> None:
             raise SupervisorError("invalid_state", "策略决策历史无效")
         if data["plans"][-1]["plan"] != data["plan"]:
             raise SupervisorError("invalid_state", "当前计划不对应最后一次规划历史")
+        source_bindings: dict[str, tuple[str, ...]] = {}
+        source_locations: list[tuple[Path, tuple[str, ...]]] = []
         for history in data["plans"]:
             historical_request = PlanningRequest.from_dict(history["request"])
             historical_plan = ExecutionPlan.from_dict(history["plan"])
             _plan_output(historical_request, historical_plan, PolicyDecision.from_dict(history["decision"]))
             if historical_plan.requirement_id != data["requirement_id"]:
                 raise SupervisorError("invalid_state", "规划历史跨越不同 Requirement")
+            for historical_task in historical_plan.nodes:
+                _bind_source(historical_task, initial, authorization, source_bindings, source_locations)
         for decision in data["decisions"]:
             PolicyDecision.from_dict(decision["policy"])
         identifiers: set[str] = set()
@@ -763,9 +886,14 @@ def _validate_data(data: dict[str, Any], fence: int) -> None:
             task = TaskSpec.from_dict(node["spec"])
             if task.task_id != task_id or node["status"] not in _NODE_STATES:
                 raise SupervisorError("invalid_state", "节点身份或状态无效")
+            if task_id not in source_bindings:
+                raise SupervisorError("invalid_state", "节点缺少受控规划历史与授权来源")
+            _bind_source(task, initial, authorization, source_bindings, source_locations)
             _integer(node["revision"], "node revision", 1)
             _integer(node["retry_count"], "retry_count")
-            if node["retry_count"] > authorization["retry_budget"] or not isinstance(node["attempts"], list):
+            sources = source_bindings[task_id]
+            retry_limit = min(item.retry_budget for item in initial.tasks if item.task_id in sources)
+            if node["retry_count"] > retry_limit or not isinstance(node["attempts"], list):
                 raise SupervisorError("invalid_state", "节点 retry 计数或 attempt 列表无效")
             for attempt in node["attempts"]:
                 identifier = attempt["attempt_id"]
