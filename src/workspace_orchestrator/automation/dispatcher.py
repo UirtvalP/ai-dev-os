@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeGuard, cast
+from typing import Any, TypeGuard
 
 from workspace_orchestrator.adapters.agent import CodexExecProvider, CodexExecutionResult
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
@@ -79,7 +79,7 @@ def _write_state(store: WorkspaceStore, state: dict[str, Any]) -> None:
 def _pid_alive(pid: object) -> TypeGuard[int]:
     if not isinstance(pid, int) or pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32":
         # Windows 的 os.kill(pid, 0) 在已退出进程上仍可能成功；直接读取
         # process exit code，避免把 stopping/stale PID 永久误判为存活。
         import ctypes
@@ -102,24 +102,24 @@ def _pid_alive(pid: object) -> TypeGuard[int]:
             return bool(get_exit_code(handle, ctypes.byref(exit_code))) and exit_code.value == 259
         finally:
             close_handle(handle)
-    # start_dispatcher 与 stop_dispatcher 在同一进程内运行时（例如集成
-    # 测试），已退出的子进程会先进入 zombie 状态。os.kill(pid, 0)
-    # 仍会把 zombie 视为存活，因此先以 WNOHANG 回收直接子进程。
-    # 独立 CLI 调用并非该 PID 的父进程，os.waitpid 会抛
-    # ChildProcessError，随后仍使用通用的存活探测。
-    try:
-        posix_os = cast(Any, os)
-        waited_pid, _ = posix_os.waitpid(pid, posix_os.WNOHANG)
-    except (AttributeError, ChildProcessError, OSError):
-        pass
     else:
-        if waited_pid == pid:
+        # start_dispatcher 与 stop_dispatcher 在同一进程内运行时（例如集成
+        # 测试），已退出的子进程会先进入 zombie 状态。os.kill(pid, 0)
+        # 仍会把 zombie 视为存活，因此先以 WNOHANG 回收直接子进程。
+        # 独立 CLI 调用并非该 PID 的父进程，os.waitpid 会抛
+        # ChildProcessError，随后仍使用通用的存活探测。
+        try:
+            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except (AttributeError, ChildProcessError, OSError):
+            pass
+        else:
+            if waited_pid == pid:
+                return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
             return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        return True
 
 
 def _config(store: WorkspaceStore) -> ProjectConfig:
