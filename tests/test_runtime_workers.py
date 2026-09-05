@@ -568,14 +568,14 @@ def test_result_publication_and_cancel_share_one_boundary(tmp_path, monkeypatch,
     def poll_candidate():
         try:
             results["poll"] = port.poll("a1", 1)
-        except BaseException as exc:
+        except Exception as exc:  # noqa: BLE001 -- 在线程外统一断言异常，不能让后台失败漏报。
             errors.append(exc)
 
     def cancel_candidate():
         cancel_started.set()
         try:
             results["cancel"] = port.cancel("a1", 1)
-        except BaseException as exc:
+        except Exception as exc:  # noqa: BLE001 -- 在线程外统一断言异常，不能让后台失败漏报。
             errors.append(exc)
 
     port.candidate_reader = read_candidate

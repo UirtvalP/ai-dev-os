@@ -483,7 +483,7 @@ class RuntimeWorkerPort:
                 transport = active.transport
             if transport is not None:
                 transport.close()
-        except Exception as exc:  # noqa: BLE001 -- 保留清理错误的可见性和重复 close 能力。
+        except Exception as exc:  # 保留清理错误的可见性和重复 close 能力，记录后重新抛出。
             self._publish(active, WorkerObservation(
                 attempt_id, fence, "unknown", error_class="cleanup_unconfirmed",
                 session_id=active.session.session_id if active.session else None, summary=str(exc),
