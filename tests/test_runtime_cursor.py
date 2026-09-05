@@ -43,9 +43,11 @@ def test_cursor_streamed_turn_message_and_capabilities(tmp_path: Path) -> None:
         assert done.returncode == 0 and done.summary == "streamed 中文"
         assert adapter.describe().supports("resume")
         assert any(model.id == "model-b" and model.is_default for model in adapter.describe().models)
-        assert {"session.started", "message.delta", "tool.started", "tool.updated", "approval.requested",
-                "approval.resolved", "turn.completed", "provider.unknown"} <= {item.kind for item in events}
-        unknown = next(item for item in events if item.kind == "provider.unknown")
+        assert {"session", "message", "tool", "approval", "completion", "unknown"} <= {item.kind for item in events}
+        assert {"tool.started", "tool.updated", "approval.requested", "approval.resolved"} <= {
+            item.extra["detail_kind"] for item in events
+        }
+        unknown = next(item for item in events if item.kind == "unknown")
         assert unknown.payload["params"]["update"]["future"] == {"unchanged": [1, {"nested": True}]}
         assert all(item.run_id == "cursor-run" for item in events)
         following = adapter.send_message(opened.session, "second turn")
@@ -62,7 +64,7 @@ def test_cursor_streamed_turn_message_and_capabilities(tmp_path: Path) -> None:
 def test_cursor_stream_visible_before_cancel_confirmation(tmp_path: Path) -> None:
     streamed = threading.Event()
     adapter = runtime("hold")
-    adapter.event_sink = lambda event: streamed.set() if event.kind == "message.delta" else None
+    adapter.event_sink = lambda event: streamed.set() if event.kind == "message" else None
     try:
         opened = adapter.start(request(tmp_path))
         assert opened.ok and opened.session and opened.turn_id
@@ -144,7 +146,7 @@ def test_cursor_strips_parent_session_identity(tmp_path: Path) -> None:
         opened = adapter.start(request(tmp_path))
         assert opened.session and opened.turn_id
         assert adapter.wait(opened.session, opened.turn_id, timeout_seconds=3).returncode == 0
-        unknown = next(item for item in events if item.kind == "provider.unknown")
+        unknown = next(item for item in events if item.kind == "unknown")
         assert all(value is None for value in unknown.payload["params"]["update"]["parent_env"].values())
     finally:
         adapter.close()
@@ -166,7 +168,7 @@ def test_cursor_terminal_event_sink_failure_does_not_hang_or_succeed(tmp_path: P
     adapter = runtime()
 
     def sink(event: AgentEvent) -> None:
-        if event.kind == "turn.completed":
+        if event.kind == "completion":
             raise OSError("event store unavailable")
 
     adapter.event_sink = sink

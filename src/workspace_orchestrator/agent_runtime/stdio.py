@@ -21,6 +21,69 @@ JsonObject = dict[str, Any]
 MessageHandler = Callable[[JsonObject], None]
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThreadEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    class _JobBasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JobExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JobBasicLimits),
+            ("IoInfo", ctypes.c_ulonglong * 6),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    def _windows_kernel() -> Any:
+        """只绑定公开的 Win32 Job/Toolhelp/Thread API，不使用私有 NtAPI。"""
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            "SetInformationJobObject": (
+                [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL
+            ),
+            "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+            "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)], wintypes.BOOL),
+            "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)], wintypes.BOOL),
+            "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            "GetProcessIdOfThread": ([wintypes.HANDLE], wintypes.DWORD),
+            "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(kernel, name)
+            function.argtypes, function.restype = arguments, result
+        return kernel
+
+
 class RpcTransportError(RuntimeError):
     """连接不可用、协议损坏、超时或 EOF；code 是稳定的机器可读分类。"""
 
@@ -47,33 +110,76 @@ class _Pending:
 
 
 class _ProcessTree:
-    """POSIX 独立进程组；Windows Job Object 随连接回收所有后代。"""
+    """POSIX 独立进程组；Windows 先纳入 Job 再恢复挂起的新进程。"""
 
     def __init__(self, process: subprocess.Popen[str]) -> None:
         self.process = process
         self._job: Any = None
         self._kernel: Any = None
         if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
-
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-            kernel.CreateJobObjectW.restype = wintypes.HANDLE
-            kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-            kernel.AssignProcessToJobObject.restype = wintypes.BOOL
-            kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-            kernel.TerminateJobObject.restype = wintypes.BOOL
-            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel.CloseHandle.restype = wintypes.BOOL
+            kernel = _windows_kernel()
             job = kernel.CreateJobObjectW(None, None)
             if not job:
                 raise OSError(ctypes.get_last_error(), "无法创建 Runtime 进程 Job")
-            if not kernel.AssignProcessToJobObject(job, int(cast(Any, process)._handle)):
-                error = ctypes.get_last_error()
-                kernel.CloseHandle(job)
-                raise OSError(error, "无法隔离 Runtime 进程树")
             self._job, self._kernel = job, kernel
+            try:
+                limits = _JobExtendedLimits()
+                limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                if not kernel.SetInformationJobObject(
+                    job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+                ):  # JobObjectExtendedLimitInformation
+                    raise OSError(ctypes.get_last_error(), "无法设置 Runtime Job 关闭回收策略")
+                if not kernel.AssignProcessToJobObject(job, int(cast(Any, process)._handle)):
+                    raise OSError(ctypes.get_last_error(), "无法隔离 Runtime 进程树")
+                self._resume_suspended()
+            except BaseException:
+                self.kill()
+                raise
+
+    def _resume_suspended(self) -> None:
+        """Popen 已关闭 primary thread handle，使用公开 Toolhelp API 重新打开。
+
+        CREATE_SUSPENDED 保证目标程序尚未执行，因此此时应只有一个初始线程。
+        枚举不到唯一线程、owner 不一致或 suspend count 异常都拒绝继续运行。
+        不逐个恢复任意线程，也不依赖未公开的 NtResumeProcess。
+        """
+
+        if sys.platform == "win32":
+            kernel = self._kernel
+            snapshot = kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+            if snapshot == ctypes.c_void_p(-1).value:
+                raise OSError(ctypes.get_last_error(), "无法读取 Runtime 初始线程快照")
+            identifiers: list[int] = []
+            try:
+                entry = _ThreadEntry()
+                entry.dwSize = ctypes.sizeof(entry)
+                exists = kernel.Thread32First(snapshot, ctypes.byref(entry))
+                while exists:
+                    if entry.dwSize < _ThreadEntry.th32OwnerProcessID.offset + ctypes.sizeof(
+                        wintypes.DWORD
+                    ):
+                        raise OSError("Runtime 初始线程快照字段不完整")
+                    if entry.th32OwnerProcessID == self.process.pid:
+                        identifiers.append(entry.th32ThreadID)
+                    entry.dwSize = ctypes.sizeof(entry)
+                    exists = kernel.Thread32Next(snapshot, ctypes.byref(entry))
+                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                    raise OSError(ctypes.get_last_error(), "读取 Runtime 初始线程失败")
+            finally:
+                kernel.CloseHandle(snapshot)
+            if len(identifiers) != 1:
+                raise OSError("无法确认 Runtime 唯一的挂起初始线程")
+            thread = kernel.OpenThread(0x0002 | 0x0800, False, identifiers[0])
+            # THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION；句柄不得继承。
+            if not thread:
+                raise OSError(ctypes.get_last_error(), "无法打开 Runtime 初始线程")
+            try:
+                if kernel.GetProcessIdOfThread(thread) != self.process.pid:
+                    raise OSError("Runtime 初始线程归属发生变化")
+                if kernel.ResumeThread(thread) != 1:
+                    raise OSError(ctypes.get_last_error(), "无法安全恢复 Runtime 初始线程")
+            finally:
+                kernel.CloseHandle(thread)
 
     def kill(self) -> None:
         if sys.platform == "win32":
@@ -159,7 +265,8 @@ class JsonRpcStdioClient:
                 return
             try:
                 if sys.platform == "win32":
-                    creationflags = subprocess.CREATE_NO_WINDOW
+                    # CREATE_SUSPENDED：任何目标代码执行前，_ProcessTree 必须先完成 Job 隔离。
+                    creationflags = subprocess.CREATE_NO_WINDOW | 0x00000004
                     executable = shutil.which(self.command[0]) or self.command[0]
                     if Path(executable).suffix.lower() not in {".exe", ".com"}:
                         raise OSError("Windows Runtime 必须使用原生 .exe/.com；禁止隐式批处理 shell")
@@ -182,13 +289,18 @@ class JsonRpcStdioClient:
                 )
                 self._process = process
                 self._tree = _ProcessTree(process)
-            except OSError as exc:
+            except BaseException as exc:
                 if self._process is not None:
-                    self._process.kill()
+                    if self._tree is not None:
+                        self._tree.kill()
+                    if self._process.poll() is None:
+                        self._process.kill()
                     self._process.wait(timeout=5)
                     for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
                         if stream:
                             stream.close()
+                if not isinstance(exc, OSError):
+                    raise
                 self._failure = RpcTransportError("unavailable", f"Runtime 启动失败：{exc}")
                 raise self._failure from exc
             self._reader = threading.Thread(target=self._read_loop, daemon=True)

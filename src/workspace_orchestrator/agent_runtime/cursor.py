@@ -26,6 +26,7 @@ from .contracts import (
     RuntimeFailure,
     RuntimeOperationResult,
     RuntimeSessionRef,
+    standard_event_kind,
 )
 from .stdio import JsonRpcStdioClient, RpcResponseError, RpcTransportError
 
@@ -97,7 +98,8 @@ class CursorAcpRuntime:
         if self.event_sink and self._request:
             self.event_sink(AgentEvent(
                 event_id=str(uuid4()), run_id=self._request.run_id,
-                runtime_id=self.runtime_id, kind=kind, payload=payload,
+                runtime_id=self.runtime_id, kind=standard_event_kind(kind), payload=payload,
+                extra={"detail_kind": kind},
                 session_id=self._session.session_id if self._session else None,
                 turn_id=turn_id,
             ))

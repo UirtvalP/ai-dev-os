@@ -4,21 +4,29 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_dispatcher import FakeTasks
+from test_runtime_codex import runtime as codex_fixture_runtime
 
-from workspace_orchestrator import product_cli
+from workspace_orchestrator import composition, product_cli
+from workspace_orchestrator.agent_runtime.claude import ClaudeCliRuntime
 from workspace_orchestrator.agent_runtime.contracts import (
+    STANDARD_EVENT_KINDS,
     AgentEvent,
+    AgentRunRequest,
     AgentRunResult,
     RuntimeDescriptor,
 )
+from workspace_orchestrator.agent_runtime.cursor import CursorAcpRuntime
 from workspace_orchestrator.agent_runtime.events import RuntimeEventStore
 from workspace_orchestrator.automation import dispatcher
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.project_config import initialized_project_config, load_project_config
+from workspace_orchestrator.project_init import initialize_project
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -137,3 +145,132 @@ def test_non_codex_executor_drives_dispatcher_and_cannot_complete_requirement(tm
     logged = json.loads(log_path.read_text(encoding="utf-8"))
     assert logged["runtime_id"] == "cursor" and logged["run_id"] == "r1"
     assert logged["summary"] == "实现候选"
+
+
+def _fixture_runtime(name, event_sink):
+    """只替换外部产品进程命令，保留真实 Adapter、传输和执行端口。"""
+    if name == "codex":
+        return codex_fixture_runtime(event_sink=event_sink)
+    adapter = {"cursor": CursorAcpRuntime, "claude": ClaudeCliRuntime}[name]
+    fixture = Path(__file__).parent / "fixtures" / f"runtime_{name}_server.py"
+    return adapter(
+        [sys.executable, "-X", "utf8", "-u", str(fixture), "normal"],
+        event_sink=event_sink, timeout_seconds=3,
+    )
+
+
+@pytest.mark.parametrize("name", ["cursor", "claude"])
+def test_managed_hooks_configured_dispatcher_runs_non_codex_fixture_without_completion(
+    tmp_path, monkeypatch, name,
+):
+    initialized = initialize_project(tmp_path)
+    assert ".codex/hooks.json" in initialized.created
+    assert dispatcher._only_managed_hooks(tmp_path)
+    hooks_before = (tmp_path / ".codex" / "hooks.json").read_bytes()
+    _config(tmp_path, agent_runtime=name, agent_model="model-b", agent_sandbox="read-only")
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create(
+        "托管 Hook 下的非 Codex 执行", task_provider="dashi", task_project_id="demo"
+    )
+    store.touch_meta(requirement_id, status="in_progress")
+    tasks = FakeTasks(Task(
+        id="TASK-MANAGED", title="只读协议工作", status="in_progress",
+        labels=(f"requirement:{requirement_id}",), version=1,
+    ))
+    created = []
+
+    def fixture_factory(selected, *, event_sink=None):
+        assert selected == name
+        adapter = _fixture_runtime(selected, event_sink)
+        created.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(composition, "create_runtime", fixture_factory)
+    monkeypatch.setattr(dispatcher, "configured_task_provider", lambda meta, root: tasks)
+    executor = composition.configured_executor(store)
+    assert not executor.allow_managed_hook_trust
+    engine = dispatcher.AutoDispatcher(store, executor)
+
+    # 真实零退出码不能替代 Review：任务未进入审查时，Dispatcher 必须阻塞而非完成。
+    assert engine.run_once() == "blocked"
+    assert engine.run_once() == "idle"
+    assert len(created) == 1
+    adapter = created[0]
+    assert adapter._request.bypass_hook_trust is False
+    assert adapter._request.sandbox == "read-only"
+    assert adapter._request.model == "model-b"
+    assert requirement_id in adapter._request.prompt and "TASK-MANAGED" in adapter._request.prompt
+    assert adapter._client.pid is not None and not adapter._client.running
+    log_path = next((store.root / "dispatcher-logs").glob("*.json"))
+    logged = json.loads(log_path.read_text(encoding="utf-8"))
+    assert logged["returncode"] == 0
+    assert logged["runtime_id"] == name and logged["session_id"]
+    assert logged["summary"] == "streamed 中文"
+    events = RuntimeEventStore(store.root / "runtime-events").replay(logged["run_id"])
+    assert {"message", "approval", "completion", "unknown"} <= {event.kind for event in events}
+    assert all(event.kind in STANDARD_EVENT_KINDS for event in events)
+    assert tasks.task.status == "blocked"
+    assert any("Task 未进入 review" in message for message in tasks.added_comments)
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert (tmp_path / ".codex" / "hooks.json").read_bytes() == hooks_before
+
+
+def _consume_by_standard_kind(events):
+    """公共消费者只识别标准事件类别，不解析产品名称或具体 wire method。"""
+    buckets = {kind: [] for kind in ("message", "completion", "unknown")}
+    for event in events:
+        assert event.kind in STANDARD_EVENT_KINDS
+        if event.kind in buckets:
+            buckets[event.kind].append(event.payload)
+    return buckets
+
+
+def _nested_payload(payload, path):
+    current = payload
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+@pytest.mark.parametrize("name,unknown_path,expected_unknown", [
+    ("codex", ("params", "opaque"), {"nested": [1, "two"]}),
+    ("cursor", ("params", "update", "future"), {"unchanged": [1, {"nested": True}]}),
+    ("claude", ("nested",), {"retained": [1, 2]}),
+])
+def test_all_adapters_share_kind_only_consumer_and_lossless_unknown_replay(
+    tmp_path, name, unknown_path, expected_unknown,
+):
+    original = []
+    store = RuntimeEventStore(tmp_path / "events")
+
+    def persist(event):
+        store.append(event)
+        original.append(event)
+
+    adapter = _fixture_runtime(name, persist)
+    run_id = "shared-consumer"
+    try:
+        opened = adapter.start(AgentRunRequest(
+            run_id, tmp_path, "只读合同测试", sandbox="read-only", timeout_seconds=5,
+        ))
+        assert opened.ok and opened.session and opened.turn_id
+        result = adapter.wait(opened.session, opened.turn_id, timeout_seconds=5)
+        assert result.returncode == 0, result
+        assert adapter._client.running  # 不等待 Agent 进程退出，就能消费持久事件。
+        replayed = store.replay(run_id)
+        buckets = _consume_by_standard_kind(replayed)
+        assert all(buckets[kind] for kind in ("message", "completion", "unknown"))
+        assert len(buckets["completion"]) == 1
+        assert buckets == _consume_by_standard_kind(original)
+        # 包括未知嵌套数据在内的整个 wire payload 都必须原样往返，而不仅是摘要文本。
+        assert [event.payload for event in replayed] == [event.payload for event in original]
+        assert any(
+            _nested_payload(payload, unknown_path) == expected_unknown
+            for payload in buckets["unknown"]
+        )
+        assert all(event.run_id == run_id for event in replayed)
+        assert [event.sequence for event in replayed] == list(range(1, len(replayed) + 1))
+    finally:
+        adapter.close()

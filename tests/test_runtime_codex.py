@@ -1,6 +1,7 @@
 """Codex App Server JSONL 假进程端到端合同测试。"""
 
 import os
+import subprocess
 import sys
 import threading
 from dataclasses import replace
@@ -13,7 +14,7 @@ from workspace_orchestrator.adapters.agent import (
     CodexExecutionResult,
     _archive_via_app_server,
 )
-from workspace_orchestrator.agent_runtime.codex import CodexRuntime
+from workspace_orchestrator.agent_runtime.codex import CodexRuntime, codex_command
 from workspace_orchestrator.agent_runtime.contracts import AgentRunRequest, AgentRunResult
 
 FAKE = r'''
@@ -66,6 +67,8 @@ for line in sys.stdin:
         notify('turn/started',{'threadId':thread_id,'turn':{'id':current_turn}})
         # 部分服务器先推送completion，再返回turn/start响应，消费者必须仍可回放。
         if text=='eof': sys.exit(0)
+        if text=='turn-missing':
+            error(req,'no rollout found for thread id owned-thread');continue
         if text=='approval':
             approvals[42]=current_turn
             reply(req,{'turn':{'id':current_turn}})
@@ -181,6 +184,7 @@ def test_steer_interrupt_and_scope_mismatches(tmp_path):
             provider.steer(started.session, "other-turn", "bad"),
         ):
             assert operation.error.code == "scope_mismatch"
+            assert operation.session is None
         assert provider.interrupt(started.session, started.turn_id).ok
         result = provider.wait(started.session, started.turn_id, timeout_seconds=3)
         assert result.returncode == 130 and result.error.code == "interrupted"
@@ -200,11 +204,27 @@ def test_non_success_cannot_become_candidate_complete(tmp_path, prompt, expected
         provider.close()
 
 
-def test_eof_during_turn_start_is_failure(tmp_path):
+@pytest.mark.parametrize("resumed", [False, True])
+def test_eof_during_turn_start_retains_confirmed_session_identity(tmp_path, resumed):
     provider = runtime()
     try:
-        result = provider.start(request(tmp_path, "eof"))
+        operation = provider.resume if resumed else provider.start
+        result = operation(request(tmp_path, "eof", resume_session_id="owned-thread" if resumed else None))
         assert not result.ok and result.error.code == "eof"
+        assert result.session.session_id == "owned-thread"
+        assert result.session.runtime_id == "codex"
+        assert result.session.run_id == "run-test"
+        assert result.session.workspace_path == str(tmp_path.resolve())
+    finally:
+        provider.close()
+
+
+def test_missing_error_after_resume_confirmation_does_not_allow_prompt_replay(tmp_path):
+    provider = runtime()
+    try:
+        result = provider.resume(request(tmp_path, "turn-missing", resume_session_id="owned-thread"))
+        assert not result.ok and result.error.code == "rpc_error"
+        assert result.session.session_id == "owned-thread"
     finally:
         provider.close()
 
@@ -276,28 +296,94 @@ def test_archive_facade_waits_for_handshake_and_matching_reply(monkeypatch):
 @pytest.mark.skipif(os.environ.get("AI_DEV_OS_CODEX_LIVE_SMOKE") != "1", reason="仅显式本机 smoke")
 def test_live_codex_created_thread_only(tmp_path):
     """只控制本次新建的临时 Thread，不读取/归档用户已有 Thread。"""
-    provider = CodexRuntime(timeout_seconds=45)
+    activity = threading.Condition()
+    started_items = set()
+
+    def note_activity(event):
+        if event.payload.get("method") == "item/started" and event.turn_id:
+            with activity:
+                started_items.add(event.turn_id)
+                activity.notify_all()
+
+    provider = CodexRuntime(timeout_seconds=45, event_sink=note_activity)
     created_id = None
+    failures = []
+    stage = "describe"
     try:
+        selected_command = codex_command()
+        cli_version = subprocess.run(
+            [*selected_command, "--version"], check=True, text=True, encoding="utf-8",
+            capture_output=True, timeout=15,
+        ).stdout.strip()
+        print(f"live codex executable={selected_command!r} version={cli_version}", flush=True)
         descriptor = provider.describe()
-        assert descriptor.available and descriptor.models
+        assert descriptor.available and descriptor.models, descriptor
+        print(f"live codex stage={stage} models={len(descriptor.models)}", flush=True)
+        stage = "start"
         started = provider.start(request(tmp_path, "不要调用工具；只回复 RUNTIME_SMOKE_OK"))
+        if started.session:
+            created_id = started.session.session_id
+        print(f"live codex stage={stage} result={started}", flush=True)
         assert started.ok, started
-        created_id = started.session.session_id
-        assert provider.steer(started.session, started.turn_id, "不要执行文件或网络操作").ok
-        assert provider.interrupt(started.session, started.turn_id).ok
-        assert provider.wait(started.session, started.turn_id, timeout_seconds=45).returncode == 130
-        assert provider.read_session(started.session).ok
+        # 归档操作针对持久 rollout；首轮尚未物化就立刻中断不能证明可恢复能力。
+        stage = "first_turn_complete"
+        first_result = provider.wait(started.session, started.turn_id, timeout_seconds=90)
+        print(f"live codex stage={stage} result={first_result}", flush=True)
+        assert first_result.returncode == 0, first_result
+        assert "RUNTIME_SMOKE_OK" in first_result.summary
+        stage = "read_persisted_first_turn"
+        stored = provider.read_session(started.session)
+        print(f"live codex stage={stage} result={stored}", flush=True)
+        assert stored.ok, stored
+        assert stored.data["thread"].get("ephemeral") is False
+        assert any(turn["id"] == started.turn_id for turn in stored.data["thread"]["turns"])
+        stage = "control_turn_start"
+        controlled = provider.send_message(started.session, "不要调用工具；请等待进一步引导")
+        print(f"live codex stage={stage} result={controlled}", flush=True)
+        assert controlled.ok, controlled
+        # turn/start 初始响应并不保证后台任务已挂载；用真实 item 事件确认进入执行。
+        stage = "control_turn_item_started"
+        with activity:
+            assert activity.wait_for(lambda: controlled.turn_id in started_items, timeout=45)
+        print(f"live codex stage={stage} turn={controlled.turn_id} PASS", flush=True)
+        stage = "steer"
+        steered = provider.steer(started.session, controlled.turn_id, "不要执行文件或网络操作")
+        print(f"live codex stage={stage} result={steered}", flush=True)
+        assert steered.ok, steered
+        stage = "interrupt"
+        interrupted = provider.interrupt(started.session, controlled.turn_id)
+        print(f"live codex stage={stage} result={interrupted}", flush=True)
+        assert interrupted.ok, interrupted
+        interrupted_result = provider.wait(started.session, controlled.turn_id, timeout_seconds=45)
+        print(f"live codex stage={stage}_complete result={interrupted_result}", flush=True)
+        assert interrupted_result.returncode == 130, interrupted_result
         provider.close()
         provider = CodexRuntime(timeout_seconds=45)
+        stage = "resume_new_connection"
         resumed = provider.resume(request(tmp_path, "不要调用工具；只回复 RUNTIME_SMOKE_OK",
                                           resume_session_id=created_id))
+        print(f"live codex stage={stage} result={resumed}", flush=True)
         assert resumed.ok, resumed
+        stage = "resumed_turn_complete"
         result = provider.wait(resumed.session, resumed.turn_id, timeout_seconds=90)
+        print(f"live codex stage={stage} result={result}", flush=True)
         assert result.returncode == 0, result
         assert "RUNTIME_SMOKE_OK" in result.summary
-        print(f"live codex thread={created_id} model_count={len(descriptor.models)} PASS")
+    except Exception as exc:  # noqa: BLE001 -- 保留主失败，不能被 finally 归档失败覆盖。
+        exc.add_note(f"live Codex 失败阶段：{stage}；本次新建 Thread：{created_id}")
+        failures.append(exc)
     finally:
-        provider.close()
+        try:
+            provider.close()
+        except Exception as exc:  # noqa: BLE001 -- 清理失败亦须令 smoke 失败。
+            failures.append(exc)
         if created_id:
-            CodexAgentProvider().archive_session(created_id)
+            try:
+                CodexAgentProvider().archive_session(created_id)
+                print(f"live codex stage=archive thread={created_id} PASS", flush=True)
+            except Exception as exc:  # noqa: BLE001 -- 显示归档错误，而非假成功或覆盖原始错误。
+                exc.add_note(f"live Codex 归档失败：{created_id}")
+                failures.append(exc)
+    if failures:
+        raise ExceptionGroup("Codex 真实 smoke 失败（包含执行及清理错误）", failures)
+    print(f"live codex thread={created_id} PASS", flush=True)

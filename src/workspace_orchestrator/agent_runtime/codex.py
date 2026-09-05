@@ -210,21 +210,28 @@ class CodexRuntime:
                 })
 
     @staticmethod
-    def _failure(exc: RpcTransportError | RpcResponseError) -> RuntimeOperationResult:
+    def _failure(
+        exc: RpcTransportError | RpcResponseError, *, session: RuntimeSessionRef | None = None,
+        turn_id: str | None = None, allow_session_missing: bool = False,
+    ) -> RuntimeOperationResult:
         if isinstance(exc, RpcTransportError):
             status: OperationStatus = "timeout" if exc.code == "timeout" else (
                 "unavailable" if exc.code == "unavailable" else "failed"
             )
-            return RuntimeOperationResult(status=status, error=RuntimeFailure(exc.code, str(exc)))
+            return RuntimeOperationResult(
+                status=status, session=session, turn_id=turn_id,
+                error=RuntimeFailure(exc.code, str(exc)),
+            )
         code = "unsupported" if exc.code == -32601 else "rpc_error"
         # 只识别明确的会话不存在；认证、模型、网络或执行错误都不得触发 prompt 重放。
         detail = str(exc).lower()
-        if exc.code in {-32600, -32000} and (
+        if allow_session_missing and exc.code in {-32600, -32000} and (
             "no rollout found for thread id" in detail or detail.startswith("thread not found:")
         ):
             code = "session_missing"
         return RuntimeOperationResult(
             status="unsupported" if code == "unsupported" else "failed",
+            session=session, turn_id=turn_id,
             error=RuntimeFailure(code, str(exc), details={"rpc_error": exc.error}),
         )
 
@@ -289,6 +296,9 @@ class CodexRuntime:
                 params["model"] = request.model
             if resumed:
                 params["threadId"] = request.resume_session_id
+            else:
+                # Runtime 声明 resume/archive 能力，不创建仅存于内存的会话。
+                params["ephemeral"] = False
             result = client.request(
                 "thread/resume" if resumed else "thread/start", params, timeout=self.timeout_seconds
             )
@@ -306,7 +316,10 @@ class CodexRuntime:
             self._resumed = resumed
             return self.send_message(self._session, request.prompt)
         except (RpcTransportError, RpcResponseError) as exc:
-            return self._failure(exc)
+            return self._failure(
+                exc, session=self._session,
+                allow_session_missing=resumed and self._session is None,
+            )
 
     def start(self, request: AgentRunRequest) -> RuntimeOperationResult:
         return self._begin(request, resumed=False)
@@ -324,15 +337,19 @@ class CodexRuntime:
         self, session: RuntimeSessionRef, method: str, params: JsonObject,
         *, turn_id: str | None = None,
     ) -> RuntimeOperationResult:
+        owned_session = None
         try:
             self._scope(session, turn_id)
+            owned_session = session
             assert self._client is not None
             result = self._client.request(method, {
                 "threadId": session.session_id, **params
             }, timeout=self.timeout_seconds)
             return RuntimeOperationResult("ok", session=session, turn_id=turn_id, data=result)
         except (RpcTransportError, RpcResponseError) as exc:
-            return self._failure(exc)
+            return self._failure(
+                exc, session=owned_session, turn_id=turn_id if owned_session else None
+            )
 
     def read_session(self, session: RuntimeSessionRef) -> RuntimeOperationResult:
         result = self._operation(session, "thread/read", {"includeTurns": True})

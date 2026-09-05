@@ -38,7 +38,10 @@ def configured_executor(store: WorkspaceStore) -> AgentExecutionPort:
     def factory(sink: EventSink) -> AgentRuntimePort:
         return create_runtime(config.agent_runtime, event_sink=sink)
 
-    return RuntimeExecutor(factory, RuntimeEventStore(store.root / "runtime-events"))
+    return RuntimeExecutor(
+        factory, RuntimeEventStore(store.root / "runtime-events"),
+        allow_managed_hook_trust=config.agent_runtime == "codex",
+    )
 
 
 def runtime_descriptors() -> tuple[RuntimeDescriptor, ...]:

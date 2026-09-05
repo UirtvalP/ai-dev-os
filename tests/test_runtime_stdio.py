@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from workspace_orchestrator.agent_runtime import stdio as stdio_module
 from workspace_orchestrator.agent_runtime.stdio import (
     JsonRpcStdioClient,
     RpcResponseError,
@@ -220,3 +221,253 @@ print(json.dumps({'type':'child','pid':child.pid}),flush=True)
         else:
             os.kill(child_pid, 9)
             pytest.fail("Runtime 后代进程未回收")
+
+
+def _windows_test_process_api():
+    """测试只操作自己创建并持有真实句柄的进程，不扫描或终止其他服务。"""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return kernel
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 挂起启动竞态")
+@pytest.mark.parametrize("parent_exits", [False, True])
+def test_windows_spawn_on_start_is_in_job_before_target_code_runs(
+    tmp_path, monkeypatch, parent_exits
+):
+    marker = tmp_path / "owned-child-pid"
+    seen = []
+    ready = threading.Event()
+    closed = threading.Event()
+    observed_before_assignment = []
+    original_init = stdio_module._ProcessTree.__init__
+
+    def delayed_assignment(tree, process):
+        # 精确放大旧实现 Popen 到 AssignProcessToJobObject 之间的逃逸窗口。
+        time.sleep(.35)
+        observed_before_assignment.append(marker.exists())
+        original_init(tree, process)
+
+    def receive(message):
+        seen.append(message)
+        ready.set()
+
+    monkeypatch.setattr(stdio_module._ProcessTree, "__init__", delayed_assignment)
+    client = server(f"""
+import json,subprocess,sys
+from pathlib import Path
+child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],
+                       stdin=sys.stdin,stdout=sys.stdout,stderr=sys.stderr)
+Path({str(marker)!r}).write_text(str(child.pid),encoding='utf-8')
+print(json.dumps({{'type':'child','pid':child.pid}}),flush=True)
+{"" if parent_exits else "sys.stdin.read()"}
+""", raw_mode=True, on_message=receive)
+    kernel = _windows_test_process_api()
+    child_handle = None
+    closer = None
+
+    def close_client():
+        try:
+            client.close()
+        finally:
+            closed.set()
+
+    try:
+        client.start()
+        assert ready.wait(5)
+        # SYNCHRONIZE | PROCESS_TERMINATE，仅保留本测试子进程的精确句柄。
+        child_handle = kernel.OpenProcess(0x00100000 | 0x0001, False, seen[0]["pid"])
+        assert child_handle
+        assert kernel.WaitForSingleObject(child_handle, 0) == 258  # WAIT_TIMEOUT，子进程确实活着。
+        closer = threading.Thread(target=close_client, daemon=True)
+        closer.start()
+        assert closed.wait(3), "关闭 Runtime 被逃逸后代持有的 pipe 阻塞"
+        assert observed_before_assignment == [False], "目标代码在加入 Job 前已经执行"
+        assert kernel.WaitForSingleObject(child_handle, 1000) == 0
+        assert all(not thread.is_alive() for thread in (
+            client._reader, client._stderr_reader, client._writer
+        ))
+    finally:
+        # 即使在旧实现上复现失败，也先回收自己创建的后代再等待 close，防止测试泄漏。
+        if child_handle is None and marker.exists():
+            child_handle = kernel.OpenProcess(
+                0x00100000 | 0x0001, False, int(marker.read_text(encoding="utf-8"))
+            )
+        if child_handle:
+            if kernel.WaitForSingleObject(child_handle, 0) == 258:
+                kernel.TerminateProcess(child_handle, 1)
+                assert kernel.WaitForSingleObject(child_handle, 5000) == 0
+            kernel.CloseHandle(child_handle)
+        if closer:
+            closer.join(timeout=5)
+            assert not closer.is_alive()
+        else:
+            client.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 挂起启动失败清理")
+@pytest.mark.parametrize(
+    ("failure_point", "failure_value"),
+    [
+        ("CreateJobObjectW", 0),
+        ("SetInformationJobObject", 0),
+        ("AssignProcessToJobObject", 0),
+        ("CreateToolhelp32Snapshot", -1),
+        ("Thread32First", 0),
+        ("Thread32Next", 0),
+        ("OpenThread", 0),
+        ("GetProcessIdOfThread", 0),
+        ("ResumeThread", 0xFFFFFFFF),
+        ("ResumeThread", 0),
+        ("ResumeThread", 2),
+    ],
+)
+def test_windows_start_failure_never_runs_target_and_closes_owned_resources(
+    tmp_path, monkeypatch, failure_point, failure_value
+):
+    import ctypes
+
+    marker = tmp_path / "must-not-execute"
+    windows_kernel = stdio_module._windows_kernel
+    created = []
+    closed = []
+
+    def fail(*args):
+        ctypes.set_last_error(5)
+        return ctypes.c_void_p(-1).value if failure_value == -1 else failure_value
+
+    def failing_kernel():
+        kernel = windows_kernel()
+        for name in ("CreateJobObjectW", "CreateToolhelp32Snapshot", "OpenThread"):
+            original = getattr(kernel, name)
+
+            def create(*args, method=original):
+                handle = method(*args)
+                if handle and handle != ctypes.c_void_p(-1).value:
+                    created.append(handle)
+                return handle
+
+            setattr(kernel, name, create)
+        close_handle = kernel.CloseHandle
+
+        def close(handle):
+            closed.append(handle)
+            return close_handle(handle)
+
+        kernel.CloseHandle = close
+        setattr(kernel, failure_point, fail)
+        return kernel
+
+    monkeypatch.setattr(stdio_module, "_windows_kernel", failing_kernel)
+    client = server(f"from pathlib import Path;Path({str(marker)!r}).write_text('executed')")
+    try:
+        with pytest.raises(RpcTransportError) as raised:
+            client.start()
+        assert raised.value.code == "unavailable"
+        assert client._process is not None
+        assert client._process.poll() is not None
+        assert all(stream.closed for stream in (
+            client._process.stdin, client._process.stdout, client._process.stderr
+        ))
+        assert client._reader is client._stderr_reader is client._writer is None
+        assert not marker.exists()
+        assert sorted(created) == sorted(closed)
+    finally:
+        client.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 挂起线程归属检查")
+@pytest.mark.parametrize("matching_threads", [0, 2])
+def test_windows_ambiguous_initial_thread_never_resumes(tmp_path, monkeypatch, matching_threads):
+    import ctypes
+
+    marker = tmp_path / "must-not-execute"
+    windows_kernel = stdio_module._windows_kernel
+    client = server(f"from pathlib import Path;Path({str(marker)!r}).write_text('executed')")
+    resumed = []
+
+    def ambiguous_kernel():
+        kernel = windows_kernel()
+        count = 0
+
+        def next_entry(snapshot, pointer):
+            nonlocal count
+            if count >= matching_threads:
+                ctypes.set_last_error(18)
+                return 0
+            entry = ctypes.cast(pointer, ctypes.POINTER(stdio_module._ThreadEntry)).contents
+            entry.dwSize = ctypes.sizeof(entry)
+            entry.th32OwnerProcessID = client.pid
+            entry.th32ThreadID = count + 1
+            count += 1
+            return 1
+
+        kernel.Thread32First = kernel.Thread32Next = next_entry
+        kernel.ResumeThread = lambda handle: resumed.append(handle)
+        return kernel
+
+    monkeypatch.setattr(stdio_module, "_windows_kernel", ambiguous_kernel)
+    try:
+        with pytest.raises(RpcTransportError, match="唯一"):
+            client.start()
+        assert not resumed
+        assert not marker.exists()
+        assert client._process.poll() is not None
+    finally:
+        client.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 恢复前异常清理")
+def test_windows_unexpected_resume_exception_still_reaps_suspended_process(tmp_path, monkeypatch):
+    marker = tmp_path / "must-not-execute"
+
+    def interrupted_resume(tree):
+        raise KeyboardInterrupt("模拟恢复前控制器中断")
+
+    monkeypatch.setattr(stdio_module._ProcessTree, "_resume_suspended", interrupted_resume)
+    client = server(f"from pathlib import Path;Path({str(marker)!r}).write_text('executed')")
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            client.start()
+        assert client._process.poll() is not None
+        assert not marker.exists()
+        assert all(stream.closed for stream in (
+            client._process.stdin, client._process.stdout, client._process.stderr
+        ))
+    finally:
+        client.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 关闭回收策略")
+def test_windows_job_kills_owned_process_when_its_last_handle_closes():
+    import ctypes
+    from ctypes import wintypes
+
+    with server("import sys;sys.stdin.read()") as client:
+        tree = client._tree
+        kernel = tree._kernel
+        kernel.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p
+        ]
+        kernel.QueryInformationJobObject.restype = wintypes.BOOL
+        limits = stdio_module._JobExtendedLimits()
+        assert kernel.QueryInformationJobObject(
+            tree._job, 9, ctypes.byref(limits), ctypes.sizeof(limits), None
+        )
+        assert limits.BasicLimitInformation.LimitFlags == 0x2000
+        # 只设 KILL_ON_JOB_CLOSE，未开放 BREAKAWAY_OK 或 SILENT_BREAKAWAY_OK。
+        assert client._process.poll() is None
+        assert kernel.CloseHandle(tree._job)
+        tree._job = None
+        assert client._process.wait(timeout=5) is not None

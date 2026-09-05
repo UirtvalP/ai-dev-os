@@ -41,8 +41,10 @@ def test_claude_streamed_turn_models_and_followup(tmp_path: Path) -> None:
         assert done.returncode == 0 and done.summary == "streamed 中文"
         assert {model.id for model in adapter.describe().models} == {"model-a", "model-b"}
         assert adapter.describe().version == "fixture-1"
-        assert {"session.started", "message.delta", "approval.requested", "approval.resolved",
-                "turn.completed", "provider.unknown"} <= {event.kind for event in events}
+        assert {"session", "message", "approval", "completion", "unknown"} <= {event.kind for event in events}
+        assert {"approval.requested", "approval.resolved"} <= {
+            event.extra["detail_kind"] for event in events
+        }
         assert all(event.run_id == "claude-run" for event in events)
         assert any(event.payload.get("nested") == {"retained": [1, 2]} for event in events)
         following = adapter.send_message(opened.session, "second turn")
@@ -59,7 +61,7 @@ def test_claude_streamed_turn_models_and_followup(tmp_path: Path) -> None:
 def test_claude_interrupt_ack_is_not_completion(tmp_path: Path) -> None:
     streamed = threading.Event()
     adapter = runtime("hold")
-    adapter.event_sink = lambda event: streamed.set() if event.kind == "message.delta" else None
+    adapter.event_sink = lambda event: streamed.set() if event.kind == "message" else None
     try:
         opened = adapter.start(request(tmp_path))
         assert opened.ok and opened.session and opened.turn_id
@@ -82,7 +84,7 @@ def test_claude_resume_and_restricted_cli_args(tmp_path: Path) -> None:
         assert opened.ok and opened.session and opened.session.session_id == "previous-session"
         assert opened.turn_id
         assert adapter.wait(opened.session, opened.turn_id, timeout_seconds=3).resumed
-        args = next(item.payload["argv"] for item in events if item.kind == "session.resumed")
+        args = next(item.payload["argv"] for item in events if item.kind == "session")
         assert "--resume=previous-session" in args
         assert args[args.index("--tools") + 1] == "Read,Grep,Glob"
         assert args[args.index("--permission-mode") + 1] == "plan"
@@ -139,7 +141,7 @@ def test_claude_strips_parent_identity_and_preserves_explicit_resume_option(tmp_
         opened = adapter.resume(request(tmp_path, resume_session_id="--dangerously-skip-permissions"))
         assert opened.session and opened.turn_id
         assert adapter.wait(opened.session, opened.turn_id, timeout_seconds=3).returncode == 0
-        init = next(event.payload for event in events if event.kind == "session.resumed")
+        init = next(event.payload for event in events if event.kind == "session")
         assert all(value is None for value in init["parent_env"].values())
         assert "--resume=--dangerously-skip-permissions" in init["argv"]
         assert "--dangerously-skip-permissions" not in init["argv"]
@@ -151,7 +153,7 @@ def test_claude_terminal_event_sink_failure_is_not_completion(tmp_path: Path) ->
     adapter = runtime()
 
     def sink(event: AgentEvent) -> None:
-        if event.kind == "turn.completed":
+        if event.kind == "completion":
             raise OSError("event store unavailable")
 
     adapter.event_sink = sink

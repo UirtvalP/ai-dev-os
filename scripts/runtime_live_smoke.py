@@ -12,9 +12,11 @@ import pytest
 
 from workspace_orchestrator.agent_runtime.contracts import AgentRunRequest
 from workspace_orchestrator.composition import create_runtime
+from workspace_orchestrator.console import configure_standard_streams
 
 
 def main() -> int:
+    configure_standard_streams()
     # 当前阶段本机已安装 Codex；其他 Runtime 缺失必须是明确的 unavailable。
     # 将来本机安装新 Runtime 后，本 gate 必须增加其 live suite，不能静默跳过。
     with tempfile.TemporaryDirectory(prefix="ai-dev-os-runtime-smoke-") as directory:

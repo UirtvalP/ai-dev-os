@@ -11,6 +11,18 @@ from typing import Any, Literal
 
 SCHEMA_VERSION = 1
 OperationStatus = Literal["ok", "unsupported", "unavailable", "failed", "timeout"]
+STANDARD_EVENT_KINDS = frozenset({
+    "session", "turn", "message", "tool", "approval", "error", "completion", "unknown",
+})
+
+
+def standard_event_kind(detail: str) -> str:
+    """Adapter 对外只发布统一类别；结束事件不代表成功或需求完成。"""
+
+    if detail in {"turn.completed", "turn.failed", "turn.cancelled"}:
+        return "completion"
+    category = detail.partition(".")[0]
+    return category if category in STANDARD_EVENT_KINDS else "unknown"
 
 
 def event_timestamp() -> str:

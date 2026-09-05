@@ -96,6 +96,17 @@ def test_only_explicit_missing_session_can_fallback(tmp_path):
     assert runtime.closed
 
 
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("trusted", [False, True])
+def test_managed_hook_trust_requires_both_local_evidence_and_adapter_support(tmp_path, supported, trusted):
+    runtime = FakeRuntime()
+    bridge, _ = executor(tmp_path, runtime)
+    bridge.allow_managed_hook_trust = supported
+    result = bridge.execute(tmp_path, "任务", bypass_hook_trust=trusted)
+    assert result.returncode == 0
+    assert runtime.requests[0][1].bypass_hook_trust is (supported and trusted)
+
+
 @pytest.mark.parametrize("code", ["timeout", "permission_denied", "transport_error", "unknown", "model_unavailable"])
 def test_ambiguous_resume_failure_never_replays_prompt(tmp_path, code):
     runtime = FakeRuntime()

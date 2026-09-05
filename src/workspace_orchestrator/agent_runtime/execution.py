@@ -26,6 +26,7 @@ class RuntimeExecutor:
     runtime_factory: Callable[[EventSink], AgentRuntimePort]
     event_store: RuntimeEventStore
     timeout_seconds: float = 7200
+    allow_managed_hook_trust: bool = False
 
     def execute(
         self,
@@ -49,7 +50,8 @@ class RuntimeExecutor:
             sandbox=sandbox,
             model=model,
             resume_session_id=resume_session_id,
-            bypass_hook_trust=bypass_hook_trust,
+            # 托管 Hook 检查来自兼容 Dispatcher；只向明确支持的 Adapter 传递授权。
+            bypass_hook_trust=bypass_hook_trust and self.allow_managed_hook_trust,
             timeout_seconds=self.timeout_seconds,
         )
 
