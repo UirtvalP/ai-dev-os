@@ -13,6 +13,7 @@ import pytest
 
 from workspace_orchestrator.adapters.agent import CodexAgentProvider
 from workspace_orchestrator.adapters.task import TaskProviderError
+from workspace_orchestrator.automation import runtime as runtime_module
 from workspace_orchestrator.automation.git_sync import collect_git_context
 from workspace_orchestrator.automation.requirement_attach import (
     AutomationAmbiguity,
@@ -23,6 +24,7 @@ from workspace_orchestrator.automation.session_runtime import attach_session, en
 from workspace_orchestrator.automation.task_attach import configured_task_provider
 from workspace_orchestrator.cli import main
 from workspace_orchestrator.models import ReviewApprovalFact, Task
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_init import initialize_project
 from workspace_orchestrator.review_packet import build_review_packet, render_review_packet
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
@@ -277,6 +279,45 @@ def test_existing_session_task_binding_wins_over_later_explicit_task(tmp_path: P
     assert tasks.get_task("TASK-002").status == "todo"
 
 
+@pytest.mark.parametrize("entrypoint", ["bootstrap", "snapshot"])
+def test_interactive_entrypoints_block_unactivated_phase_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated phase")
+    store.touch_meta(
+        requirement_id,
+        status="in_progress",
+        phase_gate_required=True,
+        requirement_task_id="AID-170",
+    )
+    tasks = FakeTasks()
+    tasks.tasks[requirement_id] = [
+        Task(id="AID-170", title="Phase 1", status="in_progress")
+    ]
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-gated"}),
+        tasks,
+    )
+
+    def reject(*_: object) -> str:
+        raise PhaseGateError("missing activation")
+
+    monkeypatch.setattr(GateStore, "require_task_active", reject)
+
+    with pytest.raises(PhaseGateError, match="missing activation"):
+        if entrypoint == "bootstrap":
+            runtime.bootstrap(requirement_id, task_ids=("AID-170",))
+        else:
+            runtime.snapshot(requirement_id, task_ids=("AID-170",))
+
+    assert tasks.get_task("AID-170").status == "blocked"
+    assert store.load(requirement_id)["sessions"] == []
+
+
 def test_black_box_c_multiple_requirements_returns_ambiguity_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -510,6 +551,107 @@ def test_finalize_runs_known_verification_and_auto_completes_by_default(
     ]
     assert review_tasks == []
     assert result.review_task_id is None
+
+
+def test_gated_finalize_requires_final_gate_before_any_task_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated finalize")
+    tasks = FakeTasks()
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-gated-finalize"}),
+        tasks,
+    )
+    runtime.bootstrap(requirement_id, development_request="完成当前阶段")
+    current_task_id = tasks.created[0]
+    tasks.tasks[requirement_id].append(
+        Task(id="TASK-FUTURE", title="未来阶段", status="blocked")
+    )
+    store.touch_meta(
+        requirement_id,
+        phase_gate_required=True,
+        requirement_task_id=current_task_id,
+    )
+
+    def reject_completion(*_: object) -> None:
+        raise PhaseGateError("最终 Gate 缺失")
+
+    monkeypatch.setattr(
+        GateStore,
+        "require_requirement_completion_ready",
+        reject_completion,
+    )
+
+    result = runtime.finalize(requirement_id)
+
+    assert result.passed is False
+    assert "最终 Phase Gate 未就绪" in result.blockers[0]
+    assert tasks.get_task(current_task_id).status == "in_progress"
+    assert tasks.get_task("TASK-FUTURE").status == "blocked"
+    data = store.load(requirement_id)
+    assert data["meta"]["status"] == "in_progress"
+    assert data["sessions"][0]["result"] == "in_progress"
+
+
+def test_gated_finalize_rechecks_valid_final_gate_before_legacy_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    store.touch_meta(
+        requirement_id,
+        manual_test_required=False,
+        phase_gate_required=True,
+        requirement_task_id="TASK-001",
+    )
+    completion_checks = 0
+
+    def accept_completion(*_: object) -> None:
+        nonlocal completion_checks
+        completion_checks += 1
+
+    monkeypatch.setattr(
+        GateStore,
+        "require_requirement_completion_ready",
+        accept_completion,
+    )
+
+    result = runtime.finalize(requirement_id)
+
+    assert result.passed is True
+    assert result.requirement_completed is True
+    assert completion_checks == 2
+    assert tasks.get_task("TASK-001").status == "done"
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+
+
+def test_gated_confirm_requires_final_gate_before_requirement_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated confirm", task_provider=None)
+    store.touch_meta(
+        requirement_id,
+        status="in_review",
+        phase_gate_required=True,
+        requirement_task_id="TASK-FINAL",
+    )
+    runtime = AutomationRuntime(store, CodexAgentProvider(environ={}))
+
+    def reject_completion(*_: object) -> None:
+        raise PhaseGateError("最终 Gate 无效")
+
+    monkeypatch.setattr(
+        GateStore,
+        "require_requirement_completion_ready",
+        reject_completion,
+    )
+
+    with pytest.raises(PhaseGateError, match="最终 Gate 无效"):
+        runtime.confirm(requirement_id, user_confirmed=True)
+
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
 
 
 def test_concurrent_finalize_never_rolls_done_back_to_in_progress(tmp_path: Path) -> None:
@@ -1315,6 +1457,317 @@ def test_stop_auto_finishes_only_after_thread_commit_is_clean_and_pushed(
     assert tasks.unlinks == [("TASK-001", "thread-pushed")]
     assert store.load(requirement_id)["sessions"][0]["result"] == "completed"
     assert store.load(requirement_id)["meta"]["status"] != "done"
+    assert store.load(requirement_id)["meta"].get("pending_auto_completion") is None
+
+
+def _crashed_finalize_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, gated: bool = False
+) -> tuple[WorkspaceStore, str, FakeTasks, AutomationRuntime, list[str]]:
+    store, requirement_id, tasks, _ = _reviewable_runtime(tmp_path)
+    initialize_project(tmp_path)
+    store.touch_meta(
+        requirement_id,
+        manual_test_required=False,
+        phase_gate_required=gated,
+        requirement_task_id="TASK-001",
+    )
+    archived: list[str] = []
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(
+            environ={"CODEX_THREAD_ID": "packet-thread"}, archive_runner=archived.append
+        ),
+        tasks,
+    )
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "verified implementation")
+    _add_remote_and_push(tmp_path)
+    complete = runtime_module.complete_tasks
+
+    def crash_after_tasks(*args: object) -> None:
+        complete(*args)  # type: ignore[arg-type]
+        raise RuntimeError("crash after provider completion")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(runtime_module, "complete_tasks", crash_after_tasks)
+        if gated:
+            crash.setattr(GateStore, "require_requirement_completion_ready", lambda *_: None)
+        with pytest.raises(RuntimeError, match="crash after provider completion"):
+            runtime.finalize(requirement_id, completed=("已验证的实现",))
+    assert tasks.get_task("TASK-001").status == "done"
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert store.load(requirement_id)["meta"]["pending_auto_completion"]["session_id"] == (
+        "packet-thread"
+    )
+    return store, requirement_id, tasks, runtime, archived
+
+
+def test_stop_recovers_requirement_after_finalize_crashes_after_task_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id, tasks, runtime, archived = _crashed_finalize_runtime(
+        tmp_path, monkeypatch
+    )
+    original_handoff = store.load(requirement_id)["handoff"]
+    task_writes: list[tuple[str, str]] = []
+    update_status = tasks.update_status
+
+    def track_status(task_id: str, status: str) -> Task:
+        task_writes.append((task_id, status))
+        return update_status(task_id, status)
+
+    monkeypatch.setattr(tasks, "update_status", track_status)
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is True
+    data = store.load(requirement_id)
+    assert data["meta"]["status"] == "done"
+    assert data["meta"]["completion_mode"] == "auto_after_verification"
+    assert data["meta"]["pending_auto_completion"] is None
+    assert data["sessions"][0]["result"] == "completed"
+    assert data["handoff"] == original_handoff
+    assert archived == ["packet-thread"]
+    assert task_writes == []
+    assert runtime.auto_finish_pushed_thread().completed is False
+    assert archived == ["packet-thread"]
+
+
+def test_stop_retries_if_recovery_requirement_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id, tasks, runtime, archived = _crashed_finalize_runtime(
+        tmp_path, monkeypatch
+    )
+    touch_meta = WorkspaceStore.touch_meta
+
+    def fail_done(
+        current_store: WorkspaceStore, requirement_id: str, **changes: object
+    ) -> dict[str, object]:
+        if changes.get("status") == "done":
+            raise WorkspaceError("injected local write failure")
+        return touch_meta(current_store, requirement_id, **changes)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(WorkspaceStore, "touch_meta", fail_done)
+        result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert "injected local write failure" in result.reason
+    assert tasks.get_task("TASK-001").status == "done"
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert store.load(requirement_id)["sessions"][0]["result"] == "in_progress"
+    assert archived == []
+    assert runtime.auto_finish_pushed_thread().completed is True
+    assert store.load(requirement_id)["meta"]["status"] == "done"
+    assert archived == ["packet-thread"]
+
+
+@pytest.mark.parametrize("changed", ["requirement", "intent", "verification", "manual", "session"])
+def test_stop_cannot_reuse_finalize_authorization_after_evidence_or_binding_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    store, requirement_id, _, runtime, archived = _crashed_finalize_runtime(
+        tmp_path, monkeypatch
+    )
+    data = store.load(requirement_id)
+    if changed == "manual":
+        store.touch_meta(requirement_id, manual_test_required=True)
+    elif changed == "session":
+        pending = dict(data["meta"]["pending_auto_completion"])
+        pending["session_id"] = "another-thread"
+        store.touch_meta(requirement_id, pending_auto_completion=pending)
+    else:
+        store.write_text(data["path"] / f"{changed}.md", data[changed] + "\n新验收事实\n")
+
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert "授权" in result.reason
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert store.load(requirement_id)["sessions"][0]["result"] == "in_progress"
+    assert archived == []
+
+
+def test_stop_recovery_rechecks_current_code_and_does_not_archive_failed_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id, _, runtime, archived = _crashed_finalize_runtime(
+        tmp_path, monkeypatch
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.workspace-orchestrator.automation]\n"
+        'verification-commands = [["{python}", "-c", "raise SystemExit(1)"]]\n',
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "pyproject.toml")
+    _git(tmp_path, "commit", "-m", "introduce verification failure")
+    _git(tmp_path, "push")
+
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert "恢复验证未通过" in result.reason
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert archived == []
+
+
+def test_stop_recovery_rechecks_final_gate_before_requirement_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id, _, runtime, archived = _crashed_finalize_runtime(
+        tmp_path, monkeypatch, gated=True
+    )
+    checks = 0
+
+    def gate_expires(*_: object) -> None:
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            raise PhaseGateError("Gate expired during recovery")
+
+    monkeypatch.setattr(GateStore, "require_requirement_completion_ready", gate_expires)
+
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert checks == 2
+    assert "Gate expired" in result.reason
+    assert store.load(requirement_id)["meta"]["status"] == "in_progress"
+    assert archived == []
+
+
+def test_manual_finalize_push_does_not_authorize_automatic_requirement_completion(
+    tmp_path: Path,
+) -> None:
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    initialize_project(tmp_path)
+    archived: list[str] = []
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(
+            environ={"CODEX_THREAD_ID": "packet-thread"}, archive_runner=archived.append
+        ),
+        tasks,
+    )
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "manual acceptance candidate")
+    _add_remote_and_push(tmp_path)
+    assert runtime.finalize(requirement_id, completed=("等待人工验收",)).requirement_in_review
+    assert store.load(requirement_id)["meta"].get("pending_auto_completion") is None
+
+    assert runtime.auto_finish_pushed_thread().completed is True
+    assert store.load(requirement_id)["meta"]["status"] == "in_review"
+    assert archived == ["packet-thread"]
+
+
+def test_gated_stop_hook_requires_final_gate_before_legacy_task_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_git(tmp_path)
+    initialize_project(tmp_path)
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "initialize ai dev os")
+    _add_remote_and_push(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated legacy stop")
+    tasks = FakeTasks()
+    archived: list[str] = []
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(
+            environ={"CODEX_THREAD_ID": "thread-gated-stop"},
+            archive_runner=archived.append,
+        ),
+        tasks,
+    )
+    runtime.bootstrap(requirement_id, development_request="完成最终阶段")
+    task_id = tasks.created[0]
+    store.touch_meta(
+        requirement_id,
+        status="done",
+        phase_gate_required=True,
+        requirement_task_id=task_id,
+    )
+    (tmp_path / "README.md").write_text("gated completion\n", encoding="utf-8")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "finish gated requirement")
+    _git(tmp_path, "push")
+
+    def reject_completion(*_: object) -> None:
+        raise PhaseGateError("最终 Gate 尚未提交")
+
+    monkeypatch.setattr(
+        GateStore,
+        "require_requirement_completion_ready",
+        reject_completion,
+    )
+
+    result = runtime.auto_finish_pushed_thread()
+
+    assert result.completed is False
+    assert "最终 Phase Gate 未就绪" in result.reason
+    assert tasks.get_task(task_id).status == "in_progress"
+    assert archived == []
+    assert store.load(requirement_id)["sessions"][0]["result"] == "in_progress"
+
+
+def test_gated_bootstrap_uses_declared_current_task_without_creating_from_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_git(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated bootstrap", task_provider=None)
+    tasks = FakeTasks()
+    tasks.tasks[requirement_id] = [
+        Task("AID-PHASE-0", "Phase 0", status="todo")
+    ]
+    store.touch_meta(
+        requirement_id,
+        phase_gate_required=True,
+        requirement_task_id="AID-PHASE-0",
+        requirement_space_closed=True,
+    )
+    monkeypatch.setattr(
+        GateStore,
+        "require_task_active",
+        lambda self, requirement_id, task_id: "initial",
+    )
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-gated"}),
+        tasks,
+    )
+
+    runtime.bootstrap(requirement_id, development_request="不得创建未声明工作卡")
+
+    assert tasks.created == []
+    assert tasks.get_task("AID-PHASE-0").status == "in_progress"
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["AID-PHASE-0"]
+
+
+def test_gated_bootstrap_without_task_provider_cannot_bind_local_task(
+    tmp_path: Path,
+) -> None:
+    _init_git(tmp_path)
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Gated providerless bootstrap", task_provider=None)
+    store.touch_meta(
+        requirement_id,
+        phase_gate_required=True,
+        requirement_task_id="AID-UNDECLARED",
+        requirement_space_closed=True,
+    )
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-providerless"}),
+        None,
+    )
+
+    with pytest.raises(PhaseGateError, match="Task Provider"):
+        runtime.bootstrap(requirement_id)
+
+    assert store.load(requirement_id)["sessions"] == []
+    assert store.load(requirement_id)["meta"]["status"] == "draft"
 
 
 def test_finalize_then_push_keeps_pending_record_until_stop_archives(

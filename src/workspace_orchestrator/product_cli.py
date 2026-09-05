@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
-from .adapters.agent import CodexExecProvider
 from .adapters.package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
+from .agent_runtime.events import RuntimeEventStore
 from .automation.dispatcher import (
     AutoDispatcher,
     dispatcher_status,
@@ -18,6 +19,8 @@ from .automation.dispatcher import (
     stop_dispatcher,
 )
 from .automation.requirement_attach import discover_project_root
+from .composition import configured_executor, runtime_descriptors
+from .console import configure_standard_streams as _configure_standard_streams
 from .hook_runtime import main as hook_main
 from .project_config import load_project_config
 from .project_init import InitResult, initialize_project, migrate_project
@@ -25,8 +28,6 @@ from .project_registry import GlobalProjectRegistry, RegisteredProject
 from .workspace import WorkspaceError, WorkspaceStore
 
 DEFAULT_UPGRADE_SOURCE = "git+https://github.com/UirtvalP/ai-dev-os.git"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-dev-os",
@@ -66,8 +67,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unregister.add_argument("project_id", help="稳定项目 ID")
     commands.add_parser("hook", help=argparse.SUPPRESS)
+    runtime = commands.add_parser("runtime", help="发现 Agent Runtime 能力或读取实时事件")
+    runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_commands.add_parser("list", help="显示已安装 Runtime 的真实能力与可用模型")
+    events = runtime_commands.add_parser("events", help="按运行 ID 和游标重放持久事件")
+    events.add_argument("run_id", help="Runtime 运行 ID")
+    events.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
+    events.add_argument("--after", type=int, default=0, help="排他事件序号（默认：0）")
+    events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
+    orchestration = commands.add_parser("orchestration", help="V2 单写者计划、执行与恢复控制面")
+    orchestration_commands = orchestration.add_subparsers(dest="orchestration_command", required=True)
+    for action, description in (
+        ("status", "读取本地编排状态，不启动 Worker"),
+        ("plan", "从结构化 JSON 冻结本需求执行计划，不启动 Worker"),
+        ("run", "前台续租并执行至候选或阻塞；不会完成 Requirement"),
+    ):
+        command = orchestration_commands.add_parser(action, help=description)
+        command.add_argument("requirement_id", help="已经存在的 Requirement ID")
+        command.add_argument("--root", type=Path, default=Path.cwd())
+        if action != "status":
+            command.add_argument("--owner", required=True, help="操作员/控制器唯一身份")
+            command.add_argument("--max-workers", type=int, default=1)
+            command.add_argument("--allow-worktree-root", type=Path, action="append", default=[])
+            command.add_argument("--allow-network", action="store_true",
+                                 help="显式允许隔离域联网；不宣称已实现域名过滤")
+        if action == "plan":
+            command.add_argument("--file", type=Path, required=True, help="PlanningRequest JSON 文件")
+        elif action == "run":
+            command.add_argument("--timeout", type=float, default=300, help="本次前台服务最长秒数")
     dispatcher = commands.add_parser(
-        "dispatcher", help="管理 dashi → Codex 自动执行 Dispatcher"
+        "dispatcher", help="管理 Task → Agent 自动执行 Dispatcher"
     )
     dispatcher_commands = dispatcher.add_subparsers(dest="dispatcher_command", required=True)
     for name, help_text in (
@@ -166,9 +195,60 @@ def _format_project(project: RegisteredProject) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "orchestration":
+        from .orchestration.contracts import PlanningRequest, PolicyError
+        from .orchestration_composition import (
+            configured_projection,
+            configured_supervisor,
+            control_store,
+            run_supervisor,
+        )
+
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        if args.orchestration_command == "status":
+            orchestration_result = control_store(store, args.requirement_id).snapshot()
+        else:
+            supervisor = configured_supervisor(
+                store, args.requirement_id, owner=args.owner, max_workers=args.max_workers,
+                allow_network=args.allow_network,
+                allowed_worktree_roots=tuple(path.absolute() for path in args.allow_worktree_root),
+            )
+            try:
+                if args.orchestration_command == "plan":
+                    if args.file.stat().st_size > 1024 * 1024:
+                        raise WorkspaceError("计划 JSON 超出 1 MiB 限制")
+                    request = PlanningRequest.from_dict(json.loads(args.file.read_text(encoding="utf-8")))
+                    if request.requirement_id != args.requirement_id:
+                        raise WorkspaceError("计划 Requirement ID 与命令目标不一致")
+                    supervisor.acquire()
+                    try:
+                        supervisor.initialize(request)
+                    finally:
+                        supervisor.close()
+                    orchestration_result = supervisor.status()
+                else:
+                    orchestration_result = run_supervisor(
+                        supervisor, timeout_seconds=args.timeout,
+                        projection=configured_projection(store, args.requirement_id),
+                    )
+            except (ValueError, PolicyError) as exc:
+                raise WorkspaceError(f"编排请求被拒绝：{exc}") from exc
+        return json.dumps(orchestration_result, ensure_ascii=False, indent=2)
+    if args.command == "runtime":
+        if args.runtime_command == "list":
+            return json.dumps(
+                [asdict(item) for item in runtime_descriptors()], ensure_ascii=False, indent=2
+            )
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        events = RuntimeEventStore(store.root / "runtime-events").replay(
+            args.run_id, after=args.after, limit=args.limit
+        )
+        return json.dumps([item.to_dict() for item in events], ensure_ascii=False, indent=2)
     if args.command == "init":
         result = initialize_project(args.path)
-        registry = _sync_registry_after_local_success(result.root, action="接入")
+        registry_message = _sync_registry_after_local_success(result.root, action="接入")
         status = start_dispatcher(
             WorkspaceStore(result.root, execution_root=result.root)
         )
@@ -177,21 +257,21 @@ def run(args: argparse.Namespace) -> str:
             if status.get("running") or status.get("status") == "starting"
             else f"\nDispatcher：{status.get('status', '未启动')}。"
         )
-        return _format_result(result, action="已接入") + f"\n{registry}" + suffix
+        return _format_result(result, action="已接入") + f"\n{registry_message}" + suffix
     if args.command == "upgrade":
         return _format_upgrade_result(UvToolInstaller().upgrade(args.source))
     if args.command == "migrate":
         result = migrate_project(args.path)
-        registry = _sync_registry_after_local_success(result.root, action="迁移")
-        return _format_result(result, action="项目格式已迁移") + f"\n{registry}"
+        registry_message = _sync_registry_after_local_success(result.root, action="迁移")
+        return _format_result(result, action="项目格式已迁移") + f"\n{registry_message}"
     if args.command == "project":
-        registry = GlobalProjectRegistry()
+        project_registry = GlobalProjectRegistry()
         if args.project_command == "list":
-            return _format_project_list(registry.list())
+            return _format_project_list(project_registry.list())
         if args.project_command == "show":
-            return _format_project(registry.show(args.project_id))
+            return _format_project(project_registry.show(args.project_id))
         if args.project_command == "unregister":
-            project = registry.unregister(args.project_id)
+            project = project_registry.unregister(args.project_id)
             return (
                 f"已取消全局登记：{project.id}（{project.name}）\n"
                 "项目文件、.workspace、Git 与 dashi Task 均未删除。"
@@ -207,11 +287,12 @@ def run(args: argparse.Namespace) -> str:
         if args.dispatcher_command == "status":
             return json.dumps(dispatcher_status(store), ensure_ascii=False, indent=2)
         if args.dispatcher_command == "run-once":
-            return AutoDispatcher(store, CodexExecProvider()).run_once()
+            return AutoDispatcher(store, configured_executor(store)).run_once()
     raise AssertionError(f"未处理的命令：{args.command}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_standard_streams()
     effective = sys.argv[1:] if argv is None else argv
     if effective == ["hook"]:
         return hook_main()
@@ -220,11 +301,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dispatcher" and args.dispatcher_command == "serve":
             execution_root = args.root.expanduser().resolve()
             project_root = discover_project_root(execution_root)
-            return serve_dispatcher(
-                WorkspaceStore(project_root, execution_root=execution_root)
-            )
+            store = WorkspaceStore(project_root, execution_root=execution_root)
+            return serve_dispatcher(store, configured_executor(store))
         output = run(args)
-    except (OSError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
+    except (OSError, ValueError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     print(output)

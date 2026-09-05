@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from workspace_orchestrator.adapters.base import TaskProvider
+from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.adapters.task import (
     DashiTaskProvider,
-    TaskProviderError,
     ensure_taskboard_service,
 )
 from workspace_orchestrator.models import Task
@@ -98,6 +97,47 @@ def _requirement_space_content(store: WorkspaceStore, requirement_id: str) -> st
     )
 
 
+def _requirement_space_task(
+    store: WorkspaceStore, requirement_id: str, *, title: str
+) -> Task:
+    return Task(
+        id="new",
+        title=title,
+        description=_requirement_space_content(store, requirement_id),
+        status="todo",
+        labels=(REQUIREMENT_SPACE_LABEL, f"requirement:{requirement_id}"),
+    )
+
+
+def _validate_requirement_space_identity(
+    task: Task,
+    *,
+    requirement_id: str,
+    expected_title: str,
+    expected_project_id: str | None,
+    allow_legacy_projection: bool,
+) -> None:
+    expected_requirement_label = f"requirement:{requirement_id}"
+    marker = f"# {requirement_id} 需求空间"
+    first_line = task.description.splitlines()[0].strip() if task.description else ""
+    requirement_labels = {label for label in task.labels if label.startswith("requirement:")}
+    full_labels = {
+        REQUIREMENT_SPACE_LABEL,
+        expected_requirement_label,
+    }.issubset(task.labels)
+    legacy_labels = allow_legacy_projection and not task.labels
+    if expected_project_id and task.project_id and task.project_id != expected_project_id:
+        raise WorkspaceError(f"Requirement 空间卡 {task.id} 属于另一个 Task 项目")
+    if task.title != expected_title or first_line != marker:
+        raise WorkspaceError(f"Requirement 空间卡 {task.id} 的标题或正文身份标记不匹配")
+    if task.binding_session_id is not None:
+        raise WorkspaceError(f"Requirement 空间卡 {task.id} 不能带执行 Session 绑定")
+    if requirement_labels not in (set(), {expected_requirement_label}):
+        raise WorkspaceError(f"Requirement 空间卡 {task.id} 带有其他 Requirement 标签")
+    if not full_labels and not legacy_labels:
+        raise WorkspaceError(f"Requirement 空间卡 {task.id} 的身份标签不完整")
+
+
 def ensure_requirement_space_task(
     store: WorkspaceStore, requirement_id: str, task_provider: TaskProvider | None
 ) -> Task | None:
@@ -109,46 +149,112 @@ def ensure_requirement_space_task(
         with store.provider_locked(requirement_id):
             data = store.load(requirement_id)
             meta = data["meta"]
+            expected_title = f"[需求空间] {requirement_id} {meta['title']}"
+            expected_project_id = str(meta.get("task_project_id") or "") or None
+            desired = _requirement_space_task(
+                store, requirement_id, title=expected_title
+            )
             tasks = tuple(task_provider.list_tasks(requirement_id))
             expected_id = str(meta.get("requirement_space_task_id") or "")
             current = next((task for task in tasks if task.id == expected_id), None)
-            if current is None:
-                matches = [task for task in tasks if is_requirement_space_task(task)]
-                if len(matches) > 1:
-                    raise WorkspaceError(
-                        f"需求 {requirement_id} 存在多个 Requirement 空间卡："
-                        + ", ".join(task.id for task in matches)
-                    )
-                current = matches[0] if matches else None
-            if current is not None and current.status == "done":
-                store.touch_meta(
-                    requirement_id,
-                    requirement_space_task_id=current.id,
-                    requirement_space_closed=True,
+            if expected_id and current is None:
+                try:
+                    candidate = task_provider.get_task(expected_id)
+                except TaskProviderError as exc:
+                    raise BoardTaskSyncError(
+                        f"无法核验需求 {requirement_id} 已记录的 Requirement 空间卡 "
+                        f"{expected_id}；为避免创建重复卡，已停止同步：{exc}"
+                    ) from exc
+                _validate_requirement_space_identity(
+                    candidate,
+                    requirement_id=requirement_id,
+                    expected_title=expected_title,
+                    expected_project_id=expected_project_id,
+                    allow_legacy_projection=True,
                 )
+                current = candidate
+            candidates = {
+                task.id: task for task in tasks if is_requirement_space_task(task)
+            }
+            finder = getattr(task_provider, "find_tasks_by_exact_title", None)
+            if callable(finder):
+                candidates.update(
+                    (task.id, task) for task in finder(expected_title)
+                )
+            if current is not None:
+                candidates[current.id] = current
+            for candidate in candidates.values():
+                _validate_requirement_space_identity(
+                    candidate,
+                    requirement_id=requirement_id,
+                    expected_title=expected_title,
+                    expected_project_id=expected_project_id,
+                    allow_legacy_projection=True,
+                )
+            if len(candidates) > 1:
+                raise WorkspaceError(
+                    f"需求 {requirement_id} 存在多个 Requirement 空间卡："
+                    + ", ".join(sorted(candidates))
+                )
+            if current is None and candidates:
+                current = next(iter(candidates.values()))
+            if current is not None and current.status == "done":
+                if (
+                    meta.get("requirement_space_task_id") != current.id
+                    or meta.get("requirement_space_closed") is not True
+                ):
+                    store.touch_meta(
+                        requirement_id,
+                        requirement_space_task_id=current.id,
+                        requirement_space_closed=True,
+                    )
                 return current
             if current is None:
                 if meta.get("requirement_space_closed"):
                     return None
-                current = task_provider.create_task(
-                    requirement_id,
-                    Task(
-                        id="new",
-                        title=f"[需求空间] {requirement_id} {meta['title']}",
-                        description=_requirement_space_content(store, requirement_id),
-                        status="todo",
-                        labels=(REQUIREMENT_SPACE_LABEL,),
-                    ),
+                current = task_provider.create_task(requirement_id, desired)
+                _validate_requirement_space_identity(
+                    current,
+                    requirement_id=requirement_id,
+                    expected_title=expected_title,
+                    expected_project_id=expected_project_id,
+                    allow_legacy_projection=False,
                 )
             else:
-                # `publish_review` 是现有 dashi 的通用正文 CAS；兼容旧 Provider 时
-                # 仍保留卡片，只在下一次支持正文更新的同步中刷新摘要。
-                publish = getattr(task_provider, "publish_review", None)
-                if callable(publish):
-                    current = publish(current.id, _requirement_space_content(store, requirement_id))
-            store.touch_meta(
-                requirement_id, requirement_space_task_id=current.id, requirement_space_closed=False
-            )
+                reconcile = getattr(task_provider, "reconcile_task", None)
+                if callable(reconcile):
+                    current = reconcile(requirement_id, current.id, desired)
+                else:
+                    _validate_requirement_space_identity(
+                        current,
+                        requirement_id=requirement_id,
+                        expected_title=expected_title,
+                        expected_project_id=expected_project_id,
+                        allow_legacy_projection=False,
+                    )
+                    publish = getattr(task_provider, "publish_review", None)
+                    if callable(publish):
+                        current = publish(current.id, desired.description)
+                _validate_requirement_space_identity(
+                    current,
+                    requirement_id=requirement_id,
+                    expected_title=expected_title,
+                    expected_project_id=expected_project_id,
+                    allow_legacy_projection=False,
+                )
+                if current.status != desired.status:
+                    raise WorkspaceError(
+                        f"Requirement 空间卡 {current.id} 状态未收敛到 {desired.status}"
+                    )
+            if (
+                meta.get("requirement_space_task_id") != current.id
+                or meta.get("requirement_space_closed") is not False
+            ):
+                store.touch_meta(
+                    requirement_id,
+                    requirement_space_task_id=current.id,
+                    requirement_space_closed=False,
+                )
             return current
     except TaskProviderError as exc:
         raise BoardTaskSyncError(f"Requirement 空间同步失败：{exc}") from exc
@@ -175,6 +281,30 @@ def ensure_requirement_board_task(
                 if not is_requirement_review_task(task) and not is_requirement_space_task(task)
             )
             expected_id = str(meta.get("requirement_task_id") or "")
+            phase_gate_required = meta.get("phase_gate_required")
+            if phase_gate_required is not None and not isinstance(
+                phase_gate_required, bool
+            ):
+                raise BoardTaskSyncError("phase_gate_required 必须是布尔值")
+            if phase_gate_required:
+                if not expected_id:
+                    raise BoardTaskSyncError(
+                        f"{requirement_id} 已启用阶段门禁，但没有权威当前 Task"
+                    )
+                current = next((task for task in tasks if task.id == expected_id), None)
+                if current is None:
+                    raise BoardTaskSyncError(
+                        f"{requirement_id} 的权威阶段 Task {expected_id} 在 Provider 中不可见；"
+                        "拒绝创建或改绑替代工作卡"
+                    )
+                # Local import keeps task helpers independent for ungated V1 users while
+                # forcing every gated board projection through the committed phase chain.
+                from workspace_orchestrator.phase_gate import GateStore
+
+                GateStore(store).require_task_active(requirement_id, current.id)
+                if meta.get("pending_task_visibility"):
+                    store.touch_meta(requirement_id, pending_task_visibility=False)
+                return current
             visible = tuple(task for task in tasks if task.status in BOARD_VISIBLE_STATUSES)
             current = next((task for task in visible if task.id == expected_id), None)
             if current is None and visible:
@@ -306,6 +436,7 @@ def select_tasks(
     explicit_task_ids: Sequence[str] = (),
     bound_task_ids: Sequence[str] = (),
     development_request: str | None = None,
+    task_activation_guard: Callable[[Task], None] | None = None,
 ) -> TaskSelection:
     """严格实现 Task Bootstrap 的确定性优先级。"""
 
@@ -358,6 +489,8 @@ def select_tasks(
         refreshed = list(tasks)
         for task_id in selected:
             task = by_id[task_id]
+            if task_activation_guard is not None:
+                task_activation_guard(task)
             if task.status in {"todo", "ready"}:
                 updated = task_provider.update_status(task_id, "in_progress")
                 by_id[task_id] = updated

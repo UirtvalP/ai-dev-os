@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "requirement_id": "REQ-020",
+  "phase": 6,
+  "task_id": "AID-174",
+  "next_task_id": null,
+  "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-6.md",
+  "plan_source_fingerprint": "4f0ebd989ef2ef6600781bdf5f9b7885fa569de2dad0d2e9948da91db4606bc1",
+  "verification_suites": [
+    {
+      "id": "p6-local-common-quality",
+      "kind": "command",
+      "commands": [
+        ["uv", "build"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
+        ["uv", "lock", "--check"],
+        ["git", "diff", "--check", "origin/main", "HEAD"]
+      ]
+    },
+    {
+      "id": "p6-github-ci-matrix",
+      "kind": "github-actions",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  ],
+  "acceptance": [
+    {"id": "P6-AC-01", "description": "feature、integration、detached HEAD、旧 main commit、脏/漂移 main 均被拒绝。"},
+    {"id": "P6-AC-02", "description": "缺失或陈旧 Merge/post-merge Verification/Deployment Authorization 时拒绝部署。"},
+    {"id": "P6-AC-03", "description": "成功、失败、超时、重复请求和 Provider 离线均有测试和可恢复状态。"},
+    {"id": "P6-AC-04", "description": "只有 main-only Gate 能调用实际 Deployment Provider；副作用前再次解析 main，TOCTOU 漂移时拒绝。"},
+    {"id": "P6-AC-05", "description": "无需部署与 deployment-required 两条完整 E2E 均正确签发 CompletionToken。"},
+    {"id": "P6-AC-06", "description": "CommonQualityGate、真实本地 dry-run E2E 与独立安全 Review 全部 PASS。"}
+  ]
+}

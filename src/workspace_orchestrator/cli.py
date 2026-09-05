@@ -7,12 +7,21 @@ import json
 import sys
 from pathlib import Path
 
+from . import __version__
 from .adapters.agent import CodexAgentProvider
 from .automation.delegation import delegate_task, request_cancel, worker_status
 from .automation.requirement_attach import AutomationAmbiguity, discover_project_root
 from .automation.runtime import AutomationRuntime
+from .automation.session_runtime import require_session_id
+from .automation.task_attach import configured_task_provider
+from .console import configure_standard_streams
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
 from .models import WorkflowComplexity
+from .phase_gate import (
+    GateStore,
+    PhaseTransitionGuard,
+)
+from .phase_verification import PhaseVerificationRunner
 from .workflow import route_workflow
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections
 
@@ -39,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="workspace",
         description="管理面向 AI 编码 Agent 的持久化需求工作区。",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--root", type=Path, default=None, help="项目根目录（默认：从当前路径自动发现）"
     )
@@ -119,6 +128,36 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("worker-status", help="查询后台 Worker 与 queued Task")
     cancel = commands.add_parser("cancel", help="取消尚未启动的 queued Dispatcher Task")
     cancel.add_argument("task_id")
+
+    phase = commands.add_parser("phase", help="签发阶段证据并执行 fail-closed 过渡")
+    phase_commands = phase.add_subparsers(dest="phase_command", required=True)
+    receipt = phase_commands.add_parser(
+        "run-verification", help="执行提交内声明的 Verification Suite 并记录 Receipt"
+    )
+    receipt.add_argument("requirement_id")
+    receipt.add_argument("--phase", type=int, required=True)
+    receipt.add_argument("--suite", required=True)
+    attest = phase_commands.add_parser(
+        "attest-review", help="由当前独立 Reviewer 记录 exact-SHA Review"
+    )
+    attest.add_argument("requirement_id")
+    attest.add_argument("--phase", type=int, required=True)
+    attest.add_argument("--file", type=Path, required=True)
+    issue = phase_commands.add_parser("issue", help="从 JSON packet 签发 exact-SHA Gate")
+    issue.add_argument("requirement_id")
+    issue.add_argument("--phase", type=int, required=True)
+    issue.add_argument("--file", type=Path, required=True)
+    advance = phase_commands.add_parser(
+        "advance", help="验证 Gate 并切换 Task/Session/meta 激活权"
+    )
+    advance.add_argument("requirement_id")
+    advance.add_argument("--completed-phase", type=int, required=True)
+    reopen = phase_commands.add_parser(
+        "reopen", help="保全未推进阶段的旧候选，并恢复验证与独立重审"
+    )
+    reopen.add_argument("requirement_id")
+    reopen.add_argument("--phase", type=int, required=True)
+    reopen.add_argument("--reason", required=True)
 
     review = commands.add_parser("review", help="检查验收与验证门禁")
     review.add_argument("requirement_id")
@@ -205,20 +244,21 @@ def run(args: argparse.Namespace) -> str:
             if args.complexity
             else route_workflow(" ".join(filter(None, (args.title, args.goal)))).complexity
         )
-        provider_options: dict[str, object] = {}
-        if args.no_task_provider:
-            provider_options["task_provider"] = None
-        elif args.task_provider:
-            provider_options["task_provider"] = args.task_provider
-        requirement_id = store.create(
-            args.title,
-            goal=args.goal,
-            acceptance=args.acceptance,
-            complexity=complexity,
-            task_project_id=args.task_project,
-            manual_test_required=args.manual_test,
-            **provider_options,
-        )
+        create_options = {
+            "goal": args.goal,
+            "acceptance": args.acceptance,
+            "complexity": complexity,
+            "task_project_id": args.task_project,
+            "manual_test_required": args.manual_test,
+        }
+        if args.no_task_provider or args.task_provider:
+            requirement_id = store.create(
+                args.title,
+                task_provider=None if args.no_task_provider else str(args.task_provider),
+                **create_options,
+            )
+        else:
+            requirement_id = store.create(args.title, **create_options)
         visibility = AutomationRuntime(store, agent_provider).sync_taskboard_visibility()
         suffix = "\n面板同步待重试：" + "；".join(visibility) if visibility else ""
         return f"已创建 {requirement_id}{suffix}"
@@ -259,6 +299,62 @@ def run(args: argparse.Namespace) -> str:
         return json.dumps(worker_status(store), ensure_ascii=False, indent=2)
     if args.command == "cancel":
         return json.dumps(request_cancel(store, args.task_id), ensure_ascii=False, indent=2)
+    if args.command == "phase":
+        gates = GateStore(store)
+        if args.phase_command == "reopen":
+            journal = gates.reopen(
+                args.requirement_id,
+                args.phase,
+                reason=args.reason,
+                session_id=require_session_id(agent_provider),
+            )
+            return json.dumps(journal, ensure_ascii=False, indent=2)
+        if args.phase_command == "run-verification":
+            receipt = PhaseVerificationRunner(gates).run(
+                args.requirement_id,
+                phase=args.phase,
+                suite_id=args.suite,
+                session_id=require_session_id(agent_provider),
+            )
+            return json.dumps(receipt.to_dict(), ensure_ascii=False, indent=2)
+        if args.phase_command in {"attest-review", "issue"}:
+            try:
+                payload = json.loads(args.file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise WorkspaceError(f"无法读取阶段 JSON packet：{exc}") from exc
+            if not isinstance(payload, dict):
+                raise WorkspaceError("阶段 JSON packet 必须是对象")
+            if args.phase_command == "attest-review":
+                review = gates.record_review_from_payload(
+                    args.requirement_id,
+                    args.phase,
+                    payload,
+                    reviewer_session_id=require_session_id(agent_provider),
+                )
+                return json.dumps(review.to_dict(), ensure_ascii=False, indent=2)
+            record = gates.issue_from_payload(
+                args.requirement_id,
+                args.phase,
+                payload,
+                issued_by=(
+                    f"{agent_provider.name}:{require_session_id(agent_provider)}"
+                ),
+            )
+            return json.dumps(record.to_dict(), ensure_ascii=False, indent=2)
+        if args.phase_command == "advance":
+            requirement_id = args.requirement_id.upper()
+            provider = configured_task_provider(
+                store.load(requirement_id)["meta"], store.project_root
+            )
+            if provider is None:
+                raise WorkspaceError("阶段过渡需要已配置的 Task Provider")
+            task = PhaseTransitionGuard(gates, provider).advance_next(
+                requirement_id,
+                completed_phase=args.completed_phase,
+                session_id=require_session_id(agent_provider),
+                activated_by=agent_provider.name,
+            )
+            return f"Phase {args.completed_phase + 1} 已激活：{task.id}"
     if args.command == "checkpoint":
         checkpoint(
             store,
@@ -286,43 +382,44 @@ def run(args: argparse.Namespace) -> str:
         )
         return f"已交接 {args.requirement_id.upper()}"
     if args.command == "finalize":
-        result = AutomationRuntime(store, agent_provider).finalize(
+        finalize_result = AutomationRuntime(store, agent_provider).finalize(
             args.requirement_id,
             completed=args.completed,
             current_state=args.current_state,
             important_context=args.important_context,
             next_action=(args.next_action or "提交并推送后由 Stop Hook 自动归档 Thread。"),
         )
-        if not result.passed:
-            details = "\n".join(f"- {item}" for item in result.blockers)
+        if not finalize_result.passed:
+            details = "\n".join(f"- {item}" for item in finalize_result.blockers)
             raise WorkspaceError(
                 f"自动收尾受阻，已保存 checkpoint：{args.requirement_id.upper()}\n"
-                f"{result.verification}\n阻塞项：\n{details}"
+                f"{finalize_result.verification}\n阻塞项：\n{details}"
             )
         requirement_status = (
             "done（验证通过后自动完成）"
-            if result.requirement_completed
+            if finalize_result.requirement_completed
             else "in_review（等待明确要求的人工测试）"
-            if result.requirement_in_review
+            if finalize_result.requirement_in_review
             else "等待审查门禁"
         )
         return (
             f"已完成自动收尾：{args.requirement_id.upper()}\n"
-            f"Task：{', '.join(result.task_ids) or '无外部 Task'}\n"
+            f"Task：{', '.join(finalize_result.task_ids) or '无外部 Task'}\n"
             f"Requirement：{requirement_status}\n"
-            f"Requirement Review Task：{result.review_task_id or '未配置'}\n"
-            f"{result.verification}"
+            f"Requirement Review Task：{finalize_result.review_task_id or '未配置'}\n"
+            f"{finalize_result.verification}"
         )
     if args.command == "review":
-        result = AutomationRuntime(store, agent_provider).review(args.requirement_id)
-        if result.passed:
+        review_result = AutomationRuntime(store, agent_provider).review(args.requirement_id)
+        if review_result.passed:
             return (
-                f"意图审查：{result.intent_status}\n"
+                f"意图审查：{review_result.intent_status}\n"
                 f"可进入审查：{args.requirement_id.upper()} 已处于 in_review 状态"
             )
-        details = "\n".join(f"- {blocker}" for blocker in result.blockers)
+        details = "\n".join(f"- {blocker}" for blocker in review_result.blockers)
         raise WorkspaceError(
-            f"意图审查：{result.intent_status}\n审查受阻：{args.requirement_id.upper()}\n{details}"
+            f"意图审查：{review_result.intent_status}\n"
+            f"审查受阻：{args.requirement_id.upper()}\n{details}"
         )
     if args.command == "confirm":
         AutomationRuntime(store, agent_provider).confirm(
@@ -344,6 +441,7 @@ def run(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_standard_streams()
     try:
         output = run(build_parser().parse_args(argv))
     except AutomationAmbiguity as exc:

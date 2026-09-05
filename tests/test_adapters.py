@@ -459,9 +459,13 @@ def test_dashi_project_mapping_never_steals_same_id_from_another_workspace(
 
 def test_dashi_adapter_creates_requirement_linked_issue() -> None:
     commands: list[tuple[str, ...]] = []
+    uploaded: list[str] = []
 
     def runner(command: tuple[str, ...]) -> str:
         commands.append(tuple(command))
+        if "--description-file" in command:
+            description_path = Path(command[command.index("--description-file") + 1])
+            uploaded.append(description_path.read_text(encoding="utf-8"))
         return json.dumps(
             {
                 "task": {
@@ -489,8 +493,8 @@ def test_dashi_adapter_creates_requirement_linked_issue() -> None:
         "ai-dev-os",
         "--title",
         "Login",
-        "--description",
-        "",
+        "--description-file",
+        commands[0][commands[0].index("--description-file") + 1],
         "--status",
         "todo",
         "--labels",
@@ -499,6 +503,66 @@ def test_dashi_adapter_creates_requirement_linked_issue() -> None:
         "main",
         "--json",
     )
+    assert uploaded == [""]
+    assert not Path(commands[0][commands[0].index("--description-file") + 1]).exists()
+
+
+def test_dashi_adapter_uses_file_for_multiline_task_description() -> None:
+    commands: list[tuple[str, ...]] = []
+    uploaded: list[str] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        if "--description-file" in command:
+            description_path = Path(command[command.index("--description-file") + 1])
+            uploaded.append(description_path.read_text(encoding="utf-8"))
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Requirement space",
+                    "description": uploaded[-1],
+                    "status": "todo",
+                    "labels": ["requirement-space", "requirement:REQ-001"],
+                    "version": 1,
+                }
+            }
+        )
+
+    DashiTaskProvider(runner=runner, executable="taskctl").create_task(
+        "REQ-001",
+        Task(
+            id="new",
+            title="Requirement space",
+            description="# REQ-001\n\nSecond line & `literal`",
+            labels=("requirement-space",),
+        ),
+    )
+
+    assert uploaded == ["# REQ-001\n\nSecond line & `literal`"]
+    assert "--description" not in commands[0]
+    description_path = Path(commands[0][commands[0].index("--description-file") + 1])
+    assert not description_path.exists()
+
+
+def test_dashi_create_removes_description_file_when_provider_fails() -> None:
+    uploaded_paths: list[Path] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        uploaded_paths.append(Path(command[command.index("--description-file") + 1]))
+        raise TaskProviderError("provider failed")
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+
+    with pytest.raises(TaskProviderError, match="provider failed"):
+        provider.create_task(
+            "REQ-001",
+            Task(id="new", title="Failure", description="line one\nline two"),
+        )
+
+    assert len(uploaded_paths) == 1
+    assert not uploaded_paths[0].exists()
 
 
 def test_dashi_status_update_uses_current_version() -> None:
@@ -536,6 +600,149 @@ def test_dashi_status_update_uses_current_version() -> None:
         "4",
         "--json",
     )
+
+
+def test_dashi_status_compare_and_set_uses_callers_expected_state() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        is_move = "move" in command
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Login",
+                    "status": "in_review" if is_move else "in_progress",
+                    "version": 5 if is_move else 4,
+                }
+            }
+        )
+
+    updated = DashiTaskProvider(
+        runner=runner, executable="taskctl"
+    ).compare_and_set_status(
+        "AID-1",
+        expected_version=4,
+        expected_status="in_progress",
+        status="in_review",
+    )
+
+    assert updated.status == "in_review"
+    assert commands == [
+        ("taskctl", "issue", "get", "AID-1", "--json"),
+        (
+            "taskctl",
+            "issue",
+            "move",
+            "AID-1",
+            "--status",
+            "in_review",
+            "--if-version",
+            "4",
+            "--json",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("current_version", "current_status", "error"),
+    [
+        (5, "in_progress", "version 冲突"),
+        (4, "blocked", "status 冲突"),
+    ],
+)
+def test_dashi_status_compare_and_set_rejects_stale_observation_without_move(
+    current_version: int, current_status: str, error: str
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Login",
+                    "status": current_status,
+                    "version": current_version,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    with pytest.raises(TaskProviderError, match=error):
+        provider.compare_and_set_status(
+            "AID-1",
+            expected_version=4,
+            expected_status="in_progress",
+            status="in_review",
+        )
+
+    assert commands == [("taskctl", "issue", "get", "AID-1", "--json")]
+
+
+def test_dashi_status_compare_and_set_fails_closed_on_server_conflict() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        if "move" in command:
+            raise TaskProviderError("version conflict")
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Login",
+                    "status": "in_progress",
+                    "version": 4,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    with pytest.raises(TaskProviderError, match="version conflict"):
+        provider.compare_and_set_status(
+            "AID-1",
+            expected_version=4,
+            expected_status="in_progress",
+            status="in_review",
+        )
+
+    assert [command[2] for command in commands] == ["get", "move"]
+    assert commands[-1][-3:] == ("--if-version", "4", "--json")
+
+
+def test_dashi_status_compare_and_set_validates_returned_status() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(tuple(command))
+        return json.dumps(
+            {
+                "task": {
+                    "id": "opaque-1",
+                    "identifier": "AID-1",
+                    "title": "Login",
+                    "status": "in_progress",
+                    "version": 5 if "move" in command else 4,
+                }
+            }
+        )
+
+    provider = DashiTaskProvider(runner=runner, executable="taskctl")
+    with pytest.raises(TaskProviderError, match="状态更新未生效"):
+        provider.compare_and_set_status(
+            "AID-1",
+            expected_version=4,
+            expected_status="in_progress",
+            status="in_review",
+        )
+
+    assert [command[2] for command in commands] == ["get", "move"]
 
 
 def test_dashi_review_packet_uses_description_file_cas_and_is_idempotent() -> None:

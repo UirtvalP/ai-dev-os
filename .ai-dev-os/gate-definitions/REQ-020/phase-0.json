@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "requirement_id": "REQ-020",
+  "phase": 0,
+  "task_id": "AID-151",
+  "next_task_id": "AID-170",
+  "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-0.md",
+  "plan_source_fingerprint": "bf9899c27a04cb1b7843a7ae3830ce9830f4c9c7a2eb553b538f7f8c1d5354eb",
+  "verification_suites": [
+    {
+      "id": "p0-local-common-quality",
+      "kind": "command",
+      "commands": [
+        ["uv", "build"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
+        ["uv", "lock", "--check"],
+        ["git", "diff", "--check", "origin/main", "HEAD"]
+      ]
+    },
+    {
+      "id": "p0-github-ci-matrix",
+      "kind": "github-actions",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "P0-AC-01",
+      "description": "当前源码、测试、Provider、Hook、Review、Git 和 Dispatcher 已完成证据审计。"
+    },
+    {
+      "id": "P0-AC-02",
+      "description": "V2 主计划已进入版本控制候选。"
+    },
+    {
+      "id": "P0-AC-03",
+      "description": "`REQ-020` Requirement、Task、Session 均绑定独立 worktree。"
+    },
+    {
+      "id": "P0-AC-04",
+      "description": "干净 `origin/main` 的 pytest、ruff、diff-check 全部通过。"
+    },
+    {
+      "id": "P0-AC-05",
+      "description": "六个实施 Task 已创建并以 `blocked_by` 串联，后阶段初始状态均为 `blocked`。"
+    },
+    {
+      "id": "P0-AC-06",
+      "description": "Windows/Linux 与 Python 3.11/当前支持版本 CI、真实类型检查均通过。"
+    },
+    {
+      "id": "P0-AC-07",
+      "description": "最小 `PhaseGateRecord` 生成、exact-SHA 校验、失效和前序包含关系有自动测试。"
+    },
+    {
+      "id": "P0-AC-08",
+      "description": "`REQ-019` 修复已提交并推送，V2 分支已更新到该基线。"
+    },
+    {
+      "id": "P0-AC-09",
+      "description": "CommonQualityGate 与独立 Phase 0 Review 全部通过。"
+    }
+  ]
+}

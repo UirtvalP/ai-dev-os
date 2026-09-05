@@ -16,7 +16,10 @@ class _NoAgentProvider:
     def name(self) -> str:
         return "unknown"
 
-    def current_session_id(self) -> None:
+    def current_session_id(self) -> str | None:
+        return None
+
+    def archive_session(self, session_id: str) -> None:
         return None
 
 

@@ -6,7 +6,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from workspace_orchestrator import product_cli, user_config
+import pytest
+
+from workspace_orchestrator import __version__, cli, product_cli, user_config
 from workspace_orchestrator.adapters.package import ToolInstallerError, ToolUpgradeResult
 from workspace_orchestrator.product_cli import main
 from workspace_orchestrator.project_config import default_task_project_id
@@ -16,6 +18,17 @@ from workspace_orchestrator.project_init import (
     GITIGNORE_START,
     initialize_project,
 )
+
+
+@pytest.mark.parametrize(
+    ("entry", "program"), [(main, "ai-dev-os"), (cli.main, "workspace")]
+)
+def test_both_cli_versions_use_the_package_version(entry, program: str, capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        entry(["--version"])
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"{program} {__version__}"
 
 
 def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Path, capsys) -> None:
@@ -254,6 +267,28 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
     ai_dev_os = scripts / ("ai-dev-os.exe" if os.name == "nt" else "ai-dev-os")
     workspace = scripts / ("workspace.exe" if os.name == "nt" else "workspace")
 
+    metadata = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "from importlib.metadata import version; print(version('ai-dev-os'))",
+        ],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert metadata.stdout.strip() == __version__
+    for executable, program in ((ai_dev_os, "ai-dev-os"), (workspace, "workspace")):
+        version = subprocess.run(
+            [str(executable), "--version"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert version.stdout.strip() == f"{program} {__version__}"
+
     isolated_home = tmp_path / "user-home"
     isolated_home.mkdir()
     subprocess_env = os.environ.copy()
@@ -472,3 +507,21 @@ def test_migrate_adds_missing_nested_defaults_without_replacing_unknown_fields(
         "custom_automation": "keep",
         "auto_finish_pushed_thread": True,
     }
+
+
+def test_product_cli_configures_utf8_for_redirected_windows_streams(monkeypatch) -> None:
+    calls: list[dict[str, str]] = []
+
+    class ReconfigurableStream:
+        def reconfigure(self, **kwargs: str) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(product_cli.sys, "stdout", ReconfigurableStream())
+    monkeypatch.setattr(product_cli.sys, "stderr", ReconfigurableStream())
+
+    product_cli._configure_standard_streams()
+
+    assert calls == [
+        {"encoding": "utf-8", "errors": "replace"},
+        {"encoding": "utf-8", "errors": "replace"},
+    ]

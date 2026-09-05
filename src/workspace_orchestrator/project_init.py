@@ -187,6 +187,8 @@ def _ensure_project_config(root: Path) -> str:
         )
         return "created"
     current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        raise WorkspaceError(f"项目配置必须是 JSON 对象：{path}")
     changed = False
     if "project_id" not in current:
         current["project_id"] = current.get("task_project_id") or desired["project_id"]
@@ -206,6 +208,8 @@ def _ensure_project_config(root: Path) -> str:
     else:
         current_automation = current["automation"]
         desired_automation = desired["automation"]
+        if not isinstance(current_automation, dict) or not isinstance(desired_automation, dict):
+            raise WorkspaceError(f"项目配置 automation 必须是 JSON 对象：{path}")
         for key, value in desired_automation.items():
             if key not in current_automation:
                 current_automation[key] = value

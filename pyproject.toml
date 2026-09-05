@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "ai-dev-os"
-version = "0.2.0"
+dynamic = ["version"]
 description = "面向 AI 编码 Agent 的持久化需求工作区编排器。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
+  "mypy>=2.3",
   "pytest>=8.3",
   "ruff>=0.9",
 ]
@@ -23,6 +24,9 @@ workspace = "workspace_orchestrator.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/workspace_orchestrator"]
 
+[tool.hatch.version]
+path = "src/workspace_orchestrator/__init__.py"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
@@ -31,10 +35,18 @@ testpaths = ["tests"]
 target-version = "py311"
 line-length = 100
 
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+
 [tool.workspace-orchestrator.automation]
 verification-timeout-seconds = 300
 verification-commands = [
   ["{python}", "-m", "pytest"],
   ["{python}", "-m", "ruff", "check", "."],
+  ["{python}", "-m", "mypy", "src"],
   ["git", "diff", "--check"],
 ]
