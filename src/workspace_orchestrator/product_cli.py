@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
-from .adapters.agent import CodexExecProvider
 from .adapters.package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
+from .agent_runtime.events import RuntimeEventStore
 from .automation.dispatcher import (
     AutoDispatcher,
     dispatcher_status,
@@ -18,6 +19,7 @@ from .automation.dispatcher import (
     stop_dispatcher,
 )
 from .automation.requirement_attach import discover_project_root
+from .composition import configured_executor, runtime_descriptors
 from .console import configure_standard_streams as _configure_standard_streams
 from .hook_runtime import main as hook_main
 from .project_config import load_project_config
@@ -65,8 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unregister.add_argument("project_id", help="稳定项目 ID")
     commands.add_parser("hook", help=argparse.SUPPRESS)
+    runtime = commands.add_parser("runtime", help="发现 Agent Runtime 能力或读取实时事件")
+    runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_commands.add_parser("list", help="显示已安装 Runtime 的真实能力与可用模型")
+    events = runtime_commands.add_parser("events", help="按运行 ID 和游标重放持久事件")
+    events.add_argument("run_id", help="Runtime 运行 ID")
+    events.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
+    events.add_argument("--after", type=int, default=0, help="排他事件序号（默认：0）")
+    events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
     dispatcher = commands.add_parser(
-        "dispatcher", help="管理 dashi → Codex 自动执行 Dispatcher"
+        "dispatcher", help="管理 Task → Agent 自动执行 Dispatcher"
     )
     dispatcher_commands = dispatcher.add_subparsers(dest="dispatcher_command", required=True)
     for name, help_text in (
@@ -165,6 +175,17 @@ def _format_project(project: RegisteredProject) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "runtime":
+        if args.runtime_command == "list":
+            return json.dumps(
+                [asdict(item) for item in runtime_descriptors()], ensure_ascii=False, indent=2
+            )
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        events = RuntimeEventStore(store.root / "runtime-events").replay(
+            args.run_id, after=args.after, limit=args.limit
+        )
+        return json.dumps([item.to_dict() for item in events], ensure_ascii=False, indent=2)
     if args.command == "init":
         result = initialize_project(args.path)
         registry_message = _sync_registry_after_local_success(result.root, action="接入")
@@ -206,7 +227,7 @@ def run(args: argparse.Namespace) -> str:
         if args.dispatcher_command == "status":
             return json.dumps(dispatcher_status(store), ensure_ascii=False, indent=2)
         if args.dispatcher_command == "run-once":
-            return AutoDispatcher(store, CodexExecProvider()).run_once()
+            return AutoDispatcher(store, configured_executor(store)).run_once()
     raise AssertionError(f"未处理的命令：{args.command}")
 
 
@@ -220,9 +241,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dispatcher" and args.dispatcher_command == "serve":
             execution_root = args.root.expanduser().resolve()
             project_root = discover_project_root(execution_root)
-            return serve_dispatcher(
-                WorkspaceStore(project_root, execution_root=execution_root)
-            )
+            store = WorkspaceStore(project_root, execution_root=execution_root)
+            return serve_dispatcher(store, configured_executor(store))
         output = run(args)
     except (OSError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

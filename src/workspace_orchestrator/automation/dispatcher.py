@@ -1,4 +1,4 @@
-"""从 dashi `in_progress` 状态反向触发 Codex 的本地单任务 Dispatcher。"""
+"""从 Task `in_progress` 状态触发执行端口的本地单任务 Dispatcher。"""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeGuard
 
-from workspace_orchestrator.adapters.agent import CodexExecProvider, CodexExecutionResult
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
+from workspace_orchestrator.agent_runtime.contracts import AgentRunResult
+from workspace_orchestrator.agent_runtime.ports import AgentExecutionPort
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import (
@@ -204,24 +205,9 @@ def _only_managed_hooks(workspace_path: Path) -> bool:
     return bool(commands) and all(command == "ai-dev-os hook" for command in commands)
 
 
-def _result_summary(result: CodexExecutionResult) -> str:
-    messages: list[str] = []
-    for line in result.stdout.splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = payload.get("item") or {}
-        if item.get("type") == "agent_message" and item.get("text"):
-            messages.append(str(item["text"]))
-        elif payload.get("type") == "error" and payload.get("message"):
-            messages.append(str(payload["message"]))
-        elif payload.get("type") == "turn.failed":
-            error = payload.get("error") or {}
-            if error.get("message"):
-                messages.append(str(error["message"]))
-    detail = messages[-1] if messages else result.stderr.strip()
-    return (detail or "Codex 未返回可读结果")[-1800:]
+def _result_summary(result: AgentRunResult) -> str:
+    return (result.summary or result.stderr.strip() or result.stdout.strip()
+            or "Agent 未返回可读结果")[-1800:]
 
 
 def _block_task(provider: TaskProvider, task: Task, message: str) -> Task:
@@ -245,7 +231,7 @@ class AutoDispatcher:
     """单进程、单任务认领；不调度多个 Agent，也不抢占已有绑定。"""
 
     store: WorkspaceStore
-    executor: CodexExecProvider
+    executor: AgentExecutionPort
 
     def _task_state(self, task: Task) -> dict[str, Any] | None:
         state = _read_state(self.store)
@@ -352,7 +338,7 @@ class AutoDispatcher:
         return None
 
     def _record_log(
-        self, candidate: DispatchCandidate, result: CodexExecutionResult
+        self, candidate: DispatchCandidate, result: AgentRunResult
     ) -> str:
         directory = self.store.root / LOG_DIRECTORY
         directory.mkdir(parents=True, exist_ok=True)
@@ -367,6 +353,9 @@ class AutoDispatcher:
                 "resumed": result.resumed,
                 "session_id": result.session_id,
                 "returncode": result.returncode,
+                "runtime_id": result.runtime_id,
+                "run_id": result.run_id,
+                "summary": result.summary,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "finished_at": now_iso(),
@@ -405,8 +394,8 @@ class AutoDispatcher:
         result = self.executor.execute(
             candidate.execution_path,
             _prompt(candidate),
-            sandbox=_config(self.store).codex_sandbox,
-            model=_config(self.store).codex_model,
+            sandbox=_config(self.store).agent_sandbox or _config(self.store).codex_sandbox,
+            model=_config(self.store).agent_model or _config(self.store).codex_model,
             resume_session_id=candidate.resume_session_id,
             bypass_hook_trust=_only_managed_hooks(candidate.execution_path),
         )
@@ -432,7 +421,7 @@ class AutoDispatcher:
                     task_provider=candidate.task_provider,
                 )
             message = (
-                f"自动 Codex 执行失败（退出码 {result.returncode}）。\n\n"
+                f"自动 Agent 执行失败（退出码 {result.returncode}）。\n\n"
                 f"{_result_summary(result)}\n\n本地日志：{log_path}"
             )
             refreshed = _block_task(candidate.task_provider, refreshed, message)
@@ -447,7 +436,7 @@ class AutoDispatcher:
 
         if refreshed.status == "in_progress":
             message = (
-                "Codex 自动执行进程已经结束，但 Task 未进入 review；为避免看似仍在处理，"
+                "Agent 自动执行进程已经结束，但 Task 未进入 review；为避免看似仍在处理，"
                 f"已转为 blocked。\n\n{_result_summary(result)}\n\n本地日志：{log_path}"
             )
             refreshed = _block_task(candidate.task_provider, refreshed, message)
@@ -565,7 +554,12 @@ def stop_dispatcher(store: WorkspaceStore) -> dict[str, Any]:
     return dispatcher_status(store)
 
 
-def serve_dispatcher(store: WorkspaceStore) -> int:
+def serve_dispatcher(store: WorkspaceStore, executor: AgentExecutionPort | None = None) -> int:
+    # 保留旧 Python 入口的单参数调用；CLI 在其 composition root 显式注入。
+    if executor is None:
+        from workspace_orchestrator.composition import configured_executor
+
+        executor = configured_executor(store)
     stop_event = threading.Event()
 
     def request_stop(*_: object) -> None:
@@ -578,7 +572,7 @@ def serve_dispatcher(store: WorkspaceStore) -> int:
         state = _read_state(store)
         state.update(pid=os.getpid(), status="running", started_at=now_iso())
         _write_state(store, state)
-    dispatcher = AutoDispatcher(store, CodexExecProvider())
+    dispatcher = AutoDispatcher(store, executor)
     try:
         while not stop_event.is_set():
             dispatcher.run_once()
