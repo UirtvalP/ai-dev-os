@@ -11,7 +11,7 @@ import math
 import re
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -58,6 +58,9 @@ class _ActiveAttempt:
     cancelled: threading.Event = field(default_factory=threading.Event)
     finished: threading.Event = field(default_factory=threading.Event)
     guard: threading.RLock = field(default_factory=threading.RLock)
+    publication_guard: threading.RLock = field(default_factory=threading.RLock)
+    result_unconfirmed: threading.Event = field(default_factory=threading.Event)
+    cleanup_confirmed: bool = False
     runtime: AgentRuntimePort | None = None
     session: RuntimeSessionRef | None = None
     turn_id: str | None = None
@@ -156,6 +159,7 @@ class RuntimeWorkerPort:
         if not capability.supported:
             raise PolicyError("isolation_failure", capability.reason)
         identity = fingerprint({"task": task.to_dict(), "route": route.to_dict()})
+        new_active: _ActiveAttempt | None = None
         with self._guard:
             created = False
 
@@ -170,8 +174,12 @@ class RuntimeWorkerPort:
                     return
                 # 即使上层误用接口，也不允许两个未确认终止的尝试争用同一写目录。
                 root = Path(task.worktree or "").resolve()
-                for value in attempts.values():
-                    if value["observation"]["state"] not in _TERMINAL:
+                for identifier, value in attempts.items():
+                    holder = self._active.get(identifier)
+                    # 旧 ledger 终态也可能正被撤销而尚未提交。只读 Event，不能在
+                    # _guard 内反向等待 publication_guard，或把写失败误作空闲槽位。
+                    unconfirmed = holder is not None and holder.result_unconfirmed.is_set()
+                    if value["observation"]["state"] not in _TERMINAL or unconfirmed:
                         other = Path(value["task"]["worktree"]).resolve()
                         if root == other or root in other.parents or other in root.parents:
                             raise PolicyError("worktree_busy", "Task worktree 仍被未终止尝试占用")
@@ -186,21 +194,28 @@ class RuntimeWorkerPort:
             self._mutate(register)
             if created:
                 active = _ActiveAttempt(fence)
+                new_active = active
                 self._active[attempt_id] = active
                 active.thread = threading.Thread(
                     target=self._execute, args=(attempt_id, task, route, spec, active),
                     name=f"worker-{attempt_id}", daemon=True,
                 )
-                try:
-                    active.thread.start()
-                except BaseException:
-                    self._save(WorkerObservation(
+        # 发布锁的顺序是 publication_guard -> _guard，不能反向持锁读取或提交结果。
+        # 尝试已登记；真正创建/恢复子进程仍由 launch_guard 再次核验 epoch 与取消状态。
+        if new_active is not None:
+            assert new_active.thread is not None
+            try:
+                new_active.thread.start()
+            except BaseException:
+                with new_active.publication_guard:
+                    new_active.cleanup_confirmed = True  # 控制面线程未启动，确定没有子进程。
+                    self._publish(new_active, WorkerObservation(
                         attempt_id, fence, "failed", error_class="launch_failed",
                         summary="控制面线程未能启动，未创建 Worker 子进程",
                     ))
-                    active.finished.set()
-                    raise
-            return self._observation(attempt_id)
+                    new_active.finished.set()
+                raise
+        return self._observation(attempt_id)
 
     def _save(self, observation: WorkerObservation) -> None:
         observation.validate()
@@ -215,23 +230,71 @@ class RuntimeWorkerPort:
 
         self._mutate(update)
 
+    @staticmethod
+    def _cancelled_result(active: _ActiveAttempt, previous: WorkerObservation) -> WorkerObservation:
+        # cleanup_confirmed 来自真实 close 成功或明确没有启动；取消标记/线程 finished
+        # 本身均不构成进程树已终止的证据。新对象不会携带被撤销候选的 SHA/tree。
+        if active.cleanup_confirmed:
+            return WorkerObservation(
+                previous.attempt_id, active.fence, "failed", error_class="cancelled",
+                session_id=previous.session_id, summary="已确认旧 Worker 进程树关闭并撤销候选",
+            )
+        return WorkerObservation(
+            previous.attempt_id, active.fence, "unknown", error_class="cleanup_unconfirmed",
+            session_id=previous.session_id,
+            summary=previous.summary if previous.error_class == "cleanup_unconfirmed" else
+            "已请求取消，但尚未确认 Worker 进程树关闭",
+        )
+
+    def _publish(self, active: _ActiveAttempt, observation: WorkerObservation) -> None:
+        """最后一刻重新应用撤销，再提交或保留同一结果供 poll 补偿。
+
+        只能持发布锁做结果选择/持久化；不可在其中关闭 transport、等待 finished
+        或调用 candidate_reader，否则结束线程与取消方可能互相等待。
+        """
+        with active.publication_guard:
+            active.result_unconfirmed.set()
+            if active.cancelled.is_set():
+                observation = self._cancelled_result(active, observation)
+            active.pending_result = observation
+            try:
+                self._save(observation)
+            except Exception as exc:  # noqa: BLE001 -- 保留选定结果，失败不释放槽位。
+                active.persistence_error = str(exc)
+            else:
+                active.pending_result = None
+                active.persistence_error = None
+                active.result_unconfirmed.clear()
+
     def _observation(self, attempt_id: str) -> WorkerObservation:
-        record = self._read(attempt_id)
-        if record is None:
-            raise PolicyError("attempt_missing", "尝试不在可信执行账本中")
-        observation = WorkerObservation.from_dict(record["observation"])
         active = self._active.get(attempt_id)
-        if active is not None and active.persistence_error:
-            return WorkerObservation(
-                attempt_id, observation.fence, "unknown", session_id=observation.session_id,
-                error_class="persistence_unconfirmed", summary=active.persistence_error,
-            )
-        if observation.state not in _TERMINAL and attempt_id not in self._active:
-            return WorkerObservation(
-                attempt_id, observation.fence, "unknown", session_id=observation.session_id,
-                error_class="ambiguous", summary="控制器重启，缺少此尝试的进程句柄；不得重放",
-            )
-        return observation
+        with active.publication_guard if active is not None else nullcontext():
+            record = self._read(attempt_id)
+            if record is None:
+                raise PolicyError("attempt_missing", "尝试不在可信执行账本中")
+            observation = WorkerObservation.from_dict(record["observation"])
+            if active is not None:
+                if active.persistence_error:
+                    return WorkerObservation(
+                        attempt_id, observation.fence, "unknown", session_id=observation.session_id,
+                        error_class="persistence_unconfirmed", summary=active.persistence_error,
+                    )
+                if (active.result_unconfirmed.is_set() or (
+                    active.cancelled.is_set() and observation.error_class != "cancelled"
+                )):
+                    # 取消已线性化而清理/提交仍在进行；旧持久候选此时也不能被读回。
+                    return WorkerObservation(
+                        attempt_id, observation.fence, "unknown", session_id=observation.session_id,
+                        error_class="cleanup_unconfirmed",
+                        summary=observation.summary if observation.error_class == "cleanup_unconfirmed"
+                        else "取消尚未持久确认，不能恢复旧候选或释放槽位",
+                    )
+            elif observation.state not in _TERMINAL:
+                return WorkerObservation(
+                    attempt_id, observation.fence, "unknown", session_id=observation.session_id,
+                    error_class="ambiguous", summary="控制器重启，缺少此尝试的进程句柄；不得重放",
+                )
+            return observation
 
     def _execute(
         self, attempt_id: str, task: TaskSpec, route: ModelRoute,
@@ -334,9 +397,12 @@ class RuntimeWorkerPort:
                     raise PolicyError("scope_mismatch", "Runtime 返回了其他尝试的会话")
                 if active.transport is None or active.transport.pid is None:
                     raise PolicyError("isolation_failure", "Runtime 未通过可信 transport 启动进程")
-                self._save(WorkerObservation(
-                    attempt_id, active.fence, "running", session_id=started.session.session_id,
-                ))
+                with active.publication_guard:
+                    if active.cancelled.is_set():
+                        raise PolicyError("cancelled", "Worker 已取消，不能重新发布运行状态")
+                    self._save(WorkerObservation(
+                        attempt_id, active.fence, "running", session_id=started.session.session_id,
+                    ))
                 result = runtime.wait(
                     started.session, started.turn_id, timeout_seconds=self.timeout_seconds,
                 )
@@ -364,12 +430,10 @@ class RuntimeWorkerPort:
                 finally:
                     if active.transport is not None:
                         active.transport.close()
-                if active.cancelled.is_set():
-                    observation = WorkerObservation(
-                        attempt_id, active.fence, "failed", error_class="cancelled",
-                        session_id=observation.session_id, summary="Worker 进程树已关闭",
-                    )
-                elif observation.error_class == "candidate_unverified" and self.candidate_reader:
+                with active.publication_guard:
+                    active.cleanup_confirmed = True
+                if (not active.cancelled.is_set() and observation.error_class == "candidate_unverified"
+                        and self.candidate_reader):
                     sha, tree = self.candidate_reader(task)
                     observation = WorkerObservation(
                         attempt_id, active.fence, "candidate_complete",
@@ -382,24 +446,19 @@ class RuntimeWorkerPort:
                     session_id=observation.session_id, summary=str(exc),
                 )
             try:
-                self._save(observation)
-            except Exception as exc:  # noqa: BLE001 -- 后台持久化失败必须可观察并保持占槽。
-                active.pending_result = observation
-                active.persistence_error = str(exc)
+                # reader 可阻塞；最终选择必须在它返回后与取消/补偿共用发布边界。
+                self._publish(active, observation)
             finally:
                 active.finished.set()
 
     def poll(self, attempt_id: str, fence: int) -> WorkerObservation:
         self._mutate(lambda data: self._fence(data, fence))
         active = self._active.get(attempt_id)
-        if active is not None and active.pending_result is not None:
-            try:
-                self._save(active.pending_result)
-            except Exception as exc:  # noqa: BLE001 -- 暂时无法提交结果，不猜测终态。
-                active.persistence_error = str(exc)
-            else:
-                active.pending_result = None
-                active.persistence_error = None
+        if active is not None:
+            with active.publication_guard:
+                if active.pending_result is not None:
+                    self._publish(active, active.pending_result)
+                return self._observation(attempt_id)
         return self._observation(attempt_id)
 
     def reconcile(self, attempt_id: str, fence: int) -> WorkerObservation:
@@ -412,23 +471,35 @@ class RuntimeWorkerPort:
         active = self._active.get(attempt_id)
         if active is None:
             return self._observation(attempt_id)
-        active.cancelled.set()
-        with active.guard:
-            if active.transport is not None:
-                active.transport.close()
+        with active.publication_guard:
+            active.cancelled.set()
+            active.result_unconfirmed.set()
+            if active.pending_result is not None:
+                active.pending_result = self._cancelled_result(active, active.pending_result)
+        # 取引用后先释放两种 attempt 锁，再关闭真实 transport 或等待结束。
+        # 若尚未创建连接，随后 launch_guard 会凭取消标记拒绝启动/恢复。
+        try:
+            with active.guard:
+                transport = active.transport
+            if transport is not None:
+                transport.close()
+        except Exception as exc:  # noqa: BLE001 -- 保留清理错误的可见性和重复 close 能力。
+            self._publish(active, WorkerObservation(
+                attempt_id, fence, "unknown", error_class="cleanup_unconfirmed",
+                session_id=active.session.session_id if active.session else None, summary=str(exc),
+            ))
+            raise
         # 阻塞于创建/协议初始化时也不谎报已取消；下一次 poll 收到关闭后的结果。
         active.finished.wait(timeout=5)
-        if active.finished.is_set():
-            observation = self._observation(attempt_id)
-            cleaned = active.transport is not None and active.transport.cleanup_complete
-            if (observation.error_class != "cancelled" and (observation.state in _TERMINAL or (
-                observation.error_class == "cleanup_unconfirmed" and cleaned
-            ))):
-                self._save(WorkerObservation(
-                    attempt_id, fence, "failed", error_class="cancelled",
-                    session_id=observation.session_id, summary="已确认旧 Worker 进程树关闭并撤销候选",
-                ))
-        return self._observation(attempt_id)
+        with active.publication_guard:
+            if transport is not None and transport.cleanup_complete:
+                active.cleanup_confirmed = True
+            # 使用原结果保留 session 身份；_publish 会再次按确认事实清空候选并应用取消。
+            latest = self._read(attempt_id)
+            assert latest is not None
+            observation = active.pending_result or WorkerObservation.from_dict(latest["observation"])
+            self._publish(active, observation)
+            return self._observation(attempt_id)
 
     def close(self) -> None:
         for attempt_id, active in tuple(self._active.items()):

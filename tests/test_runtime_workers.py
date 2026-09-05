@@ -392,3 +392,230 @@ def test_real_isolated_runtime_can_only_emit_candidate_not_modify_control_plane(
         }
     finally:
         port.close()
+
+
+def test_pending_candidate_recovers_without_cancellation(tmp_path, monkeypatch):
+    port, task, _ = make_port(tmp_path)
+    original_save = port._save
+    failed_once = False
+
+    def fail_first_candidate(observation):
+        nonlocal failed_once
+        if observation.state == "candidate_complete" and not failed_once:
+            failed_once = True
+            raise OSError("模拟终态账本第一次写入失败")
+        original_save(observation)
+
+    monkeypatch.setattr(port, "_save", fail_first_candidate)
+    try:
+        port.dispatch("a1", 1, task, ROUTE)
+        active = port._active["a1"]
+        assert active.finished.wait(5)
+        assert active.transport.cleanup_complete
+        assert port._observation("a1").error_class == "persistence_unconfirmed"
+        result = port.poll("a1", 1)
+        assert result.state == "candidate_complete" and result.candidate_sha == "a" * 40
+        assert active.pending_result is None and active.persistence_error is None
+    finally:
+        monkeypatch.setattr(port, "_save", original_save)
+        port.close()
+
+
+@pytest.mark.parametrize("keep_failing", [False, True])
+def test_cancel_replaces_pending_candidate_before_retry(tmp_path, monkeypatch, keep_failing):
+    port, task, launcher = make_port(tmp_path)
+    original_save = port._save
+    writes_unavailable = threading.Event()
+    writes_unavailable.set()
+    failed_once = False
+
+    def fail_terminal_writes(observation):
+        nonlocal failed_once
+        if (writes_unavailable.is_set()
+                and observation.state in {"candidate_complete", "failed"}
+                and (keep_failing or not failed_once)):
+            failed_once = True
+            raise OSError("模拟终态存储暂时不可写")
+        original_save(observation)
+
+    monkeypatch.setattr(port, "_save", fail_terminal_writes)
+    try:
+        port.dispatch("a1", 1, task, ROUTE)
+        active = port._active["a1"]
+        assert active.finished.wait(5)
+        assert active.transport.cleanup_complete
+        assert active.pending_result.state == "candidate_complete"
+        cancelled = port.cancel("a1", 1)
+        assert active.cancelled.is_set()
+        if keep_failing:
+            assert cancelled.state == "unknown"
+            assert cancelled.error_class == "persistence_unconfirmed"
+            assert active.pending_result.error_class == "cancelled"
+            assert active.pending_result.candidate_sha is None
+            assert active.pending_result.candidate_tree is None
+            assert port.poll("a1", 1).state == "unknown"
+            with pytest.raises(PolicyError, match="占用"):
+                port.dispatch("a2", 1, task, ROUTE)
+        else:
+            assert cancelled.state == "failed" and cancelled.error_class == "cancelled"
+
+        writes_unavailable.clear()
+        for _ in range(2):
+            result = port.poll("a1", 1)
+            assert result.state == "failed" and result.error_class == "cancelled"
+            assert result.candidate_sha is None and result.candidate_tree is None
+        assert active.pending_result is None and active.persistence_error is None
+        assert port.cancel("a1", 1).error_class == "cancelled"
+        restored, _, _ = make_port(tmp_path, launcher=launcher)
+        try:
+            result = restored.reconcile("a1", 1)
+            assert result.state == "failed" and result.error_class == "cancelled"
+            assert result.candidate_sha is None and result.candidate_tree is None
+            assert len(launcher.calls) == 1
+        finally:
+            restored.close()
+    finally:
+        writes_unavailable.clear()
+        monkeypatch.setattr(port, "_save", original_save)
+        port.close()
+
+
+def test_cancel_during_candidate_read_never_publishes_candidate(tmp_path):
+    port, task, _ = make_port(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def read_candidate(_task):
+        entered.set()
+        assert release.wait(15), "测试必须释放可信候选读取"
+        return "a" * 40, "b" * 40
+
+    port.candidate_reader = read_candidate
+    try:
+        port.dispatch("a1", 1, task, ROUTE)
+        active = port._active["a1"]
+        assert entered.wait(5)
+        assert active.transport.cleanup_complete
+        # 让取消的有限等待先返回，随后才让旧执行线程产生候选。
+        result = port.cancel("a1", 1)
+        assert active.cancelled.is_set() and result.state != "candidate_complete"
+        release.set()
+        assert active.finished.wait(5)
+        result = port.poll("a1", 1)
+        assert result.state == "failed" and result.error_class == "cancelled"
+        assert result.candidate_sha is None and result.candidate_tree is None
+    finally:
+        release.set()
+        port.close()
+
+
+def test_failed_cancellation_commit_keeps_persisted_candidate_unavailable(tmp_path, monkeypatch):
+    port, task, _ = make_port(tmp_path)
+    original_save = port._save
+    writes_unavailable = threading.Event()
+    writes_unavailable.set()
+
+    def fail_cancellation(observation):
+        if observation.error_class == "cancelled" and writes_unavailable.is_set():
+            raise OSError("模拟已持久候选的撤销提交失败")
+        original_save(observation)
+
+    try:
+        port.dispatch("a1", 1, task, ROUTE)
+        assert settled(port).state == "candidate_complete"
+        assert port._active["a1"].finished.wait(5)
+        monkeypatch.setattr(port, "_save", fail_cancellation)
+        result = port.cancel("a1", 1)
+        assert result.state == "unknown" and result.error_class == "persistence_unconfirmed"
+        assert port._read("a1")["observation"]["state"] == "candidate_complete"
+        assert port.poll("a1", 1).state == "unknown"
+        with pytest.raises(PolicyError, match="占用"):
+            port.dispatch("a2", 1, task, ROUTE)
+        writes_unavailable.clear()
+        result = port.poll("a1", 1)
+        assert result.state == "failed" and result.error_class == "cancelled"
+        assert result.candidate_sha is None and result.candidate_tree is None
+    finally:
+        writes_unavailable.clear()
+        monkeypatch.setattr(port, "_save", original_save)
+        port.close()
+
+
+@pytest.mark.parametrize("publication", ["final", "pending"])
+def test_result_publication_and_cancel_share_one_boundary(tmp_path, monkeypatch, publication):
+    port, task, _ = make_port(tmp_path)
+    original_save = port._save
+    allow_candidate, entered, release = (threading.Event() for _ in range(3))
+    cancel_started = threading.Event()
+    results, errors = {}, []
+    candidate_writes = 0
+    poller = canceller = None
+
+    def read_candidate(_task):
+        # dispatch 的首次状态读取不能被测试的发布屏障截住。
+        assert allow_candidate.wait(5)
+        return "a" * 40, "b" * 40
+
+    def pause_publication(observation):
+        nonlocal candidate_writes
+        if observation.state == "candidate_complete":
+            candidate_writes += 1
+            if publication == "pending" and candidate_writes == 1:
+                raise OSError("模拟后台终态写失败，交由 poll 补偿")
+            entered.set()
+            assert release.wait(10), "测试必须释放结果发布"
+        original_save(observation)
+
+    def poll_candidate():
+        try:
+            results["poll"] = port.poll("a1", 1)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def cancel_candidate():
+        cancel_started.set()
+        try:
+            results["cancel"] = port.cancel("a1", 1)
+        except BaseException as exc:
+            errors.append(exc)
+
+    port.candidate_reader = read_candidate
+    monkeypatch.setattr(port, "_save", pause_publication)
+    try:
+        port.dispatch("a1", 1, task, ROUTE)
+        active = port._active["a1"]
+        allow_candidate.set()
+        if publication == "pending":
+            assert active.finished.wait(5)
+            assert active.pending_result.state == "candidate_complete"
+            poller = threading.Thread(target=poll_candidate)
+            poller.start()
+        assert entered.wait(5)
+        assert active.transport.cleanup_complete
+        # 在真实保存窗口检查互斥，而非用 sleep 猜测另一线程是否已越过边界。
+        acquired = active.publication_guard.acquire(blocking=False)
+        if acquired:
+            active.publication_guard.release()
+        assert not acquired
+        canceller = threading.Thread(target=cancel_candidate)
+        canceller.start()
+        assert cancel_started.wait(5)
+        release.set()
+        assert active.finished.wait(5)
+        for thread in (poller, canceller):
+            if thread is not None:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+        assert not errors
+        assert results["cancel"].error_class == "cancelled"
+        result = port.poll("a1", 1)
+        assert result.state == "failed" and result.error_class == "cancelled"
+        assert result.candidate_sha is None and result.candidate_tree is None
+        assert active.pending_result is None and active.persistence_error is None
+    finally:
+        allow_candidate.set()
+        release.set()
+        for thread in (poller, canceller):
+            if thread is not None:
+                thread.join(timeout=5)
+        monkeypatch.setattr(port, "_save", original_save)
+        port.close()
