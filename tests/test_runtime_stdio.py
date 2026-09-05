@@ -1,5 +1,6 @@
 """真正启动隔离的假进程验证 stdio 行为，不使用网络或模型。"""
 
+import errno
 import os
 import subprocess
 import sys
@@ -19,6 +20,10 @@ from workspace_orchestrator.agent_runtime.stdio import (
 
 def server(source, **kwargs):
     return JsonRpcStdioClient([sys.executable, "-u", "-c", source], **kwargs)
+
+
+class _GenericBrokenPipeOSError(OSError):
+    """模拟未被自定义 Launcher 规范化的 POSIX EPIPE。"""
 
 
 def test_requests_match_out_of_order_responses_and_stream_before_exit():
@@ -156,6 +161,27 @@ sys.stdin.read()
             with pytest.raises(RpcTransportError):
                 waiting.result(timeout=3)
         client.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [BrokenPipeError(), _GenericBrokenPipeOSError(errno.EPIPE, "broken pipe")],
+)
+def test_close_runtime_stream_tolerates_only_broken_pipe(error):
+    class BrokenStream:
+        def close(self):
+            raise error
+
+    stdio_module._close_runtime_stream(BrokenStream())
+
+
+def test_close_runtime_stream_propagates_unexpected_os_error():
+    class FailingStream:
+        def close(self):
+            raise OSError(errno.EIO, "I/O error")
+
+    with pytest.raises(OSError, match="I/O error"):
+        stdio_module._close_runtime_stream(FailingStream())
 
 
 def test_missing_executable_reports_unavailable():

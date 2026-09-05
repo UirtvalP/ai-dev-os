@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from workspace_orchestrator.adapters.agent import AgentProviderError
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
+from workspace_orchestrator.delivery_guard import (
+    delivery_completion_guard,
+    require_delivery_completion,
+)
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import load_project_config
@@ -406,6 +411,10 @@ class AutomationRuntime:
         ) or self.store.attached_requirement_id(session_id)
         if not requirement_id:
             return AutoFinishResult(False, "当前 Thread 未绑定 Requirement")
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return AutoFinishResult(False, str(exc), requirement_id)
         data = self.store.load(requirement_id)
         session = next(
             (
@@ -460,19 +469,24 @@ class AutomationRuntime:
         )
         if recovery_blocker:
             return AutoFinishResult(False, recovery_blocker, requirement_id, task_ids)
-        complete_tasks(provider, task_ids)
-        try:
-            self.agent_provider.archive_session(session_id)
-        except AgentProviderError as exc:
-            raise WorkspaceError(f"Thread 自动归档失败：{exc}") from exc
-        end_session(
-            self.store,
-            requirement_id,
-            session_id,
-            result="completed",
-            task_provider=provider,
-            allowed_results=("in_progress", "pending_auto_finish"),
-        )
+        with self.store.locked(requirement_id):
+            try:
+                require_delivery_completion(self.store, requirement_id)
+            except WorkspaceError as exc:
+                return AutoFinishResult(False, str(exc), requirement_id, task_ids)
+            complete_tasks(provider, task_ids)
+            try:
+                self.agent_provider.archive_session(session_id)
+            except AgentProviderError as exc:
+                raise WorkspaceError(f"Thread 自动归档失败：{exc}") from exc
+            end_session(
+                self.store,
+                requirement_id,
+                session_id,
+                result="completed",
+                task_provider=provider,
+                allowed_results=("in_progress", "pending_auto_finish"),
+            )
         return AutoFinishResult(True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids)
 
     def _completion_evidence_fingerprint(self, requirement_id: str) -> str:
@@ -485,7 +499,7 @@ class AutomationRuntime:
         payload["policy"] = {
             name: data["meta"].get(name)
             for name in (
-                "manual_test_required", "phase_gate_required", "requirement_task_id"
+                "manual_test_required", "phase_gate_required", "requirement_task_id", "delivery_profile"
             )
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -501,6 +515,10 @@ class AutomationRuntime:
         """补偿 finalize 的外部 Task 写入与本地终态之间的崩溃窗口。"""
 
         with self.store.finalize_locked(requirement_id):
+            try:
+                require_delivery_completion(self.store, requirement_id)
+            except WorkspaceError as exc:
+                return str(exc)
             meta = self.store.load(requirement_id)["meta"]
             pending = meta.get("pending_auto_completion")
             if pending is None or meta.get("status") == "done":
@@ -528,6 +546,7 @@ class AutomationRuntime:
                 if not review.passed:
                     return "finalize 恢复审查未通过：" + "；".join(review.blockers)
                 with self.store.locked(requirement_id):
+                    require_delivery_completion(self.store, requirement_id)
                     fresh = self.store.load(requirement_id)["meta"]
                     if (
                         fresh.get("pending_auto_completion") != pending
@@ -630,7 +649,8 @@ class AutomationRuntime:
         return result
 
     def _publish_review_packet(
-        self, requirement_id: str, provider: TaskProvider | None
+        self, requirement_id: str, provider: TaskProvider | None, *,
+        git_context: Callable[[], dict[str, Any]] | None = None,
     ) -> tuple[tuple[str, ...], object | None]:
         """发布完整 Packet；成功后才把本地与 Review 卡推进到 in_review。"""
 
@@ -641,7 +661,7 @@ class AutomationRuntime:
         if task_error:
             return (f"Review Packet 发布失败：{task_error}",), None
         data = self.store.load(requirement_id)
-        git = collect_git_context(
+        git = git_context() if git_context is not None else collect_git_context(
             self.store.project_root,
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
@@ -680,7 +700,7 @@ class AutomationRuntime:
                 comments = tuple(provider.list_comments(review_task.id))
                 # 发布后重建事实；期间若证据变化，不能提交 review-ready。
                 refreshed_tasks, refreshed_error = list_tasks_safely(provider, requirement_id)
-                refreshed_git = collect_git_context(
+                refreshed_git = git_context() if git_context is not None else collect_git_context(
                     self.store.project_root,
                     dict(self.store.load(requirement_id)["meta"].get("git") or {}),
                     execution_root=self.store.working_root,
@@ -809,6 +829,10 @@ class AutomationRuntime:
     ) -> FinalizeResult:
         """一次触发执行验证、checkpoint、Task review、handoff 与 detach。"""
 
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return FinalizeResult(False, "状态：FAIL", (), blockers=(str(exc),))
         gates = GateStore(self.store)
         phase_gate_required = gates.is_required(requirement_id)
         if phase_gate_required:
@@ -853,6 +877,11 @@ class AutomationRuntime:
             return FinalizeResult(False, summary, task_ids, blockers=(str(exc),))
         summary = verification_summary(results)
         passed = bool(results) and all(item.passed for item in results)
+        # 长验证期间允许新的 V2 请求接入；旧结果不能写成新交付的验收事实。
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return FinalizeResult(False, summary, task_ids, blockers=(str(exc),))
         persist_verification_results(self.store, requirement_id, results)
         self.checkpoint(
             requirement_id,
@@ -888,7 +917,8 @@ class AutomationRuntime:
                     and task.status not in {"in_review", "done"}
                 )
         try:
-            move_tasks_to_review(provider, tuple(dict.fromkeys(review_candidates)))
+            with delivery_completion_guard(self.store, requirement_id):
+                move_tasks_to_review(provider, tuple(dict.fromkeys(review_candidates)))
         except WorkspaceError as exc:
             self.checkpoint(
                 requirement_id,
@@ -981,28 +1011,30 @@ class AutomationRuntime:
                     final_task_ids,
                     blockers=(f"最终 Phase Gate 在完成前失效：{exc}",),
                 )
-        # 在外部 Task 首次变为 done 之前持久化授权；Stop 只能恢复该事务。
-        self.store.touch_meta(
-            requirement_id,
-            pending_auto_completion={
-                "schema_version": 1,
-                "session_id": session_id,
-                "task_ids": list(final_task_ids),
-                "evidence_fingerprint": self._completion_evidence_fingerprint(requirement_id),
-            },
-        )
+        # 复用 Requirement 短锁，与 V2 接入串行；不在此锁内执行长验证。
         try:
-            if provider is not None:
-                complete_tasks(provider, final_task_ids)
+            with delivery_completion_guard(self.store, requirement_id):
+                # 在外部 Task 首次变为 done 之前持久化授权；Stop 只能恢复该事务。
+                self.store.touch_meta(
+                    requirement_id,
+                    pending_auto_completion={
+                        "schema_version": 1,
+                        "session_id": session_id,
+                        "task_ids": list(final_task_ids),
+                        "evidence_fingerprint": self._completion_evidence_fingerprint(requirement_id),
+                    },
+                )
+                if provider is not None:
+                    complete_tasks(provider, final_task_ids)
+                self.store.touch_meta(
+                    requirement_id,
+                    status="done",
+                    completion_mode="auto_after_verification",
+                    pending_auto_completion=None,
+                )
         except WorkspaceError as exc:
             self.store.touch_meta(requirement_id, status="in_progress")
             return FinalizeResult(False, summary, final_task_ids, blockers=(str(exc),))
-        self.store.touch_meta(
-            requirement_id,
-            status="done",
-            completion_mode="auto_after_verification",
-            pending_auto_completion=None,
-        )
         self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
         return FinalizeResult(
             True,

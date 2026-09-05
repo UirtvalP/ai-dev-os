@@ -81,6 +81,11 @@ ai-dev-os --help
 workspace --help
 ```
 
+开发测试默认使用 pytest-xdist 固定四个进程分发全部用例，不使用 `auto` 或按全部 CPU 自动扩张。`--dist=loadgroup`
+将复用 worker 只读 LPAC runtime seed 的慢例分为两个稳定组，避免每个 worker 重复冷启动；未标记用例仍细粒度调度，默认 cold-path 用例保持独立。需要串行排查时用
+`pytest -n 0`，查看慢用例用 `pytest --durations=20`。真实在线 Codex smoke 单独以
+`-n 0` 执行。并行配置不减少测试，也不替代阶段出口的 CI、独立审查与 exact-SHA 门禁。
+
 将一个现有项目接入 AI Dev OS：
 
 ```bash
@@ -298,6 +303,54 @@ Review 卡正文发布失败、关键证据缺失，或卡片 marker 与当前 r
 在**已经分配好的各自 Git worktree** 中并发执行；它们共享主工作树 `.workspace`，但 Session、
 Requirement meta 与 Git worktree 绑定不会串线。V1 尚不自动创建、分配或回收每个 Requirement
 的 branch/worktree；需要用户或上层工具先完成隔离。自动并行 Agent 与完整 Worktree 生命周期仍是后续能力。
+
+## V2 Git 集成入口（Phase 3）
+
+Git 能力直接复用原生 Git；外部方案与自研边界见 [V2 生态复用选型](V2生态复用选型.md)。
+现有 V1 Workspace、Task Provider、Review Packet 和 Hook 生命周期继续保留。
+
+Phase 3 的产品顺序是：为已有需求准备独立 Task 工作树 → 冻结计划 → 执行本批任务 →
+整批受控验证 → 集成候选验证 → Requirement Review → main CAS → post-merge 验证。
+命令示例中的 `REQ-ID`、`SHA`、路径和 request ID 都需替换成操作者明确选定的实际值；
+不要在尚未交付的 REQ-020 本身运行合并示例。
+
+```text
+ai-dev-os orchestration prepare REQ-ID --root PROJECT --file request.json --expected-main SHA
+ai-dev-os orchestration plan REQ-ID --root PROJECT --owner controller --file prepared.json
+ai-dev-os orchestration run REQ-ID --root PROJECT --owner controller --timeout 300
+ai-dev-os orchestration verify REQ-ID --root PROJECT --owner controller
+ai-dev-os integration merge REQ-ID --root PROJECT --request-id stable-request-id --expected-main SHA
+ai-dev-os integration status REQ-ID --root PROJECT --request-id stable-request-id
+ai-dev-os integration reconcile REQ-ID --root PROJECT --request-id stable-request-id
+ai-dev-os integration recover-post-merge REQ-ID --root PROJECT --request-id stable-request-id --recovery-id explicit-recovery-id
+```
+
+`prepare` 输出可保存为 `prepared.json` 的 PlanningRequest；它只为原始任务分配或恢复
+本系统持久租约，不接管未知分支/目录。工作树默认在项目同级的 `项目名.tasks` 下，
+控制状态存于共享 Git 元数据目录；Worker 不获得共享 Git 或 canonical Workspace 的写权。
+失败目录保留；`release` 释放租约但不递归删除用户文件。
+
+`verify` 复用项目 `pyproject.toml` 的既有验证命令，也可通过 `--commands-file` 提供
+VerificationCommand 数组。非空命令全部返回实际结果，收据绑定提交、tree、命令指纹、
+环境与输出摘要；没有配置的工具或隔离后端不能被视为 PASS。当前默认进程隔离后端为
+Windows LPAC；Linux 尚未接入同等后端时报告不可用，不降级为当前用户权限执行候选代码。
+`--refresh` 明确重验同一已 accepted 候选并保留原收据历史，不重新运行编码 Worker。
+
+集成只接受所有 Task 的新鲜验收证据；默认有效期为一小时。证据过期先显式刷新，
+旧合并请求若已因快照变化被拒绝，需使用新 request ID；不得修改历史回执时间。
+人工验收沿用现有 Review 卡和可靠用户活动，不新增“命令行声明 PASS”的批准入口。
+等待人工批准可用原 request ID 重试；相同 ID 不得换参数，也不会重复已确认的合并。
+人工退回留言继续由原 Hook 写回 Workspace 并补偿任务状态；它使旧审批失效，但不会
+直接篡改 Supervisor 的冻结计划或把旧候选重新视为已验收。
+
+合并前后保留 `MergeReceipt`，但 Phase 3 不签发 RequirementCompletionToken，也不会部署。
+`recovery_required` 表示尚未交付；main 已变更而 post-merge 失败时保留现场，不回滚或掩盖用户文件。
+ref 前崩溃且原子发布记录证明尚未发布时，`reconcile` 重新检查当前证据和 Review；
+旧事实已失效则以可识别拒绝结果收敛，修正后使用新 request ID。已经发布但尚未开始验证、
+或验证已确认返回失败时，操作者可显式调用 `recover-post-merge`；它保留历史收据和每次
+恢复尝试，相同 recovery ID 幂等，不接受新 SHA、命令或环境替换原意图。未知执行/清理
+状态仍拒绝重放，不能通过删除 journal、回滚 main 或修改收据时间释放队列。
+V2 的旧 `finalize`、`confirm` 和 Stop 自动收尾入口不能绕过最终交付门禁。
 
 ## 设计原则
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,9 @@ from workspace_orchestrator.orchestration.isolation import (
     WorkerIsolationError,
     WorkerIsolationSpec,
     _acl_state,
+    _assert_reparse_proofs_unchanged,
+    _reparse_target,
+    _ReparseProof,
     stage_python_runtime,
     validate_spec,
     worker_environment,
@@ -48,6 +52,192 @@ def _spec(tmp_path: Path) -> tuple[WorkerIsolationSpec, Path]:
     return WorkerIsolationSpec(
         tmp_path / "task", (tmp_path / "protected",), (tmp_path / "tools",), "run", 1
     ), tmp_path / "controller"
+
+
+def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.skip(f"当前 Windows 不能创建临时 symlink: {exc}")
+
+
+def _junction_or_skip(link: Path, target: Path) -> None:
+    command = Path(os.environ["SystemRoot"]) / "System32/cmd.exe"
+    result = subprocess.run(
+        [str(command), "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        pytest.skip(f"当前 Windows 不能创建临时 junction: {result.stderr!r}")
+
+
+def test_reparse_proof_identity_drift_is_fail_closed() -> None:
+    initial = _ReparseProof(
+        "C:/root/python3.exe", 1, 0, "python.exe", "C:/root/python.exe",
+        2, "03", 2, "04", "file",
+    )
+    changed = replace(
+        initial, raw_target="other.exe", final_path="C:/root/other.exe", target_file_id="05"
+    )
+    with pytest.raises(WorkerIsolationError) as caught:
+        _assert_reparse_proofs_unchanged((initial,), (changed,))
+    assert caught.value.code == "linked_path"
+    assert f"path={Path('C:/root/python3.exe')}" in str(caught.value)
+    assert "target=C:/root/other.exe" in str(caught.value)
+    assert "reason=probe_launch_identity_drift" in str(caught.value)
+
+
+def test_unknown_reparse_tag_is_fail_closed_with_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_orchestrator.orchestration import isolation as isolation_module
+
+    class Kernel:
+        @staticmethod
+        def DeviceIoControl(
+            _handle, _code, _input, _input_size, output, _output_size, returned, _overlapped,
+        ) -> bool:
+            payload = (0xA0000003).to_bytes(4, "little") + b"\0\0\0\0"
+            ctypes.memmove(output, payload, len(payload))
+            returned._obj.value = len(payload)
+            return True
+
+    api = SimpleNamespace(
+        ctypes=ctypes, wt=SimpleNamespace(DWORD=ctypes.c_ulong), kernel=Kernel()
+    )
+    monkeypatch.setattr(isolation_module, "_win32", lambda: api)
+    path = Path("C:/root/alias")
+    with pytest.raises(WorkerIsolationError) as caught:
+        _reparse_target(object(), path)
+    assert caught.value.code == "linked_path"
+    assert f"path={path}" in str(caught.value)
+    assert "target=<unresolved>" in str(caught.value)
+    assert "reason=unsupported_reparse_tag:0xa0000003" in str(caught.value)
+
+
+@WINDOWS
+def test_protected_same_root_file_symlink_is_proved_at_probe_and_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, controller = _spec(tmp_path)
+    target = spec.protected_roots[0] / "python.exe"
+    target.write_bytes(b"physical target")
+    _symlink_or_skip(spec.protected_roots[0] / "python3.exe", target)
+    isolation = WindowsAppContainerIsolation(controller_roots=(controller,))
+    isolation._proof = {"fixture": True}
+    capability = isolation.probe(spec)
+    assert capability.supported, capability
+    assert capability.evidence["protected_link_count"] >= 1
+    attested = next(iter(isolation._attested.values()))
+    proof = next(item for item in attested.links if item.path.endswith("python3.exe"))
+    assert proof.tag == 0xA000000C
+    assert proof.raw_target
+    assert Path(proof.final_path) == target
+    assert proof.link_volume == proof.target_volume
+    assert proof.link_file_id and proof.target_file_id
+    assert proof.link_file_id != proof.target_file_id
+    assert proof.object_type == "file"
+    process = SimpleNamespace(isolation_evidence={})
+    monkeypatch.setattr(isolation, "_launch", lambda *args, **kwargs: process)
+    assert isolation.launch(spec, [str(spec.task_root / "not-executed.exe")]) is process
+    assert process.isolation_evidence["protected_link_count"] >= 1
+
+
+def test_lpac_working_directory_must_be_a_physical_task_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, controller = _spec(tmp_path)
+    candidate = spec.task_root / "candidate"
+    candidate.mkdir()
+    executable = spec.task_root / "not-executed.exe"
+    executable.write_bytes(b"fixture")
+    isolation = WindowsAppContainerIsolation(controller_roots=(controller,))
+    from workspace_orchestrator.orchestration import isolation as isolation_module
+
+    monkeypatch.setattr(
+        isolation_module, "AppContainerProcess", lambda _spec, _command, _env, cwd: cwd,
+    )
+    assert isolation._launch(
+        spec, [str(executable)], working_directory=candidate,
+    ) == candidate
+    with pytest.raises(WorkerIsolationError) as caught:
+        isolation._launch(
+            spec, [str(executable)], working_directory=spec.protected_roots[0],
+        )
+    assert caught.value.code == "unsafe_path"
+
+
+@WINDOWS
+def test_protected_file_symlink_retarget_between_probe_and_launch_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, controller = _spec(tmp_path)
+    first = spec.protected_roots[0] / "first.exe"
+    second = spec.protected_roots[0] / "second.exe"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    link = spec.protected_roots[0] / "python3.exe"
+    _symlink_or_skip(link, first)
+    isolation = WindowsAppContainerIsolation(controller_roots=(controller,))
+    isolation._proof = {"fixture": True}
+    assert isolation.probe(spec).supported
+    link.unlink()
+    _symlink_or_skip(link, second)
+    monkeypatch.setattr(isolation, "_launch", lambda *args, **kwargs: pytest.fail("不得启动"))
+    with pytest.raises(WorkerIsolationError) as caught:
+        isolation.launch(spec, [str(spec.task_root / "not-executed.exe")])
+    assert caught.value.code == "linked_path"
+    assert "path=" in str(caught.value) and "target=" in str(caught.value)
+    assert "reason=probe_launch_identity_drift" in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["broken", "cycle", "outside", "directory"])
+@WINDOWS
+def test_unsupported_protected_reparse_fails_with_diagnostics(tmp_path: Path, kind: str) -> None:
+    spec, controller = _spec(tmp_path)
+    link = spec.protected_roots[0] / "alias"
+    if kind == "broken":
+        _symlink_or_skip(link, spec.protected_roots[0] / "missing.exe")
+    elif kind == "cycle":
+        other = spec.protected_roots[0] / "other"
+        _symlink_or_skip(link, other)
+        _symlink_or_skip(other, link)
+    elif kind == "outside":
+        target = tmp_path / "outside.exe"
+        target.write_bytes(b"outside")
+        _symlink_or_skip(link, target)
+    else:
+        target = spec.protected_roots[0] / "directory"
+        target.mkdir()
+        _junction_or_skip(link, target)
+    capability = WindowsAppContainerIsolation(controller_roots=(controller,)).probe(spec)
+    assert not capability.supported
+    assert capability.evidence["code"] == "linked_path"
+    assert "path=" in capability.reason
+    assert "target=" in capability.reason
+    assert "reason=" in capability.reason
+
+
+@pytest.mark.parametrize("position", ["root", "ancestor"])
+@WINDOWS
+def test_protected_root_or_ancestor_reparse_remains_rejected(
+    tmp_path: Path, position: str,
+) -> None:
+    spec, controller = _spec(tmp_path)
+    physical = tmp_path / "physical-parent"
+    protected = physical / "protected"
+    protected.mkdir(parents=True)
+    linked = tmp_path / "linked-parent"
+    if position == "root":
+        _junction_or_skip(linked, protected)
+        replacement = linked
+    else:
+        _junction_or_skip(linked, physical)
+        replacement = linked / "protected"
+    with pytest.raises(WorkerIsolationError, match="隔离路径包含") as caught:
+        validate_spec(replace(spec, protected_roots=(replacement,)), controller_roots=(controller,))
+    assert caught.value.code == "linked_path"
 
 
 @WINDOWS

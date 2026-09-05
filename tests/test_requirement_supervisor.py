@@ -484,6 +484,72 @@ def prepare_candidate(harness: Harness, **changes: Any) -> RequirementSupervisor
     return supervisor
 
 
+def test_explicit_refresh_reuses_same_candidate_and_keeps_prior_receipt(harness: Harness) -> None:
+    supervisor = prepare_candidate(harness)
+    supervisor.verify_task("T1", COMMANDS, ENVIRONMENT)
+    before = node(supervisor)
+    with pytest.raises(WorkspaceError, match="候选"):
+        supervisor.verify_task("T1", COMMANDS, ENVIRONMENT)
+    harness.clock.advance(5)
+    supervisor.renew()
+    supervisor.verify_task("T1", COMMANDS, ENVIRONMENT, refresh=True)
+    after = node(supervisor)
+    assert after["status"] == "accepted"
+    assert after["candidate_sha"] == before["candidate_sha"]
+    assert after["verification_history"][-1] == before["verification"]
+    assert after["verification"]["receipt"]["receipt_id"] != before["verification"]["receipt"]["receipt_id"]
+    assert len(harness.workers.dispatches) == 1 and len(harness.verifier.executions) == 2
+
+
+def test_refresh_of_accepted_candidate_does_not_accept_changed_git_facts(harness: Harness) -> None:
+    supervisor = prepare_candidate(harness)
+    supervisor.verify_task("T1", COMMANDS, ENVIRONMENT)
+    harness.candidates["T1"] = ("e" * 40, TREE)
+    supervisor.verify_task("T1", COMMANDS, ENVIRONMENT, refresh=True)
+    assert node(supervisor)["status"] != "accepted"
+    assert len(harness.verifier.executions) == 1
+
+
+def test_refresh_cannot_revive_cancelled_worker(harness: Harness) -> None:
+    supervisor = harness.supervisor()
+    supervisor.acquire()
+    supervisor.initialize(request(harness.task()))
+    tick_until(supervisor, "T1", {"running"})
+    supervisor.close(cancel_running=True)
+    supervisor.acquire()
+    with pytest.raises(WorkspaceError, match="候选"):
+        supervisor.verify_task("T1", COMMANDS, ENVIRONMENT, refresh=True)
+    assert not harness.verifier.executions
+
+
+def test_refresh_rejects_while_another_task_has_active_worker(harness: Harness) -> None:
+    supervisor = harness.supervisor(max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(harness.task("A"), harness.task("B")))
+    tick_until(supervisor, "A", {"running"})
+    tick_until(supervisor, "B", {"running"})
+    candidate(harness, supervisor, "A")
+    supervisor.verify_task("A", COMMANDS, ENVIRONMENT)
+    with pytest.raises(WorkspaceError, match="所有 Worker"):
+        supervisor.verify_task("A", COMMANDS, ENVIRONMENT, refresh=True)
+    assert len(harness.verifier.executions) == 1
+
+
+def test_verification_can_renew_lease_while_executor_runs(harness: Harness) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    supervisor = prepare_candidate(harness)
+
+    def renew_during_execution() -> None:
+        harness.clock.advance(10)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(supervisor.renew).result(timeout=10)
+
+    harness.verifier.after_execute = renew_during_execution
+    supervisor.verify_task("T1", COMMANDS, ENVIRONMENT)
+    assert node(supervisor)["status"] == "accepted"
+
+
 def verify_rejected(supervisor: RequirementSupervisor) -> None:
     try:
         supervisor.verify_task("T1", COMMANDS, ENVIRONMENT)

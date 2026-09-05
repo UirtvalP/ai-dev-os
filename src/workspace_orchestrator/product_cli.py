@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
+from .adapters.git import GitError
 from .adapters.package import ToolInstallerError, ToolUpgradeResult, UvToolInstaller
 from .agent_runtime.events import RuntimeEventStore
 from .automation.dispatcher import (
@@ -22,6 +23,7 @@ from .automation.requirement_attach import discover_project_root
 from .composition import configured_executor, runtime_descriptors
 from .console import configure_standard_streams as _configure_standard_streams
 from .hook_runtime import main as hook_main
+from .orchestration.contracts import PlanningRequest
 from .project_config import load_project_config
 from .project_init import InitResult, initialize_project, migrate_project
 from .project_registry import GlobalProjectRegistry, RegisteredProject
@@ -79,22 +81,42 @@ def build_parser() -> argparse.ArgumentParser:
     orchestration_commands = orchestration.add_subparsers(dest="orchestration_command", required=True)
     for action, description in (
         ("status", "读取本地编排状态，不启动 Worker"),
+        ("prepare", "从 main 为原始 Task 幂等分配工作树，输出可冻结的计划请求"),
         ("plan", "从结构化 JSON 冻结本需求执行计划，不启动 Worker"),
         ("run", "前台续租并执行至候选或阻塞；不会完成 Requirement"),
+        ("verify", "整批验证已退出 Worker 的候选；不合并或完成 Requirement"),
     ):
         command = orchestration_commands.add_parser(action, help=description)
         command.add_argument("requirement_id", help="已经存在的 Requirement ID")
         command.add_argument("--root", type=Path, default=Path.cwd())
-        if action != "status":
+        if action not in ("status", "prepare"):
             command.add_argument("--owner", required=True, help="操作员/控制器唯一身份")
             command.add_argument("--max-workers", type=int, default=1)
             command.add_argument("--allow-worktree-root", type=Path, action="append", default=[])
             command.add_argument("--allow-network", action="store_true",
                                  help="显式允许隔离域联网；不宣称已实现域名过滤")
-        if action == "plan":
+        if action in ("plan", "prepare"):
             command.add_argument("--file", type=Path, required=True, help="PlanningRequest JSON 文件")
+        if action == "prepare":
+            command.add_argument("--expected-main", required=True, help="完整、明确的 main 基线 SHA")
         elif action == "run":
             command.add_argument("--timeout", type=float, default=300, help="本次前台服务最长秒数")
+        elif action == "verify":
+            command.add_argument("--task-id", action="append", default=[], help="省略时验证本批全部候选")
+            command.add_argument("--refresh", action="store_true", help="明确重验已 accepted 的同一候选，保留旧收据历史")
+            command.add_argument("--commands-file", type=Path, help="可信操作员提供的 VerificationCommand 数组")
+    integration = commands.add_parser("integration", help="Git 集成队列、CAS 合并与中断恢复")
+    integration_commands = integration.add_subparsers(dest="integration_command", required=True)
+    for action in ("merge", "status", "reconcile", "recover-post-merge"):
+        command = integration_commands.add_parser(action)
+        command.add_argument("requirement_id")
+        command.add_argument("--request-id", required=True, help="可重试的稳定操作 ID")
+        command.add_argument("--root", type=Path, default=Path.cwd())
+        if action == "merge":
+            command.add_argument("--expected-main", required=True, help="副作用前以 CAS 再校验的完整 main SHA")
+            command.add_argument("--commands-file", type=Path)
+        elif action == "recover-post-merge":
+            command.add_argument("--recovery-id", required=True, help="本次显式恢复的稳定 ID；未知执行不可重放")
     dispatcher = commands.add_parser(
         "dispatcher", help="管理 Task → Agent 自动执行 Dispatcher"
     )
@@ -195,8 +217,31 @@ def _format_project(project: RegisteredProject) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "integration":
+        from .integration_composition import configured_integration, load_verification_commands
+
+        execution_root = args.root.expanduser().resolve()
+        workspace = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        service = configured_integration(workspace, args.requirement_id)
+        if args.integration_command == "status":
+            integration_result = service.status(args.requirement_id, args.request_id)
+        elif args.integration_command == "reconcile":
+            integration_result = service.reconcile(args.requirement_id, args.request_id).to_dict()
+        elif args.integration_command == "recover-post-merge":
+            integration_result = service.recover_post_merge(
+                args.requirement_id, args.request_id, args.recovery_id,
+            ).to_dict()
+        else:
+            from .integration_composition import configured_verification
+
+            integration_result = service.integrate(
+                args.requirement_id, args.request_id, args.expected_main,
+                load_verification_commands(workspace, args.commands_file),
+                configured_verification(workspace).environment,
+            ).to_dict()
+        return json.dumps(integration_result, ensure_ascii=False, indent=2)
     if args.command == "orchestration":
-        from .orchestration.contracts import PlanningRequest, PolicyError
+        from .orchestration.contracts import PolicyError
         from .orchestration_composition import (
             configured_projection,
             configured_supervisor,
@@ -208,6 +253,13 @@ def run(args: argparse.Namespace) -> str:
         store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
         if args.orchestration_command == "status":
             orchestration_result = control_store(store, args.requirement_id).snapshot()
+        elif args.orchestration_command == "prepare":
+            from .integration_composition import prepare_git_request
+
+            request = _load_planning_request(args.file, args.requirement_id)
+            orchestration_result = prepare_git_request(
+                store, request, expected_main_sha=args.expected_main,
+            ).to_dict()
         else:
             supervisor = configured_supervisor(
                 store, args.requirement_id, owner=args.owner, max_workers=args.max_workers,
@@ -216,17 +268,25 @@ def run(args: argparse.Namespace) -> str:
             )
             try:
                 if args.orchestration_command == "plan":
-                    if args.file.stat().st_size > 1024 * 1024:
-                        raise WorkspaceError("计划 JSON 超出 1 MiB 限制")
-                    request = PlanningRequest.from_dict(json.loads(args.file.read_text(encoding="utf-8")))
-                    if request.requirement_id != args.requirement_id:
-                        raise WorkspaceError("计划 Requirement ID 与命令目标不一致")
+                    request = _load_planning_request(args.file, args.requirement_id)
                     supervisor.acquire()
                     try:
                         supervisor.initialize(request)
                     finally:
                         supervisor.close()
                     orchestration_result = supervisor.status()
+                elif args.orchestration_command == "verify":
+                    from .integration_composition import (
+                        configured_verification,
+                        load_verification_commands,
+                        verify_candidates,
+                    )
+
+                    orchestration_result = verify_candidates(
+                        supervisor, load_verification_commands(store, args.commands_file),
+                        configured_verification(store).environment, task_ids=tuple(args.task_id),
+                        refresh=args.refresh,
+                    )
                 else:
                     orchestration_result = run_supervisor(
                         supervisor, timeout_seconds=args.timeout,
@@ -291,6 +351,15 @@ def run(args: argparse.Namespace) -> str:
     raise AssertionError(f"未处理的命令：{args.command}")
 
 
+def _load_planning_request(path: Path, requirement_id: str) -> PlanningRequest:
+    if path.stat().st_size > 1024 * 1024:
+        raise WorkspaceError("计划 JSON 超出 1 MiB 限制")
+    request = PlanningRequest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    if request.requirement_id != requirement_id:
+        raise WorkspaceError("计划 Requirement ID 与命令目标不一致")
+    return request
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_standard_streams()
     effective = sys.argv[1:] if argv is None else argv
@@ -304,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             store = WorkspaceStore(project_root, execution_root=execution_root)
             return serve_dispatcher(store, configured_executor(store))
         output = run(args)
-    except (OSError, ValueError, ToolInstallerError, UnicodeError, WorkspaceError) as exc:
+    except (OSError, ValueError, ToolInstallerError, UnicodeError, WorkspaceError, GitError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     print(output)

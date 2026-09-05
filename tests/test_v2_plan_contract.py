@@ -1,11 +1,88 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
+import tomllib
 from itertools import pairwise, product
 from pathlib import Path
 
 from workspace_orchestrator.phase_gate import source_fingerprint
+
+
+def test_pytest_parallelism_is_fixed_four_workers_with_lpac_seed_groups() -> None:
+    root = Path(__file__).parents[1]
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert configuration["tool"]["pytest"]["ini_options"]["addopts"] == "-n 4 --dist=loadgroup"
+
+    source = ast.parse((root / "tests" / "test_legacy_verification.py").read_text(encoding="utf-8"))
+    group_members: dict[str, str] = {}
+    parameterized: set[str] = set()
+    test_functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for node in ast.walk(source):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("test_"):
+            test_functions[node.name] = node
+        for decorator in node.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and isinstance(decorator.func.value, ast.Attribute)
+                and isinstance(decorator.func.value.value, ast.Name)
+                and decorator.func.value.value.id == "pytest"
+                and decorator.func.value.attr == "mark"
+                and decorator.func.attr == "xdist_group"
+            ):
+                assert (
+                    len(decorator.args) == 1
+                    and isinstance(decorator.args[0], ast.Constant)
+                    and isinstance(decorator.args[0].value, str)
+                )
+                group_members[node.name] = decorator.args[0].value
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and isinstance(decorator.func.value, ast.Attribute)
+                and isinstance(decorator.func.value.value, ast.Name)
+                and decorator.func.value.value.id == "pytest"
+                and decorator.func.value.attr == "mark"
+                and decorator.func.attr == "parametrize"
+            ):
+                parameterized.add(node.name)
+
+    lpac_fixture_consumers = {
+        name
+        for name, node in test_functions.items()
+        if "lpac_test_infrastructure"
+        in {
+            argument.arg
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+                *((node.args.vararg,) if node.args.vararg is not None else ()),
+                *((node.args.kwarg,) if node.args.kwarg is not None else ()),
+            )
+        }
+    }
+
+    assert group_members == {
+        "test_lpac_runtime_seed_clones_are_physical_isolated_and_tamper_evident": "lpac-seeded-a",
+        "test_default_adapter_rejects_candidate_pytest_impersonation_before_launch": "lpac-seeded-a",
+        "test_real_lpac_trusted_pytest_really_executes_a_failing_candidate_test": "lpac-seeded-b",
+        "test_real_lpac_candidate_package_cannot_be_shadowed_by_old_installed_package": "lpac-seeded-b",
+        "test_real_lpac_private_package_and_bytecode_injection_cannot_reach_next_command": "lpac-seeded-a",
+        "test_default_backend_real_timeout_kills_descendants": "lpac-seeded-b",
+        "test_existing_python_test_tools_run_inside_private_candidate_directory": "lpac-seeded-a",
+        "test_private_python_ignores_existing_pth_and_cannot_write_dependency_source": "lpac-seeded-b",
+    }
+    assert set(group_members) == lpac_fixture_consumers
+    assert "test_real_lpac_candidate_package_cannot_be_shadowed_by_old_installed_package" in parameterized
+    raw_cold_test = "test_default_backend_real_candidate_isolated_raw_output_and_cleanup"
+    assert raw_cold_test not in lpac_fixture_consumers
+    assert raw_cold_test not in group_members
 
 
 def test_v2_plan_and_complete_gate_definition_chain_are_one_contract() -> None:

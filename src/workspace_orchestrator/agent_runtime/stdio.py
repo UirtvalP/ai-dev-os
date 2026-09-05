@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import queue
@@ -53,6 +54,19 @@ def _close_process_resources(process: RuntimeProcess) -> None:
     closer = getattr(process, "close", None)
     if callable(closer):
         closer()
+
+
+def _close_runtime_stream(stream: IO[str]) -> None:
+    """关闭已退出 Runtime 的管道，不让预期的断管掩盖后续资源回收。"""
+    try:
+        stream.close()
+    except BrokenPipeError:
+        pass
+    except OSError as exc:
+        # 自定义 Launcher 可能未把断管规范化为 BrokenPipeError。仅接受 POSIX
+        # EPIPE 和 Windows ERROR_BROKEN_PIPE；其余关闭错误仍必须显式暴露。
+        if exc.errno != errno.EPIPE and getattr(exc, "winerror", None) != 109:
+            raise
 
 
 if sys.platform == "win32":
@@ -389,7 +403,7 @@ class JsonRpcStdioClient:
                     self._process.wait(timeout=5)
                     for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
                         if stream:
-                            stream.close()
+                            _close_runtime_stream(stream)
                     _close_process_resources(self._process)
                 if not isinstance(exc, OSError):
                     raise
@@ -576,7 +590,7 @@ class JsonRpcStdioClient:
                     thread.join(timeout=5)
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream:
-                    stream.close()
+                    _close_runtime_stream(stream)
             _close_process_resources(process)
             self._cleanup_complete = True
 

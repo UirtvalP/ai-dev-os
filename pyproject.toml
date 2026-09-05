@@ -14,6 +14,7 @@ dependencies = []
 dev = [
   "mypy>=2.3",
   "pytest>=8.3",
+  "pytest-xdist>=3.8,<4",
   "ruff>=0.9",
 ]
 
@@ -28,6 +29,7 @@ packages = ["src/workspace_orchestrator"]
 path = "src/workspace_orchestrator/__init__.py"
 
 [tool.pytest.ini_options]
+addopts = "-n 4 --dist=loadgroup"
 pythonpath = ["src"]
 testpaths = ["tests"]
 

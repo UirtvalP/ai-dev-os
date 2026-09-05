@@ -110,6 +110,26 @@ def _win32() -> Any:
             ("Reserved", wt.DWORD),
         ]
 
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wt.DWORD),
+            ("ftCreationTime", wt.FILETIME),
+            ("ftLastAccessTime", wt.FILETIME),
+            ("ftLastWriteTime", wt.FILETIME),
+            ("dwVolumeSerialNumber", wt.DWORD),
+            ("nFileSizeHigh", wt.DWORD),
+            ("nFileSizeLow", wt.DWORD),
+            ("nNumberOfLinks", wt.DWORD),
+            ("nFileIndexHigh", wt.DWORD),
+            ("nFileIndexLow", wt.DWORD),
+        ]
+
+    class FileId128(ctypes.Structure):
+        _fields_ = [("identifier", ctypes.c_ubyte * 16)]
+
+    class FileIdInfo(ctypes.Structure):
+        _fields_ = [("volume_serial", ctypes.c_ulonglong), ("file_id", FileId128)]
+
     kernel, userenv, advapi = (
         _windows_library(name) for name in ("kernel32", "userenv", "advapi32")
     )
@@ -139,6 +159,31 @@ def _win32() -> Any:
         (kernel, "CreatePipe", [void, void, void, wt.DWORD], wt.BOOL),
         (kernel, "SetHandleInformation", [wt.HANDLE, wt.DWORD, wt.DWORD], wt.BOOL),
         (kernel, "CloseHandle", [wt.HANDLE], wt.BOOL),
+        (
+            kernel,
+            "CreateFileW",
+            [wt.LPCWSTR, wt.DWORD, wt.DWORD, void, wt.DWORD, wt.DWORD, wt.HANDLE],
+            wt.HANDLE,
+        ),
+        (
+            kernel,
+            "DeviceIoControl",
+            [wt.HANDLE, wt.DWORD, void, wt.DWORD, void, wt.DWORD, void, void],
+            wt.BOOL,
+        ),
+        (kernel, "GetFileInformationByHandle", [wt.HANDLE, void], wt.BOOL),
+        (
+            kernel,
+            "GetFileInformationByHandleEx",
+            [wt.HANDLE, ctypes.c_int, void, wt.DWORD],
+            wt.BOOL,
+        ),
+        (
+            kernel,
+            "GetFinalPathNameByHandleW",
+            [wt.HANDLE, wt.LPWSTR, wt.DWORD, wt.DWORD],
+            wt.DWORD,
+        ),
         (kernel, "GetExitCodeProcess", [wt.HANDLE, void], wt.BOOL),
         (kernel, "WaitForSingleObject", [wt.HANDLE, wt.DWORD], wt.DWORD),
         (kernel, "TerminateProcess", [wt.HANDLE, wt.UINT], wt.BOOL),
@@ -160,6 +205,12 @@ def _win32() -> Any:
             advapi,
             "GetNamedSecurityInfoW",
             [wt.LPWSTR, ctypes.c_int, wt.DWORD, void, void, void, void, void],
+            wt.DWORD,
+        ),
+        (
+            advapi,
+            "GetSecurityInfo",
+            [wt.HANDLE, ctypes.c_int, wt.DWORD, void, void, void, void, void],
             wt.DWORD,
         ),
         (advapi, "GetAce", [void, wt.DWORD, void], wt.BOOL),
@@ -188,6 +239,8 @@ def _win32() -> Any:
         SecurityAttributes=SecurityAttributes,
         SecurityCapabilities=SecurityCapabilities,
         SidAndAttributes=SidAndAttributes,
+        ByHandleFileInformation=ByHandleFileInformation,
+        FileIdInfo=FileIdInfo,
     )
 
 
@@ -492,21 +545,16 @@ def _edit_private_sid(path: Path, sid: str, *, grant: bool) -> None:
         api.kernel.LocalFree(descriptor)
 
 
-def _acl_state(path: Path, *, enforce: bool = True) -> str:
-    """只读核对实际 DACL；普通 AppContainer/capability 不能从共享 ACE 得到写权限。"""
+def _acl_descriptor_state(
+    api: Any, descriptor: Any, dacl: Any, label: Path, *, enforce: bool,
+) -> str:
+    """核对已打开对象的 DACL；调用者保留并最终释放 descriptor。"""
 
-    api = _win32()
     c = api.ctypes
-    descriptor, dacl = c.c_void_p(), c.c_void_p()
-    result = api.advapi.GetNamedSecurityInfoW(
-        str(path), 1, 7, None, None, c.byref(dacl), None, c.byref(descriptor)
-    )
-    if result:
-        raise WorkerIsolationError("acl_unverifiable", f"无法读取保护对象 DACL: {result}")
     text = c.c_wchar_p()
     try:
         if not dacl:
-            raise WorkerIsolationError("unsafe_acl", "保护对象没有限制性 DACL")
+            raise WorkerIsolationError("unsafe_acl", f"保护对象没有限制性 DACL: {label}")
         if enforce:
             header = c.string_at(dacl, 8)
             count = struct.unpack_from("<H", header, 4)[0]
@@ -531,7 +579,7 @@ def _acl_state(path: Path, *, enforce: bool = True) -> str:
                 if sid in _relevant_lpac_sids() and mask & ~0xA01200A9:
                     raise WorkerIsolationError(
                         "unsafe_acl",
-                        f"保护对象向 AppContainer 授予写权限: {path}; {sid}; 0x{mask:x}",
+                        f"保护对象向 AppContainer 授予写权限: {label}; {sid}; 0x{mask:x}",
                     )
         if not api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor, 1, 7, c.byref(text), None
@@ -541,11 +589,209 @@ def _acl_state(path: Path, *, enforce: bool = True) -> str:
     finally:
         if text:
             api.kernel.LocalFree(text)
+
+
+def _acl_state(path: Path, *, enforce: bool = True) -> str:
+    """只读核对实际 DACL；普通 AppContainer/capability 不能从共享 ACE 得到写权限。"""
+
+    api = _win32()
+    c = api.ctypes
+    descriptor, dacl = c.c_void_p(), c.c_void_p()
+    result = api.advapi.GetNamedSecurityInfoW(
+        str(path), 1, 7, None, None, c.byref(dacl), None, c.byref(descriptor)
+    )
+    if result:
+        raise WorkerIsolationError("acl_unverifiable", f"无法读取保护对象 DACL: {result}")
+    try:
+        return _acl_descriptor_state(api, descriptor, dacl, path, enforce=enforce)
+    finally:
         if descriptor:
             api.kernel.LocalFree(descriptor)
 
 
-def _protected_acl_fingerprint(spec: WorkerIsolationSpec, controllers: Sequence[Path]) -> str:
+def _handle_acl_state(handle: Any, label: Path) -> str:
+    """从 handle 核对对象自身 DACL；reparse handle 不会误跟随到 target。"""
+
+    api = _win32()
+    c = api.ctypes
+    descriptor, dacl = c.c_void_p(), c.c_void_p()
+    result = api.advapi.GetSecurityInfo(
+        handle, 1, 7, None, None, c.byref(dacl), None, c.byref(descriptor)
+    )
+    if result:
+        raise WorkerIsolationError(
+            "acl_unverifiable", f"无法读取保护对象 DACL: {label}; error={result}"
+        )
+    try:
+        return _acl_descriptor_state(api, descriptor, dacl, label, enforce=True)
+    finally:
+        if descriptor:
+            api.kernel.LocalFree(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReparseProof:
+    path: str
+    tag: int
+    flags: int
+    raw_target: str
+    final_path: str
+    link_volume: int
+    link_file_id: str
+    target_volume: int
+    target_file_id: str
+    object_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedAclFingerprint:
+    acl: str
+    links: tuple[_ReparseProof, ...]
+
+
+def _linked_path(path: Path, target: str, reason: str) -> WorkerIsolationError:
+    return WorkerIsolationError(
+        "linked_path", f"保护目录链接证明失败: path={path}; target={target}; reason={reason}"
+    )
+
+
+def _open_proof_handle(path: Path, *, reparse: bool) -> Any:
+    api = _win32()
+    flags = 0x02000000 | (0x00200000 if reparse else 0)  # BACKUP_SEMANTICS | OPEN_REPARSE
+    handle = api.kernel.CreateFileW(
+        str(path), 0x00020080, 0x7, None, 3, flags, None  # READ_CONTROL | READ_ATTRIBUTES
+    )
+    if handle in (None, api.ctypes.c_void_p(-1).value):
+        raise _linked_path(path, "<unresolved>", f"open_failed:{api.ctypes.get_last_error()}")
+    return handle
+
+
+def _handle_identity(handle: Any, path: Path, target: str) -> tuple[int, str, int]:
+    api = _win32()
+    info = api.ByHandleFileInformation()
+    if not api.kernel.GetFileInformationByHandle(handle, api.ctypes.byref(info)):
+        raise _linked_path(path, target, "handle_identity_unavailable")
+    identity = api.FileIdInfo()
+    if not api.kernel.GetFileInformationByHandleEx(
+        handle, 18, api.ctypes.byref(identity), api.ctypes.sizeof(identity)
+    ):
+        raise _linked_path(path, target, "file_id_unavailable")
+    file_id = bytes(identity.file_id.identifier).hex()
+    return int(identity.volume_serial), file_id, int(info.dwFileAttributes)
+
+
+def _final_handle_path(handle: Any, label: Path) -> Path:
+    api = _win32()
+    size = api.kernel.GetFinalPathNameByHandleW(handle, None, 0, 0)
+    if not size:
+        raise _linked_path(label, "<unresolved>", "final_path_unavailable")
+    buffer = api.ctypes.create_unicode_buffer(size + 1)
+    written = api.kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+    if not written or written >= len(buffer):
+        raise _linked_path(label, "<unresolved>", "final_path_unavailable")
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        raise _linked_path(label, value, "unc_target")
+    value = value.removeprefix("\\\\?\\")
+    if value.startswith(("\\\\", "//")):
+        raise _linked_path(label, value, "unc_or_device_target")
+    return Path(value)
+
+
+def _reparse_target(handle: Any, path: Path) -> tuple[int, int, str]:
+    """读取 symlink reparse payload；未知 tag 不得按普通文件处理。"""
+
+    api = _win32()
+    buffer = api.ctypes.create_string_buffer(16 * 1024)
+    returned = api.wt.DWORD()
+    if not api.kernel.DeviceIoControl(
+        handle, 0x000900A8, None, 0, buffer, len(buffer), api.ctypes.byref(returned), None
+    ):
+        raise _linked_path(path, "<unresolved>", f"reparse_read_failed:{api.ctypes.get_last_error()}")
+    raw = buffer.raw[: returned.value]
+    if len(raw) < 8:
+        raise _linked_path(path, "<unresolved>", "truncated_reparse_data")
+    tag, data_length = struct.unpack_from("<IH", raw)
+    if tag != 0xA000000C:  # IO_REPARSE_TAG_SYMLINK
+        raise _linked_path(path, "<unresolved>", f"unsupported_reparse_tag:0x{tag:08x}")
+    if data_length + 8 > len(raw) or len(raw) < 20:
+        raise _linked_path(path, "<unresolved>", "truncated_symlink_data")
+    substitute_offset, substitute_length = struct.unpack_from("<HH", raw, 8)
+    start = 20 + substitute_offset
+    end = start + substitute_length
+    if end > len(raw) or substitute_length % 2:
+        raise _linked_path(path, "<unresolved>", "invalid_symlink_target")
+    try:
+        target = raw[start:end].decode("utf-16-le")
+    except UnicodeDecodeError as exc:
+        raise _linked_path(path, "<unresolved>", "invalid_symlink_target") from exc
+    flags = struct.unpack_from("<I", raw, 16)[0]
+    if flags & ~1:
+        raise _linked_path(path, target, f"unsupported_symlink_flags:0x{flags:x}")
+    return tag, flags, target
+
+
+def _raw_symlink_target(item: Path, raw_target: str, flags: int) -> Path:
+    """从已打开 link 的原始 payload 构造 target；不再经可被换向的 link 名称解析。"""
+
+    value = raw_target
+    if flags & 1:
+        if Path(value).is_absolute():
+            raise _linked_path(item, value, "relative_flag_with_absolute_target")
+        target = item.parent / value
+    else:
+        if value.startswith("\\??\\UNC\\"):
+            raise _linked_path(item, value, "unc_target")
+        value = value.removeprefix("\\??\\").removeprefix("\\\\?\\")
+        target = Path(value)
+    if not target.is_absolute() or str(target).startswith(("\\\\", "//")):
+        raise _linked_path(item, raw_target, "relative_escape_or_device_target")
+    try:
+        return _physical_path(target, directory=False)
+    except (OSError, RuntimeError, WorkerIsolationError) as exc:
+        raise _linked_path(item, raw_target, "broken_cycle_or_nonphysical_target") from exc
+
+
+def _file_symlink_proof(item: Path, root: Path) -> tuple[_ReparseProof, str, str]:
+    """证明同一保护根内的 Windows file symlink，并分别核对 link/target ACL。"""
+
+    api = _win32()
+    link = _open_proof_handle(item, reparse=True)
+    target_handle = None
+    raw_target = "<unresolved>"
+    try:
+        tag, flags, raw_target = _reparse_target(link, item)
+        link_volume, link_id, link_attributes = _handle_identity(link, item, raw_target)
+        if link_attributes & 0x10:
+            raise _linked_path(item, raw_target, "directory_reparse_not_supported")
+        target = _raw_symlink_target(item, raw_target, flags)
+        if target == root or root not in target.parents:
+            raise _linked_path(item, str(target), "target_outside_same_protected_root")
+        if str(target).startswith(("\\\\", "//")):
+            raise _linked_path(item, str(target), "unc_or_device_target")
+        target_handle = _open_proof_handle(target, reparse=False)
+        final = _final_handle_path(target_handle, item)
+        target_volume, target_id, target_attributes = _handle_identity(
+            target_handle, item, str(final)
+        )
+        if target_attributes & 0x10:
+            raise _linked_path(item, str(final), "target_type_mismatch")
+        if os.path.normcase(str(final)) != os.path.normcase(str(target)):
+            raise _linked_path(item, str(final), "canonical_target_mismatch")
+        proof = _ReparseProof(
+            str(item), tag, flags, raw_target, str(final), link_volume, link_id,
+            target_volume, target_id, "file",
+        )
+        return proof, _handle_acl_state(link, item), _handle_acl_state(target_handle, target)
+    finally:
+        if target_handle is not None:
+            api.kernel.CloseHandle(target_handle)
+        api.kernel.CloseHandle(link)
+
+
+def _protected_acl_fingerprint(
+    spec: WorkerIsolationSpec, controllers: Sequence[Path],
+) -> _ProtectedAclFingerprint:
     digest = hashlib.sha256()
     roots = {
         *spec.protected_roots,
@@ -554,6 +800,7 @@ def _protected_acl_fingerprint(spec: WorkerIsolationSpec, controllers: Sequence[
         Path(__file__).resolve().parents[1],
     }
     checked: set[Path] = set()
+    links: list[_ReparseProof] = []
 
     def inaccessible(error: OSError) -> None:
         raise WorkerIsolationError("acl_unverifiable", "无法完整枚举保护域") from error
@@ -566,15 +813,40 @@ def _protected_acl_fingerprint(spec: WorkerIsolationSpec, controllers: Sequence[
                 digest.update(str(ancestor).encode("utf-8"))
                 digest.update(_acl_state(ancestor).encode("utf-8"))
         for current, directories, files in os.walk(root, followlinks=False, onerror=inaccessible):
+            directories.sort()
+            files.sort()
             for item in (Path(current), *(Path(current) / name for name in (*directories, *files))):
                 if item in checked:
                     continue
                 checked.add(item)
                 if item.is_symlink() or getattr(item.lstat(), "st_file_attributes", 0) & 0x400:
-                    raise WorkerIsolationError("linked_path", "保护目录包含无法核对的链接")
+                    proof, link_acl, target_acl = _file_symlink_proof(item, root)
+                    links.append(proof)
+                    digest.update(str(item).encode("utf-8"))
+                    digest.update(link_acl.encode("utf-8"))
+                    digest.update(target_acl.encode("utf-8"))
+                    digest.update(repr(proof).encode("utf-8"))
+                    continue
                 digest.update(str(item).encode("utf-8"))
                 digest.update(_acl_state(item).encode("utf-8"))
-    return digest.hexdigest()
+    return _ProtectedAclFingerprint(digest.hexdigest(), tuple(sorted(links, key=lambda item: item.path)))
+
+
+def _assert_reparse_proofs_unchanged(
+    initial: tuple[_ReparseProof, ...], current: tuple[_ReparseProof, ...],
+) -> None:
+    if current == initial:
+        return
+    expected = {item.path: item for item in initial}
+    actual = {item.path: item for item in current}
+    path = next(
+        key for key in sorted(expected.keys() | actual.keys())
+        if expected.get(key) != actual.get(key)
+    )
+    target = actual[path].final_path if path in actual else "<missing>"
+    raise _linked_path(
+        Path(path), target, f"probe_launch_identity_drift:expected={expected.get(path)!r}"
+    )
 
 
 class CodexSandboxIsolation:
@@ -616,7 +888,8 @@ class AppContainerProcess:
     requires_job_resume = True
 
     def __init__(
-        self, spec: WorkerIsolationSpec, command: Sequence[str], environment: dict[str, str]
+        self, spec: WorkerIsolationSpec, command: Sequence[str], environment: dict[str, str],
+        working_directory: Path,
     ) -> None:
         self.args = tuple(command)
         self._api = api = _win32()
@@ -634,7 +907,7 @@ class AppContainerProcess:
         self._acl_granted = False
         self._closed = False
         self.cleanup_evidence: dict[str, Any] = {}
-        self.isolation_evidence: dict[str, str] = {}
+        self.isolation_evidence: dict[str, str | int] = {}
         c = api.ctypes
         package_sid = c.c_void_p()
         network_sid = c.c_void_p()
@@ -793,7 +1066,7 @@ class AppContainerProcess:
                 True,
                 flags,
                 env_block,
-                str(spec.task_root),
+                str(working_directory),
                 c.byref(startup),
                 c.byref(process),
             ):
@@ -987,13 +1260,15 @@ class WindowsAppContainerIsolation:
     def __init__(self, *, controller_roots: tuple[Path, ...]) -> None:
         self.controller_roots = controller_roots
         self._proof: dict[str, Any] | None = None
-        self._attested: dict[str, str] = {}
+        self._attested: dict[str, _ProtectedAclFingerprint] = {}
 
     def _launch(
         self,
         spec: WorkerIsolationSpec,
         command: Sequence[str],
         environ: Mapping[str, str] | None = None,
+        *,
+        working_directory: Path | None = None,
     ) -> AppContainerProcess:
         normalized = validate_spec(spec, controller_roots=self.controller_roots)
         if not command or any(not isinstance(item, str) or "\0" in item for item in command):
@@ -1007,18 +1282,23 @@ class WindowsAppContainerIsolation:
             )
         if binary.suffix.lower() != ".exe":
             raise WorkerIsolationError("invalid_command", "Windows Worker 必须指定绝对 EXE 路径")
+        cwd = normalized.task_root if working_directory is None else _physical_path(
+            working_directory,
+        )
+        if cwd != normalized.task_root and normalized.task_root not in cwd.parents:
+            raise WorkerIsolationError("unsafe_path", "Worker 工作目录必须位于 Task 私有目录内")
         env = worker_environment(normalized, platform=os.environ if environ is None else environ)
-        return AppContainerProcess(normalized, command, env)
+        return AppContainerProcess(normalized, command, env, cwd)
 
     def probe(self, spec: WorkerIsolationSpec) -> IsolationCapability:
         try:
             normalized = validate_spec(spec, controller_roots=self.controller_roots)
             _win32()
-            acl = _protected_acl_fingerprint(normalized, self.controller_roots)
+            protected = _protected_acl_fingerprint(normalized, self.controller_roots)
             if self._proof is None:
                 self._proof = self._probe_temporary_domain()
             fingerprint = policy_fingerprint(normalized, self.controller_roots)
-            self._attested[fingerprint] = acl
+            self._attested[fingerprint] = protected
             return IsolationCapability(
                 True,
                 "windows-appcontainer",
@@ -1026,7 +1306,8 @@ class WindowsAppContainerIsolation:
                 {
                     **self._proof,
                     "policy_fingerprint": fingerprint,
-                    "acl_fingerprint": acl,
+                    "acl_fingerprint": protected.acl,
+                    "protected_link_count": len(protected.links),
                     "network": "internet-capability-unfiltered"
                     if spec.allow_network
                     else "disabled",
@@ -1046,6 +1327,7 @@ class WindowsAppContainerIsolation:
         command: Sequence[str],
         *,
         environ: Mapping[str, str] | None = None,
+        working_directory: Path | None = None,
     ) -> AppContainerProcess:
         normalized = validate_spec(spec, controller_roots=self.controller_roots)
         fingerprint = policy_fingerprint(normalized, self.controller_roots)
@@ -1054,12 +1336,17 @@ class WindowsAppContainerIsolation:
         # The policy (roots/lease/network) is fixed, not the control plane's file set.
         # Revalidate every current object and ancestor; unsafe ACLs or links still
         # fail closed, while a trusted ledger/event file with a safe ACL is allowed.
-        current_acl = _protected_acl_fingerprint(normalized, self.controller_roots)
-        process = self._launch(spec, command, environ)
+        current = _protected_acl_fingerprint(normalized, self.controller_roots)
+        initial = self._attested[fingerprint]
+        _assert_reparse_proofs_unchanged(initial.links, current.links)
+        process = self._launch(
+            spec, command, environ, working_directory=working_directory,
+        )
         process.isolation_evidence = {
             "policy_fingerprint": fingerprint,
-            "initial_acl_fingerprint": self._attested[fingerprint],
-            "launch_acl_fingerprint": current_acl,
+            "initial_acl_fingerprint": initial.acl,
+            "launch_acl_fingerprint": current.acl,
+            "protected_link_count": len(current.links),
         }
         return process
 

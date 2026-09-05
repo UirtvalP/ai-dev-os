@@ -10,8 +10,9 @@ from typing import Any
 from .agent_runtime.codex import codex_command
 from .automation.task_attach import configured_task_provider
 from .composition import create_runtime, runtime_descriptors
+from .delivery_guard import mark_v2_delivery
 from .execution_ownership import ExecutionOwnership
-from .orchestration.contracts import PlanningRequest
+from .orchestration.contracts import ExecutionPlan, PlanningRequest
 from .orchestration.isolation import WindowsAppContainerIsolation
 from .orchestration.projection import TaskProjection, TaskProjectionPump
 from .orchestration.store import OrchestrationStore
@@ -32,7 +33,16 @@ def configured_supervisor(
     allowed_worktree_roots: tuple[Path, ...] = (),
 ) -> RequirementSupervisor:
     store = control_store(workspace, requirement_id)
-    protected = (workspace.root, workspace.project_root)
+    protected: tuple[Path, ...] = (workspace.root, workspace.project_root)
+    git_workspaces = None
+    verification = None
+    # 非 Git 的 Phase 2 只读编排保持兼容；Git 项目才装配 Phase 3 候选读写端口。
+    if (workspace.project_root / ".git").exists():
+        from .integration_composition import configured_git_workspaces, configured_verification
+
+        git_workspaces = configured_git_workspaces(workspace)
+        verification = configured_verification(workspace)
+        protected = (*protected, git_workspaces.git.common_dir)
     # 用已校验的持久 Store 创建控制目录；不在 Task 可写目录安装控制面。
     worker_root = store.root.parent / "workers"
     preparation = OrchestrationStore(worker_root / "ledger")
@@ -53,16 +63,25 @@ def configured_supervisor(
         launcher=launcher, protected_roots=protected, readonly_tools=tuple(dict.fromkeys(tools)),
         allow_network=allow_network,
         authority_guard=lambda fence: store.guard_epoch(owner, fence),
+        candidate_reader=git_workspaces.capture_candidate if git_workspaces else None,
     )
+
+    def claim(request: PlanningRequest, plan: ExecutionPlan) -> None:
+        # 在所有权或可执行计划对外可见之前声明交付模式；不持 Requirement 锁访问 Provider。
+        mark_v2_delivery(workspace, requirement_id)
+        ExecutionOwnership(workspace).claim_plan(
+            request, plan, lambda: configured_task_provider(
+                workspace.load(requirement_id)["meta"], workspace.project_root,
+            ),
+        )
+
     return RequirementSupervisor(
         store, owner=owner, workers=workers, runtimes=runtime_descriptors,
         max_workers=max_workers, protected_roots=protected,
         allowed_worktree_roots=allowed_worktree_roots,
-        execution_claim=lambda request, plan: ExecutionOwnership(workspace).claim_plan(
-            request, plan, lambda: configured_task_provider(
-                workspace.load(requirement_id)["meta"], workspace.project_root,
-            ),
-        ),
+        candidate_reader=git_workspaces.read_candidate if git_workspaces else None,
+        verification_executor=verification,
+        execution_claim=claim,
     )
 
 

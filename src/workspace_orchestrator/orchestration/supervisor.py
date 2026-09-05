@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -114,15 +115,19 @@ class RequirementSupervisor:
         self.allowed_worktree_roots = tuple(_path(path) for path in allowed_worktree_roots)
         self.execution_claim = execution_claim
         self.lease: SupervisorLease | None = None
+        # 只序列化本控制器凭据读写；跨进程权威仍来自已有 Store/fence。
+        self._lease_lock = threading.RLock()
         self._verifications: set[str] = set()
 
     def acquire(self) -> SupervisorLease:
-        self.lease = self.store.acquire(self.owner, self.lease_ttl_seconds)
-        return self.lease
+        with self._lease_lock:
+            self.lease = self.store.acquire(self.owner, self.lease_ttl_seconds)
+            return self.lease
 
     def renew(self) -> SupervisorLease:
-        self.lease = self.store.renew(self._lease(), self.lease_ttl_seconds)
-        return self.lease
+        with self._lease_lock:
+            self.lease = self.store.renew(self._lease(), self.lease_ttl_seconds)
+            return self.lease
 
     def status(self) -> dict[str, Any]:
         snapshot = self.store.snapshot()
@@ -243,14 +248,19 @@ class RequirementSupervisor:
         return self._change(change)
 
     def verify_task(
-        self, task_id: str, commands: tuple[VerificationCommand, ...], environment: dict[str, str]
+        self, task_id: str, commands: tuple[VerificationCommand, ...], environment: dict[str, str],
+        *, refresh: bool = False,
     ) -> dict[str, Any]:
         """受控验证前后独立读取候选；没有 Executor 或只有 Worker PASS 时拒绝验收。"""
 
         data = self._active(require_plan=True)["data"]
         node = _get_node(data, task_id)
-        if node["status"] != "candidate_complete" or node["active_attempt_id"] is not None:
+        expected_status = node["status"]
+        allowed = {"candidate_complete", "accepted"} if refresh else {"candidate_complete"}
+        if expected_status not in allowed or node["active_attempt_id"] is not None:
             raise SupervisorError("not_candidate", "只能验证已终止 Worker 的候选结果")
+        if refresh and any(item["active_attempt_id"] is not None for item in data["nodes"].values()):
+            raise SupervisorError("active_workers", "证据刷新需先确认本批所有 Worker 已结束")
         if self.candidate_reader is None or self.verification_executor is None:
             raise SupervisorError("verification_unavailable", "未配置可信候选读取或隔离 Verification Executor")
         task = TaskSpec.from_dict(node["spec"])
@@ -274,7 +284,7 @@ class RequirementSupervisor:
 
         def begin(state: dict[str, Any]) -> None:
             current = _get_node(state, task_id)
-            if current["status"] != "candidate_complete" or current["revision"] != node["revision"]:
+            if current["status"] != expected_status or current["revision"] != node["revision"]:
                 raise SupervisorError("revision_conflict", "候选在验证准备期间已变化")
             current["status"], current["revision"] = "verifying", current["revision"] + 1
             if "verification" in current:
@@ -347,6 +357,10 @@ class RequirementSupervisor:
         return float(stamp)
 
     def _active(self, *, require_plan: bool = False) -> dict[str, Any]:
+        with self._lease_lock:
+            return self._active_locked(require_plan=require_plan)
+
+    def _active_locked(self, *, require_plan: bool = False) -> dict[str, Any]:
         lease = self._lease()
         snapshot = self.status()
         current = snapshot["lease"]
@@ -361,6 +375,10 @@ class RequirementSupervisor:
         return snapshot
 
     def _change(self, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        with self._lease_lock:
+            return self._change_locked(change)
+
+    def _change_locked(self, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         lease = self._lease()
 
         def checked(data: dict[str, Any]) -> None:
