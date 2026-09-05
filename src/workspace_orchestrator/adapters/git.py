@@ -78,6 +78,22 @@ class LocalGitProvider:
             raise GitError(message)
         return result.stdout
 
+    def list_files_at(self, revision: str, prefix: str) -> tuple[str, ...]:
+        """枚举某次提交中前缀下的文件，不读取未提交工作树。"""
+
+        normalized = prefix.replace("\\", "/").strip("/")
+        if not normalized or ".." in normalized.split("/"):
+            raise GitError(f"Git 文件前缀必须位于仓库内：{prefix}")
+        output = self._run(
+            "ls-tree",
+            "-r",
+            "--name-only",
+            revision,
+            "--",
+            normalized,
+        )
+        return tuple(line for line in output.splitlines() if line)
+
     def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
         """确定 ancestor_sha 是否可从 descendant_sha 到达。"""
 

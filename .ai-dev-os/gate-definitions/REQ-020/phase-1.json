@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "requirement_id": "REQ-020",
+  "phase": 1,
+  "task_id": "AID-170",
+  "next_task_id": "AID-171",
+  "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-1.md",
+  "plan_source_fingerprint": "0155e84df3d2a8bb1645b3f5e390d368173701d3eb4ddebddc5ea46c56e07f96",
+  "verification_suites": [
+    {
+      "id": "p1-local-common-quality",
+      "kind": "command",
+      "commands": [
+        ["uv", "build"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
+        ["uv", "lock", "--check"],
+        ["git", "diff", "--check", "origin/main", "HEAD"]
+      ]
+    },
+    {
+      "id": "p1-github-ci-matrix",
+      "kind": "github-actions",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  ],
+  "acceptance": [
+    {"id": "P1-AC-01", "description": "非 Codex fake Runtime 可完整驱动 Dispatcher。"},
+    {"id": "P1-AC-02", "description": "Runtime 能报告真实 capabilities 与 model descriptors；不支持/未安装操作返回结构化结果。"},
+    {"id": "P1-AC-03", "description": "Codex start、resume、resume fallback、message、steer、interrupt、archive 与 event replay 契约通过；真实 Stop Hook archive 不再因 stdin 提前关闭而丢响应。"},
+    {"id": "P1-AC-04", "description": "Cursor ACP 与 Claude Adapter 的 start/resume/message/control/event 能力矩阵、契约测试和 hermetic E2E 通过。"},
+    {"id": "P1-AC-05", "description": "事件在 Agent 进程退出前可被消费者读取。"},
+    {"id": "P1-AC-06", "description": "旧 Workspace、Session JSON、配置、CLI 和 Python imports 保持兼容。"},
+    {"id": "P1-AC-07", "description": "三种 Adapter 的 fake-server E2E 通过；本机已安装 Runtime 完成 live smoke，未安装 Runtime 明确报告 `unavailable` 而非伪成功。"},
+    {"id": "P1-AC-08", "description": "CommonQualityGate 与独立 Phase 1 Review 全部 PASS。"}
+  ]
+}

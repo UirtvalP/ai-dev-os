@@ -529,6 +529,32 @@ class WorkspaceStore:
             self.write_json(path, meta)
             return meta
 
+    def compare_and_set_meta(
+        self,
+        requirement_id: str,
+        *,
+        field: str,
+        expected: object,
+        value: object,
+    ) -> dict[str, Any]:
+        """在 Requirement 锁内幂等更新单个 meta 字段。"""
+
+        with self.locked(requirement_id):
+            path = self.path_for(requirement_id) / "meta.json"
+            meta: dict[str, Any] = self.read_json(path)
+            current = meta.get(field)
+            if current == value:
+                return meta
+            if current != expected:
+                raise WorkspaceError(
+                    f"{requirement_id.upper()} meta.{field} CAS 失败："
+                    f"期望 {expected!r}，实际 {current!r}"
+                )
+            meta[field] = value
+            meta["updated_at"] = now_iso()
+            self.write_json(path, meta)
+            return meta
+
     @staticmethod
     def read_json(path: Path) -> Any:
         try:

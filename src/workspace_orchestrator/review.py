@@ -10,6 +10,7 @@ from datetime import datetime
 from .adapters.base import TaskProvider, TaskProviderError
 from .intent import INTENT_CHECK_LABELS, IntentStatus, review_intent
 from .models import Task
+from .phase_gate import GateStore
 from .workspace import WorkspaceError, WorkspaceStore, bullets, markdown_sections, replace_section
 
 
@@ -346,6 +347,9 @@ def confirm_requirement_done(
     require_current_review_packet(store, requirement_id, task_provider, current_packet_fingerprint)
     with store.locked(requirement_id):
         meta = store.load(requirement_id)["meta"]
+        gates = GateStore(store)
+        if gates.is_required(requirement_id):
+            gates.require_requirement_completion_ready(requirement_id)
         if meta.get("status") == "done":
             return
         if meta.get("status") != "in_review":

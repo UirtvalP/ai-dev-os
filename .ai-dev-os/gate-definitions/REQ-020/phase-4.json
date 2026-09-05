@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "requirement_id": "REQ-020",
+  "phase": 4,
+  "task_id": "AID-173",
+  "next_task_id": "AID-175",
+  "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-4.md",
+  "plan_source_fingerprint": "30f3e298c8de3ea906aca933e7c003952f55bf132f8713687795c20d0241479c",
+  "verification_suites": [
+    {
+      "id": "p4-local-common-quality",
+      "kind": "command",
+      "commands": [
+        ["uv", "build"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
+        ["uv", "lock", "--check"],
+        ["git", "diff", "--check", "origin/main", "HEAD"]
+      ]
+    },
+    {
+      "id": "p4-github-ci-matrix",
+      "kind": "github-actions",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  ],
+  "acceptance": [
+    {"id": "P4-AC-01", "description": "Provider 替换不修改 Core；fake/local 两类实现通过同一 contract suite。"},
+    {"id": "P4-AC-02", "description": "timeout、进程不可用、输出限长、artifact 缺失、陈旧 commit 与部分通过均有测试。"},
+    {"id": "P4-AC-03", "description": "Phase Gate 能声明必需 suites，未执行或失败时不得推进。"},
+    {"id": "P4-AC-04", "description": "Review Packet 使用结构化 Receipt，不再从展示文本反推验证事实。"},
+    {"id": "P4-AC-05", "description": "Phase 3 的 Legacy Receipt 兼容迁移及全部 Merge Gate 回归通过。"},
+    {"id": "P4-AC-06", "description": "unsigned、自签、上下文重放、policy 降级、PATH/PYTHONPATH 注入、假 GitHub reader、密钥/网络越权与 attestor 离线全部被拒绝；签名绑定 project/Requirement/Phase/SHA/tree/suite/policy/run/attempt/result/artifact。"},
+    {"id": "P4-AC-07", "description": "CommonQualityGate 与独立 Phase 4 Review 全部 PASS。"}
+  ]
+}

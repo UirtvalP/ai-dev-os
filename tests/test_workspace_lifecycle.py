@@ -720,3 +720,34 @@ def test_cli_checkpoint_records_explicit_task_for_current_session(
     )
 
     assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["TASK-007"]
+
+
+def test_compare_and_set_meta_is_idempotent_and_rejects_stale_writer(
+    tmp_path: Path,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Phase CAS", task_provider=None)
+    store.touch_meta(requirement_id, requirement_task_id="AID-1")
+
+    changed = store.compare_and_set_meta(
+        requirement_id,
+        field="requirement_task_id",
+        expected="AID-1",
+        value="AID-2",
+    )
+    repeated = store.compare_and_set_meta(
+        requirement_id,
+        field="requirement_task_id",
+        expected="AID-1",
+        value="AID-2",
+    )
+
+    assert changed["requirement_task_id"] == "AID-2"
+    assert repeated["requirement_task_id"] == "AID-2"
+    with pytest.raises(WorkspaceError, match="CAS 失败"):
+        store.compare_and_set_meta(
+            requirement_id,
+            field="requirement_task_id",
+            expected="AID-1",
+            value="AID-3",
+        )

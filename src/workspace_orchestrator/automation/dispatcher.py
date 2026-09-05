@@ -11,11 +11,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, TypeGuard, cast
 
 from workspace_orchestrator.adapters.agent import CodexExecProvider, CodexExecutionResult
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.models import Task
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import (
     ProjectConfig,
     default_project_config,
@@ -101,6 +102,19 @@ def _pid_alive(pid: object) -> TypeGuard[int]:
             return bool(get_exit_code(handle, ctypes.byref(exit_code))) and exit_code.value == 259
         finally:
             close_handle(handle)
+    # start_dispatcher 与 stop_dispatcher 在同一进程内运行时（例如集成
+    # 测试），已退出的子进程会先进入 zombie 状态。os.kill(pid, 0)
+    # 仍会把 zombie 视为存活，因此先以 WNOHANG 回收直接子进程。
+    # 独立 CLI 调用并非该 PID 的父进程，os.waitpid 会抛
+    # ChildProcessError，随后仍使用通用的存活探测。
+    try:
+        posix_os = cast(Any, os)
+        waited_pid, _ = posix_os.waitpid(pid, posix_os.WNOHANG)
+    except (AttributeError, ChildProcessError, OSError):
+        pass
+    else:
+        if waited_pid == pid:
+            return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -258,6 +272,7 @@ class AutoDispatcher:
     def _claim(self, task: Task, requirement_id: str) -> bool:
         """与 queued cancel 共用同一文件锁，保证启动边界只有一方获胜。"""
 
+        GateStore(self.store).require_task_active(requirement_id, task.id)
         with self.store.locked():
             state = _read_state(self.store)
             tasks = dict(state.get("tasks") or {})
@@ -305,6 +320,16 @@ class AutoDispatcher:
                 previous = self._task_state(task)
                 if not _task_state_allows_dispatch(task, previous):
                     continue
+                try:
+                    GateStore(self.store).require_task_active(requirement_id, task.id)
+                except PhaseGateError as exc:
+                    refreshed = _block_task(
+                        provider,
+                        task,
+                        f"阶段门禁拒绝 Dispatcher 启动：{exc}",
+                    )
+                    self._remember(refreshed, result="blocked", error=str(exc))
+                    raise
                 path = _execution_path(self.store, task, data["meta"])
                 try:
                     comments = tuple(provider.list_comments(task.id))
@@ -350,11 +375,24 @@ class AutoDispatcher:
         return str(path.relative_to(self.store.project_root))
 
     def run_once(self) -> str:
-        candidate = self._candidate()
+        try:
+            candidate = self._candidate()
+        except PhaseGateError:
+            return "blocked"
         if candidate is None:
             return "idle"
         task = candidate.task
-        if not self._claim(task, candidate.requirement_id):
+        try:
+            claimed = self._claim(task, candidate.requirement_id)
+        except PhaseGateError as exc:
+            refreshed = _block_task(
+                candidate.task_provider,
+                task,
+                f"阶段门禁在认领前失效：{exc}",
+            )
+            self._remember(refreshed, result="blocked", error=str(exc))
+            return "blocked"
+        if not claimed:
             refreshed = _block_task(candidate.task_provider, task, "任务已按 Main 请求取消，未启动 Worker。")
             self._remember(refreshed, result="cancelled")
             return "cancelled"

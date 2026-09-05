@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "requirement_id": "REQ-020",
+  "phase": 5,
+  "task_id": "AID-175",
+  "next_task_id": "AID-174",
+  "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-5.md",
+  "plan_source_fingerprint": "4c5ac44b873adb1f035db647e7523b8a91c403498bd73c551e9f7d76d287d285",
+  "verification_suites": [
+    {
+      "id": "p5-local-common-quality",
+      "kind": "command",
+      "commands": [
+        ["uv", "build"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"],
+        ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."],
+        ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"],
+        ["uv", "lock", "--check"],
+        ["git", "diff", "--check", "origin/main", "HEAD"]
+      ]
+    },
+    {
+      "id": "p5-github-ci-matrix",
+      "kind": "github-actions",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  ],
+  "acceptance": [
+    {"id": "P5-AC-01", "description": "页面可展开 Requirement → Agent → Session/Turn，并实时看到事件增量。"},
+    {"id": "P5-AC-02", "description": "运行中回复、排队下一条、取消和失败重试都有 API/浏览器 E2E。"},
+    {"id": "P5-AC-03", "description": "页面刷新、服务重启和投影重建不丢消息、不重复投递。"},
+    {"id": "P5-AC-04", "description": "Dashboard 关闭时 Orchestrator、Workspace 和 Hook 生命周期仍完整工作。"},
+    {"id": "P5-AC-05", "description": "本地来源限制、权限、脱敏、游标、断线重连与跨 Requirement 隔离有负向测试。"},
+    {"id": "P5-AC-06", "description": "CommonQualityGate、可访问性 smoke 与独立 Phase 5 Review 全部 PASS。"}
+  ]
+}

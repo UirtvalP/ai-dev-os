@@ -18,6 +18,7 @@ from .automation.dispatcher import (
     stop_dispatcher,
 )
 from .automation.requirement_attach import discover_project_root
+from .console import configure_standard_streams as _configure_standard_streams
 from .hook_runtime import main as hook_main
 from .project_config import load_project_config
 from .project_init import InitResult, initialize_project, migrate_project
@@ -25,8 +26,6 @@ from .project_registry import GlobalProjectRegistry, RegisteredProject
 from .workspace import WorkspaceError, WorkspaceStore
 
 DEFAULT_UPGRADE_SOURCE = "git+https://github.com/UirtvalP/ai-dev-os.git"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-dev-os",
@@ -212,6 +211,7 @@ def run(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_standard_streams()
     effective = sys.argv[1:] if argv is None else argv
     if effective == ["hook"]:
         return hook_main()
