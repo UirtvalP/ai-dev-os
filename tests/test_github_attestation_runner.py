@@ -261,6 +261,9 @@ def test_candidate_path_drops_missing_entries_and_keeps_verified_directories(
             command, 1 if command[5] == "/usr/bin/test" else 0, b"", b"",
         ),
     )
+    monkeypatch.setattr(
+        runner, "_run_checked", lambda command, **_kwargs: CompletedProcess(command, 0, b"", b""),
+    )
 
     result = runner._candidate_path(
         "phase4candidate1", os.pathsep.join((str(existing), str(missing))),
@@ -291,6 +294,9 @@ def test_candidate_path_freezes_command_from_writable_runner_directory(
         return CompletedProcess(command, 0, b"", b"")
 
     monkeypatch.setattr(runner.subprocess, "run", access_check)
+    monkeypatch.setattr(
+        runner, "_run_checked", lambda command, **_kwargs: CompletedProcess(command, 0, b"", b""),
+    )
 
     result = runner._candidate_path(
         "phase4candidate1", os.pathsep.join((str(writable), str(system))),
@@ -319,6 +325,9 @@ def test_candidate_path_excludes_readonly_directory_with_writable_file(
         return CompletedProcess(command, 0, str(tools / "uv").encode(), b"")
 
     monkeypatch.setattr(runner.subprocess, "run", access_check)
+    monkeypatch.setattr(
+        runner, "_run_checked", lambda command, **_kwargs: CompletedProcess(command, 0, b"", b""),
+    )
 
     result = runner._candidate_path(
         "phase4candidate1", str(tools),
