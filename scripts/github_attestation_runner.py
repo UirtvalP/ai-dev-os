@@ -13,6 +13,7 @@ import math
 import os
 import platform
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -287,14 +288,8 @@ def _candidate_identity(candidate_user: str) -> tuple[str, str, str]:
     return uid, gid, group
 
 
-def _candidate_path(candidate_user: str, path_value: str) -> str:
-    entries = path_value.split(os.pathsep)
-    if not entries or any(not entry or not Path(entry).is_absolute() for entry in entries):
-        raise ValueError("candidate PATH 必须只包含绝对目录")
-    existing = [entry for entry in entries if Path(entry).is_dir()]
-    if not existing:
-        raise ValueError("candidate PATH 不包含现存目录")
-    for entry in existing:
+def _verify_candidate_path(candidate_user: str, entries: list[str]) -> None:
+    for entry in entries:
         writable = subprocess.run(
             ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
              "/usr/bin/test", "-w", entry],
@@ -302,6 +297,61 @@ def _candidate_path(candidate_user: str, path_value: str) -> str:
         )
         if writable.returncode != 1:
             raise ValueError(f"candidate PATH 目录可写或无法验证：{entry}")
+        writable_file = subprocess.run(
+            ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
+             "/usr/bin/find", "-L", entry, "-maxdepth", "1", "-type", "f",
+             "-writable", "-print", "-quit"],
+            capture_output=True, check=False, timeout=30, shell=False,
+        )
+        if writable_file.returncode != 0 or writable_file.stdout.strip():
+            raise ValueError(f"candidate PATH 包含可写文件或无法验证：{entry}")
+
+
+def _candidate_path(
+    candidate_user: str, path_value: str, *, command_names: tuple[str, ...], trusted_root: Path,
+) -> str:
+    entries = path_value.split(os.pathsep)
+    if not entries or any(not entry or not Path(entry).is_absolute() for entry in entries):
+        raise ValueError("candidate PATH 必须只包含绝对目录")
+    existing = [entry for entry in entries if Path(entry).is_dir()]
+    if not existing:
+        raise ValueError("candidate PATH 不包含现存目录")
+    _verify_candidate_path(candidate_user, existing)
+    trusted_bin: Path | None = None
+    for command_name in dict.fromkeys(command_names):
+        if Path(command_name).name != command_name:
+            raise ValueError("candidate command 必须通过受验证 PATH 解析")
+        source = next(
+            (Path(entry) / command_name for entry in existing
+             if (Path(entry) / command_name).is_file()
+             and os.access(Path(entry) / command_name, os.X_OK)),
+            None,
+        )
+        if source is None:
+            raise ValueError(f"candidate command 不存在：{command_name}")
+        # 在任何候选代码运行前，从已解析的 runner 入口建立一次性只读基线。
+        # O_NOFOLLOW + fstat 防止把符号链接或非普通文件冻结成可信入口。
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or (os.name != "nt" and not info.st_mode & 0o111):
+                raise ValueError(f"candidate command 不是可执行普通文件：{command_name}")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                content = stream.read()
+        finally:
+            os.close(descriptor)
+        if trusted_bin is None:
+            trusted_bin = trusted_root / "trusted-bin"
+            trusted_bin.mkdir(mode=0o700)
+        target = trusted_bin / command_name
+        target.write_bytes(content)
+        target.chmod(0o555)
+        if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(content).digest():
+            raise ValueError("candidate command 冻结校验失败")
+    if trusted_bin is not None:
+        trusted_bin.chmod(0o555)
+        existing.insert(0, str(trusted_bin))
     return os.pathsep.join(existing)
 
 
@@ -462,6 +512,31 @@ def _execute_commands(
         isolated_sha = candidate_sha
     else:
         isolated_sha = None
+    isolated_path: str | None = None
+    path_preparation_error: str | None = None
+    trusted_tools: Path | None = None
+    if candidate_user is not None:
+        probe_user: str | None = None
+        probe_identity: tuple[str, str, str] | None = None
+        try:
+            trusted_tools = Path(tempfile.mkdtemp(prefix="phase4-tools-", dir=root.parent))
+            trusted_tools.chmod(0o711)
+            probe_user, probe_identity = _create_candidate_user(candidate_user, 0)
+            commands = tuple(
+                str(suite["argv"][0]) for suite in contract
+                if suite["argv"] != ["git", "diff", "--check", "origin/main", "HEAD"]
+            )
+            isolated_path = _candidate_path(
+                probe_user, environment.get("PATH", ""),
+                command_names=commands, trusted_root=trusted_tools,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            path_preparation_error = str(exc)
+        finally:
+            if probe_user is not None and probe_identity is not None:
+                cleanup_error = _terminate_candidate(probe_identity[0])
+                identity_error = _delete_candidate_user(probe_user, probe_identity[0])
+                path_preparation_error = path_preparation_error or cleanup_error or identity_error
     for command_index, suite in enumerate(contract, 1):
         argv = suite["argv"]
         timeout = suite["timeout_seconds"]
@@ -497,10 +572,12 @@ def _execute_commands(
                         "origin/main", "HEAD",
                     ]
                 else:
+                    if isolated_path is None:
+                        raise ValueError(path_preparation_error or "candidate PATH 基线准备失败")
                     active_user, candidate_identity = _create_candidate_user(
                         candidate_user, command_index,
                     )
-                    isolated_path = _candidate_path(active_user, environment.get("PATH", ""))
+                    _verify_candidate_path(active_user, isolated_path.split(os.pathsep))
                     temporary, execution_root = _fresh_candidate_copy(
                         root, isolated_sha, active_user, candidate_identity[2],
                     )
@@ -562,6 +639,11 @@ def _execute_commands(
             "artifacts": artifacts,
             "error_code": error_code,
         })
+    if trusted_tools is not None:
+        cleanup_error = _remove_candidate_copy(trusted_tools)
+        if cleanup_error is not None:
+            for result in results:
+                result["status"], result["error_code"] = "ERROR", cleanup_error
     return results, started_at, datetime.now(UTC).isoformat(), all_artifacts
 
 
