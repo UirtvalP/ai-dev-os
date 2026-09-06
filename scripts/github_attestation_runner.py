@@ -535,7 +535,9 @@ def _execute_commands(
         probe_user: str | None = None
         probe_identity: tuple[str, str, str] | None = None
         try:
-            trusted_tools = Path(tempfile.mkdtemp(prefix="phase4-tools-", dir=root.parent))
+            # GitHub Workspace 可能在 sudo/useradd 探测后禁止创建或写入新增子目录；
+            # 可信工具不依赖候选 checkout，使用 OS 临时区并随后 root-own + 只读冻结。
+            trusted_tools = Path(tempfile.mkdtemp(prefix="phase4-tools-"))
             trusted_tools.chmod(0o711)
             # 在切换到隔离候选身份前创建唯一可写子目录；部分托管 Runner 会在
             # useradd/sudo 身份探测后拒绝于 workspace 内新建子目录。
