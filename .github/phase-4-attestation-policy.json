@@ -26,7 +26,7 @@
     ],
     "pinned_values": {
       "workflow_sha256": "c5883681616c6685e175aa7f694681093c46ce3918b0546a7eb2658c983a79c3",
-      "runner_sha256": "3d1738d31751fcecc5e2d43fc4f50e95a5c6f7be3090c46127850962d9de19f4",
+      "runner_sha256": "876798177d99d546108833f8258984a77d7bf263e3cd598e37d6db6af175a35f",
       "action_sha": "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
     },
     "fallback": "forbidden"
@@ -62,5 +62,5 @@
       ]
     }
   },
-  "policy_fingerprint": "908ba4ec7c5bbda55c15f9883c2a24506d8c5fb3c019715156f6194c8c1b0fb1"
+  "policy_fingerprint": "8c55f3513e2a3dc2f4de445d508d2d9c3a72f1cd9bc2c0b3d27dc1028db65b44"
 }

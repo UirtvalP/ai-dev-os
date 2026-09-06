@@ -386,7 +386,7 @@ def _git_blob_sha(content: bytes) -> str:
 
 def _materialize_tree(candidate_root: Path, candidate_sha: str, destination: Path) -> None:
     listing = _run_checked(
-        ["/usr/bin/git", "ls-tree", "--recursive", "-z", "--full-tree", candidate_sha],
+        ["/usr/bin/git", "ls-tree", "-r", "-z", "--full-tree", candidate_sha],
         cwd=candidate_root,
     ).stdout
     destination_root = destination.resolve(strict=True)
