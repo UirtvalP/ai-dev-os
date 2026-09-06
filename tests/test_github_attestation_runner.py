@@ -102,6 +102,7 @@ def test_isolated_commands_receive_fresh_candidate_copies(
     candidate.mkdir()
     copies = []
     users = []
+    path_preparations = []
 
     monkeypatch.setattr(runner, "_verify_canonical_checkout", lambda *_args: None)
     def create_user(_prefix: str, index: int) -> tuple[str, tuple[str, str, str]]:
@@ -110,7 +111,12 @@ def test_isolated_commands_receive_fresh_candidate_copies(
         return identity
 
     monkeypatch.setattr(runner, "_create_candidate_user", create_user)
-    monkeypatch.setattr(runner, "_candidate_path", lambda *_args: os.environ.get("PATH", ""))
+    def prepare_path(*_args: object, **_kwargs: object) -> str:
+        path_preparations.append(len(copies))
+        return os.environ.get("PATH", "")
+
+    monkeypatch.setattr(runner, "_candidate_path", prepare_path)
+    monkeypatch.setattr(runner, "_verify_candidate_path", lambda *_args: None)
 
     def fresh(*_args: object) -> tuple[Path, Path]:
         temporary = tmp_path / f"copy-{len(copies)}"
@@ -146,6 +152,7 @@ def test_isolated_commands_receive_fresh_candidate_copies(
 
     assert [result["status"] for result in results] == ["PASS", "PASS"]
     assert copies[0] != copies[1]
+    assert path_preparations == [0]
     assert users[0][0] != users[1][0]
     assert users[0][1][0] != users[1][1][0]
 
@@ -210,7 +217,10 @@ def test_isolated_command_fails_closed_when_candidate_process_survives(
         runner, "_create_candidate_user",
         lambda _prefix, _index: ("phase4candidate1", ("999", "999", "candidate")),
     )
-    monkeypatch.setattr(runner, "_candidate_path", lambda *_args: os.environ.get("PATH", ""))
+    monkeypatch.setattr(
+        runner, "_candidate_path", lambda *_args, **_kwargs: os.environ.get("PATH", ""),
+    )
+    monkeypatch.setattr(runner, "_verify_candidate_path", lambda *_args: None)
     monkeypatch.setattr(
         runner, "_fresh_candidate_copy", lambda *_args: (work.parent, work),
     )
@@ -241,17 +251,79 @@ def test_candidate_path_drops_missing_entries_and_keeps_verified_directories(
 ) -> None:
     existing = tmp_path / "tools"
     existing.mkdir()
+    tool = existing / "tool"
+    tool.write_bytes(b"tool")
+    tool.chmod(0o755)
     missing = tmp_path / "future-tools"
     monkeypatch.setattr(
         runner.subprocess, "run",
-        lambda command, **_kwargs: CompletedProcess(command, 1, b"", b""),
+        lambda command, **_kwargs: CompletedProcess(
+            command, 1 if command[5] == "/usr/bin/test" else 0, b"", b"",
+        ),
     )
 
     result = runner._candidate_path(
         "phase4candidate1", os.pathsep.join((str(existing), str(missing))),
+        command_names=("tool",), trusted_root=tmp_path,
     )
 
-    assert result == str(existing)
+    assert result == os.pathsep.join((str(tmp_path / "trusted-bin"), str(existing)))
+
+
+def test_candidate_path_freezes_command_from_writable_runner_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writable = tmp_path / "runner-tools"
+    system = tmp_path / "system-tools"
+    temporary = tmp_path / "command"
+    writable.mkdir()
+    system.mkdir()
+    temporary.mkdir()
+    tool = writable / "uv"
+    tool.write_bytes(b"trusted executable bytes")
+    tool.chmod(0o755)
+
+    def access_check(command: list[str], **_kwargs: object) -> CompletedProcess[bytes]:
+        if command[5] == "/usr/bin/test":
+            return CompletedProcess(
+                command, 0 if command[-1] == str(writable) else 1, b"", b"",
+            )
+        return CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(runner.subprocess, "run", access_check)
+
+    result = runner._candidate_path(
+        "phase4candidate1", os.pathsep.join((str(writable), str(system))),
+        command_names=("uv",), trusted_root=temporary,
+    )
+
+    trusted_bin = temporary / "trusted-bin"
+    assert result == os.pathsep.join((str(trusted_bin), str(system)))
+    assert (trusted_bin / "uv").read_bytes() == b"trusted executable bytes"
+    assert (trusted_bin.stat().st_mode & 0o222) == 0
+    assert ((trusted_bin / "uv").stat().st_mode & 0o222) == 0
+
+
+def test_candidate_path_excludes_readonly_directory_with_writable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "uv").write_bytes(b"mutable")
+
+    def access_check(command: list[str], **_kwargs: object) -> CompletedProcess[bytes]:
+        if command[5] == "/usr/bin/test":
+            return CompletedProcess(command, 1, b"", b"")
+        return CompletedProcess(command, 0, str(tools / "uv").encode(), b"")
+
+    monkeypatch.setattr(runner.subprocess, "run", access_check)
+
+    result = runner._candidate_path(
+        "phase4candidate1", str(tools),
+        command_names=("uv",), trusted_root=tmp_path,
+    )
+
+    assert result == str(tmp_path / "trusted-bin")
 
 
 def test_github_suite_requires_exact_completed_run_and_each_required_job(
