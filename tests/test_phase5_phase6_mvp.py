@@ -7,7 +7,9 @@ from workspace_orchestrator.agent_runtime.contracts import (
     RuntimeOperationResult,
     RuntimeSessionRef,
 )
-from workspace_orchestrator.dashboard import CommandQueue
+from workspace_orchestrator.agent_runtime.events import RuntimeEventStore
+from workspace_orchestrator.dashboard import CommandQueue, DashboardService
+from workspace_orchestrator.dashboard_ui import DASHBOARD_HTML
 from workspace_orchestrator.deployment import (
     DeploymentAuthorization,
     DeploymentError,
@@ -15,11 +17,7 @@ from workspace_orchestrator.deployment import (
     DeploymentService,
 )
 from workspace_orchestrator.integration.contracts import MergeReceipt
-from workspace_orchestrator.remote_control import (
-    _DASHBOARD_HTML,
-    RemoteController,
-    load_or_create_token,
-)
+from workspace_orchestrator.remote_control import RemoteController, load_or_create_token
 from workspace_orchestrator.workspace import WorkspaceStore
 
 
@@ -85,9 +83,57 @@ def test_dashboard_token_is_generated_and_reused(tmp_path: Path) -> None:
 
 
 def test_dashboard_browser_api_paths_support_reverse_proxy_prefix() -> None:
-    assert "request('api/status')" in _DASHBOARD_HTML
-    assert "request('api/message'" in _DASHBOARD_HTML
-    assert "request('/api/" not in _DASHBOARD_HTML
+    assert "api('api/status" in DASHBOARD_HTML
+    assert "api('api/message'" in DASHBOARD_HTML
+    assert "api('/api/" not in DASHBOARD_HTML
+
+
+def test_dashboard_projects_phase_gate_and_workspace_agents(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    store = WorkspaceStore(root, execution_root=root)
+    requirement_id = store.create("控制面投影", task_provider=None)
+    definition_root = root / ".ai-dev-os" / "gate-definitions" / requirement_id
+    plan = root / ".ai-dev-os" / "plans" / requirement_id / "phase-0.md"
+    store.write_text(plan, "# 0. 基线与主计划（AID-001）")
+    store.write_json(definition_root / "phase-0.json", {
+        "phase": 0,
+        "task_id": "AID-001",
+        "plan_source_path": f".ai-dev-os/plans/{requirement_id}/phase-0.md",
+        "acceptance": [{"id": "P0-AC-01", "description": "基线通过"}],
+    })
+    store.write_json(store.path_for(requirement_id) / "phase-gates" / "phase-0.json", {
+        "status": "PASS",
+        "commit_sha": "a" * 40,
+        "acceptance_results": [{"acceptance_id": "P0-AC-01", "status": "PASS"}],
+    })
+    store.write_json(store.path_for(requirement_id) / "sessions.json", [{
+        "id": "session-1",
+        "agent": "codex",
+        "result": "in_progress",
+        "task_ids": [],
+        "started_at": "2026-09-07T00:00:00+00:00",
+    }])
+    service = DashboardService(
+        store,
+        RuntimeEventStore(store.root / "runtime-events"),
+        CommandQueue(store.path_for(requirement_id) / "dashboard" / "commands.json"),
+    )
+
+    projection = service.requirement(requirement_id)["projection"]
+
+    assert projection["phases"][0] == {
+        "phase": 0,
+        "task_id": "AID-001",
+        "title": "基线与主计划",
+        "status": "passed",
+        "commit_sha": "a" * 40,
+        "activated_at": None,
+        "acceptance": [{"id": "P0-AC-01", "description": "基线通过", "status": "PASS"}],
+        "passed_acceptance": 1,
+        "total_acceptance": 1,
+    }
+    assert projection["agents"][0]["session_id"] == "session-1"
+    assert projection["agents"][0]["role"] == "Control"
 
 
 def test_remote_controller_can_create_dedicated_session(tmp_path: Path) -> None:

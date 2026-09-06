@@ -19,6 +19,7 @@ from .agent_runtime.events import RuntimeEventStore
 from .agent_runtime.ports import AgentRuntimePort
 from .composition import create_runtime
 from .dashboard import CommandQueue, DashboardService
+from .dashboard_ui import DASHBOARD_HTML
 from .workspace import WorkspaceError, WorkspaceStore
 
 MAX_BODY_BYTES = 65_536
@@ -190,7 +191,7 @@ def serve_remote_control(
         def do_GET(self) -> None:
             path, _, query = self.path.partition("?")
             if path == "/":
-                self._bytes(HTTPStatus.OK, _DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
+                self._bytes(HTTPStatus.OK, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
                 return
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "需要有效 Bearer token"})
@@ -265,25 +266,3 @@ def serve_remote_control(
     finally:
         server.server_close()
         controller.close()
-
-
-_DASHBOARD_HTML = """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Dev OS 远程控制</title><style>
-body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#0b1020;color:#e8eefc}
-input,textarea,button{font:inherit;border-radius:8px;border:1px solid #34415f;padding:.7rem;background:#121a2d;color:#fff}
-input,textarea{box-sizing:border-box;width:100%}textarea{min-height:110px}button{cursor:pointer;background:#2962ff}
-.card{background:#121a2d;padding:1rem;border-radius:12px;margin:1rem 0}.muted{color:#9fb0d0}pre{white-space:pre-wrap;overflow-wrap:anywhere}
-</style></head><body><h1>AI Dev OS 远程控制</h1>
-<div class="card"><label>访问 token</label><input id="token" type="password" autocomplete="off"><button onclick="connect()">连接</button><p id="meta" class="muted">尚未连接</p></div>
-<div class="card"><label>发送给固定 Codex 会话（只读沙箱、审批拒绝）</label><textarea id="message"></textarea><button onclick="sendMessage()">发送并等待回复</button><pre id="result"></pre></div>
-<div class="card"><h2>对话与事件</h2><pre id="conversation">连接后显示</pre></div>
-<script>
-const token=document.getElementById('token'); token.value=sessionStorage.getItem('ai-dev-os-token')||'';
-function headers(){return {'Authorization':'Bearer '+token.value,'Content-Type':'application/json'}}
-async function request(path,opts={}){const r=await fetch(path,{...opts,headers:headers()});const j=await r.json();if(!r.ok)throw Error(j.error||j.result||r.status);return j}
-function textFromThread(thread){if(!thread)return '尚未建立 Runtime 连接';const turns=thread.turns||[];return turns.map(t=>JSON.stringify(t,null,2)).join('\n\n')||JSON.stringify(thread,null,2)}
-async function connect(){sessionStorage.setItem('ai-dev-os-token',token.value);try{const s=await request('api/status');meta.textContent=s.requirement_id+' / '+s.session_id+' / '+(s.connected?'已连接':'等待首条消息');conversation.textContent=textFromThread(s.thread)+'\n\n事件：\n'+JSON.stringify(s.events,null,2)}catch(e){meta.textContent='连接失败：'+e.message}}
-async function sendMessage(){result.textContent='发送中…';try{const r=await request('api/message',{method:'POST',body:JSON.stringify({message:message.value,command_id:crypto.randomUUID()})});result.textContent=r.result||r.status;await connect()}catch(e){result.textContent='失败：'+e.message}}
-setInterval(()=>{if(token.value)connect()},5000);
-</script></body></html>"""
