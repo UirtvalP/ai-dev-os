@@ -428,7 +428,8 @@ def test_workflow_and_repository_policy_pin_trusted_attestor_contract() -> None:
     assert pins["workflow_sha256"] == hashlib.sha256(workflow.encode()).hexdigest()
     runner_text = (root / "scripts/github_attestation_runner.py").read_text(encoding="utf-8")
     assert "git archive" not in runner_text
-    assert '"ls-tree", "--recursive"' in runner_text
+    assert '"ls-tree", "-r"' in runner_text
+    assert '"ls-tree", "--recursive"' not in runner_text
     assert "_create_candidate_user" in runner_text
     assert pins["runner_sha256"] == hashlib.sha256(runner_text.encode()).hexdigest()
     installer = (root / "scripts/install_github_attestation_trust.ps1").read_text(
