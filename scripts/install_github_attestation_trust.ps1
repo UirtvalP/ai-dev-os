@@ -9,6 +9,10 @@ if ($target -ne "C:\ProgramData\ai-dev-os\verification-authority") {
 }
 
 New-Item -ItemType Directory -Path $target -Force | Out-Null
+$workerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+# Remove the previous explicit deny while this elevated installer refreshes the
+# authority, then restore the deny after all files have been written.
+& icacls.exe $target /remove:d $workerIdentity /T /C | Out-Null
 $policy = @{
     schema_version = 1
     repository = "UirtvalP/ai-dev-os"
@@ -28,13 +32,6 @@ $policyPath = Join-Path $target "github-oidc-policy.json"
 [System.IO.File]::WriteAllText($policyPath, $json + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false))
 
-& icacls.exe $target /inheritance:r | Out-Null
-& icacls.exe $target /setowner "BUILTIN\Administrators" /T /C | Out-Null
-& icacls.exe $target /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "BUILTIN\Users:(OI)(CI)RX" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "无法收紧系统信任目录 ACL"
-}
-
 $receipt = @{
     installed_at = [DateTimeOffset]::UtcNow.ToString("o")
     policy_sha256 = (Get-FileHash -LiteralPath $policyPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -45,3 +42,11 @@ $receipt = @{
     ($receipt | ConvertTo-Json -Depth 3) + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false)
 )
+
+& icacls.exe $target /inheritance:r | Out-Null
+& icacls.exe $target /setowner "BUILTIN\Administrators" /T /C | Out-Null
+& icacls.exe $target /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "BUILTIN\Users:(OI)(CI)RX" /T /C | Out-Null
+& icacls.exe $target /deny "$workerIdentity`:(OI)(CI)W" /T /C | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "无法收紧系统信任目录 ACL"
+}
