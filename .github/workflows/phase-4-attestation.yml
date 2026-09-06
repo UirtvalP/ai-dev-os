@@ -85,8 +85,6 @@ jobs:
           CI_RUN_ID: ${{ inputs.ci_run_id }}
           CI_RUN_ATTEMPT: ${{ inputs.ci_run_attempt }}
         run: |
-          sudo useradd --system --user-group --no-create-home phase4candidate
-          sudo chown -R phase4candidate:phase4candidate candidate
           mkdir -p phase4-output
           chmod 700 phase4-output
           args=(
