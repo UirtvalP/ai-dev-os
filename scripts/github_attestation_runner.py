@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import subprocess
+import tempfile
 import time
 import urllib.request
 from datetime import UTC, datetime
@@ -255,8 +256,194 @@ def _command_artifacts(
     return artifacts, None
 
 
+def _run_checked(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
+    completed = subprocess.run(
+        command, cwd=cwd, capture_output=True, check=False, timeout=30, shell=False,
+    )
+    if completed.returncode != 0:
+        detail = _preview(completed.stderr or completed.stdout)
+        raise RuntimeError(f"可信执行准备失败：{command[0]} ({completed.returncode}) {detail}")
+    return completed
+
+
+def _candidate_identity(candidate_user: str) -> tuple[str, str, str]:
+    uid = _preview(_run_checked(["/usr/bin/id", "--user", candidate_user]).stdout).strip()
+    gid = _preview(_run_checked(["/usr/bin/id", "--group", candidate_user]).stdout).strip()
+    group = _preview(_run_checked(["/usr/bin/id", "--group", "--name", candidate_user]).stdout).strip()
+    current_uid = _preview(_run_checked(["/usr/bin/id", "--user"]).stdout).strip()
+    groups = _preview(_run_checked(["/usr/bin/id", "--groups", candidate_user]).stdout).split()
+    if (
+        not uid.isdecimal() or int(uid) == 0 or uid == current_uid or not gid.isdecimal()
+        or not group or groups != [gid]
+    ):
+        raise ValueError("candidate user 必须是独立的非 root 身份")
+    sudo = subprocess.run(
+        ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
+         "/usr/bin/sudo", "--non-interactive", "--list"],
+        capture_output=True, check=False, timeout=10, shell=False,
+    )
+    if sudo.returncode == 0:
+        raise ValueError("candidate user 不得拥有 sudo 权限")
+    return uid, gid, group
+
+
+def _validate_candidate_path(candidate_user: str, path_value: str) -> None:
+    entries = path_value.split(os.pathsep)
+    if not entries or any(not entry or not Path(entry).is_absolute() for entry in entries):
+        raise ValueError("candidate PATH 必须只包含绝对目录")
+    for entry in entries:
+        path = Path(entry)
+        if not path.is_dir():
+            raise ValueError(f"candidate PATH 目录不存在：{entry}")
+        writable = subprocess.run(
+            ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
+             "/usr/bin/test", "-w", entry],
+            capture_output=True, check=False, timeout=10, shell=False,
+        )
+        if writable.returncode != 1:
+            raise ValueError(f"candidate PATH 目录可写或无法验证：{entry}")
+
+
+def _verify_canonical_checkout(root: Path, candidate_sha: str) -> None:
+    head = _preview(_run_checked(["/usr/bin/git", "rev-parse", "HEAD"], cwd=root).stdout).strip()
+    if head != candidate_sha:
+        raise ValueError("candidate checkout 未绑定 exact SHA")
+    _run_checked(["/usr/bin/git", "diff", "--quiet", "HEAD", "--"], cwd=root)
+    _run_checked(["/usr/bin/git", "diff", "--cached", "--quiet", "HEAD", "--"], cwd=root)
+
+
+def _git_blob_sha(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode()
+    return hashlib.sha1(header + content, usedforsecurity=False).hexdigest()
+
+
+def _materialize_tree(candidate_root: Path, candidate_sha: str, destination: Path) -> None:
+    listing = _run_checked(
+        ["/usr/bin/git", "ls-tree", "--recursive", "-z", "--full-tree", candidate_sha],
+        cwd=candidate_root,
+    ).stdout
+    destination_root = destination.resolve(strict=True)
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if separator != b"\t" or len(fields) != 3:
+            raise ValueError("candidate tree 记录无效")
+        mode, kind, expected_sha = (field.decode("ascii") for field in fields)
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise ValueError("candidate tree 包含 symlink、gitlink 或特殊文件")
+        relative = Path(os.fsdecode(raw_path))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("candidate tree 包含越界路径")
+        source = candidate_root / relative
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("candidate checkout 与 tree 类型不匹配")
+        content = source.read_bytes()
+        if _git_blob_sha(content) != expected_sha:
+            raise ValueError("candidate checkout 文件与 tree blob 不匹配")
+        target = destination / relative
+        resolved_parent = target.parent.resolve(strict=False)
+        if resolved_parent != destination_root and destination_root not in resolved_parent.parents:
+            raise ValueError("candidate tree 包含越界路径")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if mode == "100755" else 0o644)
+
+
+def _fresh_candidate_copy(
+    root: Path, candidate_sha: str, candidate_user: str, candidate_group: str,
+) -> tuple[Path, Path]:
+    temporary = Path(tempfile.mkdtemp(prefix="phase4-command-", dir=root.parent))
+    temporary.chmod(0o711)
+    work = temporary / "work"
+    work.mkdir()
+    _materialize_tree(root, candidate_sha, work)
+    (work / ".phase4-home").mkdir()
+    _run_checked([
+        "/usr/bin/sudo", "--non-interactive", "/bin/chown", "--recursive",
+        f"{candidate_user}:{candidate_group}", str(work),
+    ])
+    return temporary, work
+
+
+def _create_candidate_user(prefix: str, index: int) -> tuple[str, tuple[str, str, str]]:
+    if re.fullmatch(r"[a-z_][a-z0-9_-]{0,19}", prefix) is None:
+        raise ValueError("candidate user prefix 无效")
+    name = f"{prefix}{index}"
+    uid = 50000 + index
+    for key in (name, str(uid)):
+        exists = subprocess.run(
+            ["/usr/bin/getent", "passwd", key], capture_output=True, check=False,
+            timeout=10, shell=False,
+        )
+        if exists.returncode == 0 or exists.returncode not in (0, 2):
+            raise ValueError("candidate user 身份已存在或无法验证")
+    _run_checked([
+        "/usr/bin/sudo", "--non-interactive", "/usr/sbin/useradd", "--uid", str(uid),
+        "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", name,
+    ])
+    return name, _candidate_identity(name)
+
+
+def _delete_candidate_user(candidate_user: str, candidate_uid: str) -> str | None:
+    try:
+        deleted = subprocess.run(
+            ["/usr/bin/sudo", "--non-interactive", "/usr/sbin/userdel", "--force",
+             candidate_user],
+            capture_output=True, check=False, timeout=30, shell=False,
+        )
+        if deleted.returncode != 0:
+            return "candidate_identity_cleanup_failed"
+        for key in (candidate_user, candidate_uid):
+            remaining = subprocess.run(
+                ["/usr/bin/getent", "passwd", key], capture_output=True, check=False,
+                timeout=10, shell=False,
+            )
+            if remaining.returncode != 2:
+                return "candidate_identity_cleanup_failed"
+    except (OSError, subprocess.TimeoutExpired):
+        return "candidate_identity_cleanup_failed"
+    return None
+
+
+def _terminate_candidate(candidate_uid: str) -> str | None:
+    try:
+        killed = subprocess.run(
+            ["/usr/bin/sudo", "--non-interactive", "/usr/bin/pkill", "--signal", "KILL",
+             "--uid", candidate_uid],
+            capture_output=True, check=False, timeout=10, shell=False,
+        )
+        if killed.returncode not in (0, 1):
+            return "candidate_cleanup_failed"
+        survivors = subprocess.run(
+            ["/usr/bin/pgrep", "--uid", candidate_uid],
+            capture_output=True, check=False, timeout=10, shell=False,
+        )
+        if survivors.returncode != 1:
+            return "candidate_process_survived" if survivors.returncode == 0 else "candidate_cleanup_failed"
+    except (OSError, subprocess.TimeoutExpired):
+        return "candidate_cleanup_failed"
+    return None
+
+
+def _remove_candidate_copy(temporary: Path) -> str | None:
+    try:
+        removed = subprocess.run(
+            ["/usr/bin/sudo", "--non-interactive", "/bin/rm", "--recursive", "--force", "--",
+             str(temporary)],
+            capture_output=True, check=False, timeout=30, shell=False,
+        )
+        if removed.returncode != 0 or temporary.exists():
+            return "candidate_cleanup_failed"
+    except (OSError, subprocess.TimeoutExpired):
+        return "candidate_cleanup_failed"
+    return None
+
+
 def _execute_commands(
-    contract: list[dict[str, object]], candidate_root: Path,
+    contract: list[dict[str, object]], candidate_root: Path, *, candidate_sha: str | None = None,
+    candidate_user: str | None = None,
 ) -> tuple[list[dict[str, object]], str, str, list[dict[str, object]]]:
     root = candidate_root.resolve(strict=True)
     if not root.is_dir():
@@ -267,10 +454,18 @@ def _execute_commands(
     environment = {
         key: value for key, value in os.environ.items() if key.upper() not in _FORBIDDEN_ENV
     }
-    for suite in contract:
+    if candidate_user is not None:
+        if candidate_sha is None or _SHA1.fullmatch(candidate_sha) is None:
+            raise ValueError("隔离执行必须绑定 candidate SHA")
+        _verify_canonical_checkout(root, candidate_sha)
+        isolated_sha = candidate_sha
+    else:
+        isolated_sha = None
+    for command_index, suite in enumerate(contract, 1):
         argv = suite["argv"]
         timeout = suite["timeout_seconds"]
-        cwd = root / str(suite["cwd"])
+        suite_cwd = str(suite["cwd"])
+        cwd = root / suite_cwd
         if (
             not isinstance(argv, list)
             or not argv
@@ -284,9 +479,39 @@ def _execute_commands(
         began = time.monotonic()
         status, returncode, error_code = "ERROR", None, None
         stdout = stderr = b""
+        temporary: Path | None = None
+        execution_root = root
+        active_user: str | None = None
+        candidate_identity: tuple[str, str, str] | None = None
         try:
+            command = list(argv)
+            if candidate_user is not None:
+                assert isolated_sha is not None
+                _verify_canonical_checkout(root, isolated_sha)
+                if command == ["git", "diff", "--check", "origin/main", "HEAD"]:
+                    cwd = root / suite_cwd
+                    command = [
+                        "/usr/bin/git", "-c", "diff.external=", "-c", "diff.trustExitCode=false",
+                        "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--check",
+                        "origin/main", "HEAD",
+                    ]
+                else:
+                    active_user, candidate_identity = _create_candidate_user(
+                        candidate_user, command_index,
+                    )
+                    _validate_candidate_path(active_user, environment.get("PATH", ""))
+                    temporary, execution_root = _fresh_candidate_copy(
+                        root, isolated_sha, active_user, candidate_identity[2],
+                    )
+                    cwd = execution_root / suite_cwd
+                    command = [
+                        "/usr/bin/sudo", "--non-interactive", "--user", active_user, "--",
+                        "/usr/bin/env", "-i", f"PATH={environment.get('PATH', '')}",
+                        f"HOME={execution_root / '.phase4-home'}",
+                        f"TMPDIR={execution_root / '.phase4-home'}", *command,
+                    ]
             completed = subprocess.run(
-                argv,
+                command,
                 cwd=cwd,
                 env=environment,
                 capture_output=True,
@@ -303,9 +528,25 @@ def _execute_commands(
         except OSError as exc:
             stderr = str(exc).encode("utf-8", errors="replace")
             error_code = "process_unavailable"
-        artifacts, artifact_error = _command_artifacts(suite["artifacts"], root)
+        except (RuntimeError, ValueError) as exc:
+            stderr = str(exc).encode("utf-8", errors="replace")
+            error_code = "trusted_preparation_failed"
+        finally:
+            if active_user is not None and candidate_identity is not None:
+                cleanup_error = _terminate_candidate(candidate_identity[0])
+                if cleanup_error is not None:
+                    status, error_code = "ERROR", cleanup_error
+        artifacts, artifact_error = _command_artifacts(suite["artifacts"], execution_root)
         if artifact_error is not None:
             status, error_code = "ERROR", artifact_error
+        if temporary is not None:
+            removal_error = _remove_candidate_copy(temporary)
+            if removal_error is not None:
+                status, error_code = "ERROR", removal_error
+        if active_user is not None and candidate_identity is not None:
+            identity_error = _delete_candidate_user(active_user, candidate_identity[0])
+            if identity_error is not None:
+                status, error_code = "ERROR", identity_error
         all_artifacts.extend(artifacts)
         results.append({
             "suite_id": suite["suite_id"],
@@ -327,7 +568,7 @@ def build_receipt(
     policy: dict[str, Any], *, suite_id: str, candidate_sha: str, candidate_tree_sha: str,
     github_run_id: str, github_run_attempt: int, token: str, output: Path,
     candidate_root: Path | None = None, ci_run_id: str | None = None,
-    ci_run_attempt: int | None = None,
+    ci_run_attempt: int | None = None, candidate_user: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     suites = policy.get("suites")
     if not isinstance(suites, dict) or suite_id not in suites:
@@ -357,7 +598,9 @@ def build_receipt(
     if suite["kind"] == "command":
         if candidate_root is None:
             raise ValueError("command suite 必须指定 candidate root")
-        results, started, completed, artifacts = _execute_commands(contract, candidate_root)
+        results, started, completed, artifacts = _execute_commands(
+            contract, candidate_root, candidate_sha=candidate_sha, candidate_user=candidate_user,
+        )
         receipt_run_id = f"github-attestation-{github_run_id}-attempt-{github_run_attempt}"
         receipt_attempt = github_run_attempt
     else:
@@ -431,6 +674,7 @@ def main() -> int:
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path)
+    parser.add_argument("--candidate-user")
     parser.add_argument("--ci-run-id")
     parser.add_argument("--ci-run-attempt", type=int)
     args = parser.parse_args()
@@ -451,7 +695,7 @@ def main() -> int:
         candidate_tree_sha=tree, github_run_id=github_run_id,
         github_run_attempt=github_attempt, token=token, output=args.output,
         candidate_root=args.candidate_root, ci_run_id=args.ci_run_id,
-        ci_run_attempt=args.ci_run_attempt,
+        ci_run_attempt=args.ci_run_attempt, candidate_user=args.candidate_user,
     )
     envelope = build_envelope(
         policy, receipt, run_id=github_run_id, attempt=github_attempt,
