@@ -170,22 +170,24 @@ class PhaseVerificationRunner:
                 expected_attempt=run_attempt,
             )
             expected = self._github_receipt_fields(suite, facts)
+            receipt_started = _timestamp(receipt.started_at, "Receipt started_at")
+            receipt_completed = _timestamp(receipt.completed_at, "Receipt completed_at")
+            if datetime.fromisoformat(receipt_completed) < datetime.fromisoformat(receipt_started):
+                raise PhaseGateError("GitHub Verification Receipt 完成时间早于开始时间")
             if suite.kind == "github-actions":
                 actual = (
                     receipt.run_id,
                     receipt.environment,
-                    _timestamp(receipt.started_at, "Receipt started_at"),
-                    _timestamp(receipt.completed_at, "Receipt completed_at"),
+                    receipt_started,
                     receipt.source_url,
                     receipt.summary,
                 )
-                matches_live = actual == expected
+                matches_live = actual == (expected[0], expected[1], expected[2], expected[4], expected[5])
             else:
                 matches_live = (
                     receipt.run_id,
-                    _timestamp(receipt.started_at, "Receipt started_at"),
-                    _timestamp(receipt.completed_at, "Receipt completed_at"),
-                ) == (expected[0], expected[2], expected[3])
+                    receipt_started,
+                ) == (expected[0], expected[2])
             if not matches_live:
                 raise PhaseGateError("GitHub Verification Receipt 与实时 API 事实不一致")
         elif suite.kind == "github-attestation" and suite.execution_kind == "command":

@@ -369,7 +369,9 @@ def test_phase4_attestation_revalidate_verifies_signature_and_live_ci_without_re
         "path": ".github/workflows/ci.yml", "repository": {"full_name": "owner/repo"},
         "jobs_url": "https://api.github.com/repos/owner/repo/actions/runs/42/jobs",
         "html_url": "https://github.com/owner/repo/actions/runs/42",
-        "run_started_at": "2026-09-05T01:00:00Z", "updated_at": "2026-09-05T01:05:00Z",
+        # GitHub may rewrite ``updated_at`` by a second after the attestor has
+        # signed otherwise identical run/job facts.
+        "run_started_at": "2026-09-05T01:00:00Z", "updated_at": "2026-09-05T01:04:59Z",
     }
     requests: list[str] = []
 
