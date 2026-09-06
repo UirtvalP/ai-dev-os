@@ -241,7 +241,11 @@ print(json.dumps({'type':'child','pid':child.pid}),flush=True)
         from pathlib import Path
         for _ in range(100):
             path = Path(f"/proc/{child_pid}/stat")
-            if not path.exists() or path.read_text().split()[2] == "Z":
+            try:
+                state = path.read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            if state == "Z":
                 break
             time.sleep(.01)
         else:
