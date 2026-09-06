@@ -287,14 +287,14 @@ def _candidate_identity(candidate_user: str) -> tuple[str, str, str]:
     return uid, gid, group
 
 
-def _validate_candidate_path(candidate_user: str, path_value: str) -> None:
+def _candidate_path(candidate_user: str, path_value: str) -> str:
     entries = path_value.split(os.pathsep)
     if not entries or any(not entry or not Path(entry).is_absolute() for entry in entries):
         raise ValueError("candidate PATH 必须只包含绝对目录")
-    for entry in entries:
-        path = Path(entry)
-        if not path.is_dir():
-            raise ValueError(f"candidate PATH 目录不存在：{entry}")
+    existing = [entry for entry in entries if Path(entry).is_dir()]
+    if not existing:
+        raise ValueError("candidate PATH 不包含现存目录")
+    for entry in existing:
         writable = subprocess.run(
             ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
              "/usr/bin/test", "-w", entry],
@@ -302,6 +302,7 @@ def _validate_candidate_path(candidate_user: str, path_value: str) -> None:
         )
         if writable.returncode != 1:
             raise ValueError(f"candidate PATH 目录可写或无法验证：{entry}")
+    return os.pathsep.join(existing)
 
 
 def _verify_canonical_checkout(root: Path, candidate_sha: str) -> None:
@@ -499,14 +500,14 @@ def _execute_commands(
                     active_user, candidate_identity = _create_candidate_user(
                         candidate_user, command_index,
                     )
-                    _validate_candidate_path(active_user, environment.get("PATH", ""))
+                    isolated_path = _candidate_path(active_user, environment.get("PATH", ""))
                     temporary, execution_root = _fresh_candidate_copy(
                         root, isolated_sha, active_user, candidate_identity[2],
                     )
                     cwd = execution_root / suite_cwd
                     command = [
                         "/usr/bin/sudo", "--non-interactive", "--user", active_user, "--",
-                        "/usr/bin/env", "-i", f"PATH={environment.get('PATH', '')}",
+                        "/usr/bin/env", "-i", f"PATH={isolated_path}",
                         f"HOME={execution_root / '.phase4-home'}",
                         f"TMPDIR={execution_root / '.phase4-home'}", *command,
                     ]
