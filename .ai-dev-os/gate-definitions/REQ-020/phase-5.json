@@ -9,7 +9,8 @@
   "verification_suites": [
     {
       "id": "p5-local-common-quality",
-      "kind": "command",
+      "kind": "github-attestation",
+      "attested_kind": "command",
       "commands": [
         ["uv", "build"],
         ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
@@ -25,7 +26,8 @@
     },
     {
       "id": "p5-github-ci-matrix",
-      "kind": "github-actions",
+      "kind": "github-attestation",
+      "attested_kind": "github-actions",
       "repository": "UirtvalP/ai-dev-os",
       "workflow": "ci.yml",
       "required_event": "pull_request",

@@ -140,11 +140,11 @@ def test_v2_plan_and_complete_gate_definition_chain_are_one_contract() -> None:
         ]
         expected_kinds = (
             ["github-attestation", "github-attestation"]
-            if phase == 4
+            if phase >= 4
             else ["command", "github-actions"]
         )
         assert [suite["kind"] for suite in suites] == expected_kinds
-        if phase == 4:
+        if phase >= 4:
             assert [suite["attested_kind"] for suite in suites] == ["command", "github-actions"]
         commands = suites[0]["commands"]
         for program, option in product(("ai-dev-os", "workspace"), ("--help", "--version")):
