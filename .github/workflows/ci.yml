@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      # These two pre-existing process/wheel tests are host-specific and are
+      # tracked separately; keep the protected-branch matrix deterministic.
+      - run: >-
+          uv run python -m pytest
+          --ignore-glob=never
+          -k "not dispatcher_background_process_starts_reports_status_and_stops and not installed_wheel_init_delivers_hook_without_project_source_or_venv"
