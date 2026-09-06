@@ -256,7 +256,7 @@ def _command_artifacts(
 
 
 def _execute_commands(
-    contract: list[dict[str, object]], candidate_root: Path,
+    contract: list[dict[str, object]], candidate_root: Path, *, candidate_user: str | None = None,
 ) -> tuple[list[dict[str, object]], str, str, list[dict[str, object]]]:
     root = candidate_root.resolve(strict=True)
     if not root.is_dir():
@@ -285,8 +285,15 @@ def _execute_commands(
         status, returncode, error_code = "ERROR", None, None
         stdout = stderr = b""
         try:
+            command = list(argv)
+            if candidate_user is not None:
+                command = [
+                    "sudo", "--non-interactive", "--user", candidate_user, "--",
+                    "env", "-i", f"PATH={environment.get('PATH', '')}",
+                    f"HOME={root / '.phase4-home'}", *command,
+                ]
             completed = subprocess.run(
-                argv,
+                command,
                 cwd=cwd,
                 env=environment,
                 capture_output=True,
@@ -303,6 +310,15 @@ def _execute_commands(
         except OSError as exc:
             stderr = str(exc).encode("utf-8", errors="replace")
             error_code = "process_unavailable"
+        finally:
+            if candidate_user is not None:
+                subprocess.run(
+                    ["sudo", "--non-interactive", "pkill", "--signal", "KILL", "--uid", candidate_user],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                    shell=False,
+                )
         artifacts, artifact_error = _command_artifacts(suite["artifacts"], root)
         if artifact_error is not None:
             status, error_code = "ERROR", artifact_error
@@ -327,7 +343,7 @@ def build_receipt(
     policy: dict[str, Any], *, suite_id: str, candidate_sha: str, candidate_tree_sha: str,
     github_run_id: str, github_run_attempt: int, token: str, output: Path,
     candidate_root: Path | None = None, ci_run_id: str | None = None,
-    ci_run_attempt: int | None = None,
+    ci_run_attempt: int | None = None, candidate_user: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     suites = policy.get("suites")
     if not isinstance(suites, dict) or suite_id not in suites:
@@ -357,7 +373,9 @@ def build_receipt(
     if suite["kind"] == "command":
         if candidate_root is None:
             raise ValueError("command suite 必须指定 candidate root")
-        results, started, completed, artifacts = _execute_commands(contract, candidate_root)
+        results, started, completed, artifacts = _execute_commands(
+            contract, candidate_root, candidate_user=candidate_user,
+        )
         receipt_run_id = f"github-attestation-{github_run_id}-attempt-{github_run_attempt}"
         receipt_attempt = github_run_attempt
     else:
@@ -431,6 +449,7 @@ def main() -> int:
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path)
+    parser.add_argument("--candidate-user")
     parser.add_argument("--ci-run-id")
     parser.add_argument("--ci-run-attempt", type=int)
     args = parser.parse_args()
@@ -451,7 +470,7 @@ def main() -> int:
         candidate_tree_sha=tree, github_run_id=github_run_id,
         github_run_attempt=github_attempt, token=token, output=args.output,
         candidate_root=args.candidate_root, ci_run_id=args.ci_run_id,
-        ci_run_attempt=args.ci_run_attempt,
+        ci_run_attempt=args.ci_run_attempt, candidate_user=args.candidate_user,
     )
     envelope = build_envelope(
         policy, receipt, run_id=github_run_id, attempt=github_attempt,
