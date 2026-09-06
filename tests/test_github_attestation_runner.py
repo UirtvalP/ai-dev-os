@@ -113,6 +113,7 @@ def test_isolated_commands_receive_fresh_candidate_copies(
     monkeypatch.setattr(runner, "_create_candidate_user", create_user)
     def prepare_path(*_args: object, **_kwargs: object) -> str:
         path_preparations.append(len(copies))
+        assert _kwargs["command_names"][-3:] == ("git", "realpath", "dirname")
         return os.environ.get("PATH", "")
 
     monkeypatch.setattr(runner, "_candidate_path", prepare_path)
@@ -122,6 +123,7 @@ def test_isolated_commands_receive_fresh_candidate_copies(
         temporary = tmp_path / f"copy-{len(copies)}"
         work = temporary / "work"
         work.mkdir(parents=True)
+        (temporary / "home").mkdir()
         copies.append(work)
         return temporary, work
 
@@ -129,6 +131,8 @@ def test_isolated_commands_receive_fresh_candidate_copies(
         command: list[str], *, cwd: Path, **_kwargs: object,
     ) -> CompletedProcess[bytes]:
         assert command[:3] == ["/usr/bin/sudo", "--non-interactive", "--user"]
+        assert f"HOME={cwd.parent / 'home'}" in command
+        assert f"TMPDIR={cwd.parent / 'home'}" in command
         if len(copies) == 1:
             (cwd / "poisoned").write_text("yes", encoding="utf-8")
         else:
