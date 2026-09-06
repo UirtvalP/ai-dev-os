@@ -1169,10 +1169,10 @@ class GateStore:
             raise PhaseGateError("GateDefinition Acceptance ID 重复：" + ", ".join(duplicates))
         if not definition.verification_suites:
             raise PhaseGateError("GateDefinition verification_suites 不能为空")
-        if definition.phase != 4 and any(
+        if definition.phase < 4 and any(
             suite.kind == "github-attestation" for suite in definition.verification_suites
         ):
-            raise PhaseGateError("github-attestation Verification Suite 仅允许 Phase 4 使用")
+            raise PhaseGateError("github-attestation Verification Suite 仅允许 Phase 4+ 使用")
         suite_ids = [suite.suite_id for suite in definition.verification_suites]
         duplicate_suites = sorted(
             item for item, count in Counter(suite_ids).items() if count > 1

@@ -142,12 +142,13 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
 
         def execute(self, **kwargs: object) -> object:
             assert kwargs == {
-                "suite_id": "p4-suite",
+                "suite_id": kwargs["suite_id"],
                 "candidate_sha": "1" * 40,
                 "execution_kind": "command",
                 "ci_workflow": None,
                 "ci_event": None,
             }
+            assert kwargs["suite_id"] in {"p4-suite", "p5-suite"}
             payload = {
                 "receipt_id": "receipt-1",
                 "run_id": "github-attestation-321-attempt-1",
@@ -193,6 +194,16 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
     outer = structured_runner("REQ-020", 4, suite, "session-1", "1" * 40)
     assert outer.signed_envelope == {"payload": outer.structured_receipt}
     assert outer.source_url == "https://github.com/owner/repo/actions/runs/321"
+
+    configured_phase5 = composition.configured_phase_verification(workspace, phase=5)
+    phase5_runner = configured_phase5.runner.structured_runner
+    assert phase5_runner is not None
+    phase5_suite = VerificationSuiteDefinition(
+        "p5-suite", "github-attestation", commands=(("python", "-V"),),
+        attested_kind="command",
+    )
+    phase5 = phase5_runner("REQ-020", 5, phase5_suite, "session-1", "1" * 40)
+    assert phase5.source_url == "https://github.com/owner/repo/actions/runs/321"
 
 
 def test_phase4_missing_gh_is_unavailable_and_never_falls_back_to_local_keys(

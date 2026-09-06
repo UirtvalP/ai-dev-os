@@ -69,6 +69,51 @@ def test_command_receipt_uses_real_process_facts_and_never_infers_pass_from_job(
     assert isinstance(result["duration_seconds"], int)
 
 
+def test_suite_declared_phase_drives_phase4plus_receipt(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    suite = {
+        "phase": 5,
+        "kind": "command",
+        "provider_id": "workspace-command-runner",
+        "commands": [{
+            "suite_type": "unit",
+            "argv": [sys.executable, "-c", "raise SystemExit(0)"],
+        }],
+    }
+    policy = _policy(suite)
+    policy["suites"] = {"p5-local-common-quality": suite}
+
+    plan, receipt = runner.build_receipt(
+        policy,
+        suite_id="p5-local-common-quality",
+        candidate_sha=SHA,
+        candidate_tree_sha=TREE,
+        github_run_id="123",
+        github_run_attempt=1,
+        token="token",
+        output=tmp_path,
+        candidate_root=candidate,
+    )
+
+    assert plan["phase"] == 5
+    assert receipt["phase"] == 5
+
+    policy["suites"] = {"p6-local-common-quality": suite}
+    with pytest.raises(ValueError, match="suite phase"):
+        runner.build_receipt(
+            policy,
+            suite_id="p6-local-common-quality",
+            candidate_sha=SHA,
+            candidate_tree_sha=TREE,
+            github_run_id="123",
+            github_run_attempt=1,
+            token="token",
+            output=tmp_path,
+            candidate_root=candidate,
+        )
+
+
 def test_command_receipt_records_process_unavailable_as_error(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     candidate.mkdir()

@@ -206,11 +206,11 @@ def configured_phase_verification(
             from .phase_gate import VerificationSuiteDefinition
 
             if (
-                requested_phase != 4
+                requested_phase < 4
                 or not isinstance(suite, VerificationSuiteDefinition)
                 or suite.kind != "github-attestation"
             ):
-                raise PhaseGateError("GitHub OIDC attestor 仅执行 Phase 4 github-attestation Suite")
+                raise PhaseGateError("GitHub OIDC attestor 仅执行 Phase 4+ github-attestation Suite")
             artifact = github_client.execute(
                 suite_id=suite.suite_id,
                 candidate_sha=commit_sha,
