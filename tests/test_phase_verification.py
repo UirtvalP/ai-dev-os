@@ -149,25 +149,27 @@ def test_command_timeout_never_writes_a_pass_receipt(
     assert not (gates.workspace_store.path_for("REQ-001") / "verification-receipts").exists()
 
 
-def test_gate_issue_live_revalidation_rejects_forged_pass_receipt(tmp_path: Path) -> None:
+def test_gate_issue_local_command_receipt_does_not_rerun_suite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     gates = _gates(
         tmp_path,
         {
             "id": "local",
             "kind": "command",
-            "commands": [[sys.executable, "-c", "raise SystemExit(7)"]],
+            "commands": [[sys.executable, "-c", "print('already verified')"]],
         },
     )
     suite = gates.verification_suite("REQ-001", 0, "local", revision=SHA)
     timestamp = now_iso()
-    forged = VerificationReceipt(
-        receipt_id="local-forged",
+    receipt = VerificationReceipt(
+        receipt_id="local-pass",
         requirement_id="REQ-001",
         commit_sha=SHA,
         suite_id=suite.suite_id,
         suite_fingerprint=suite.fingerprint,
         issuer=suite.expected_issuer,
-        run_id="forged-run",
+        run_id="local-run",
         session_id="implementer",
         command=suite.command_summary,
         environment=PhaseVerificationRunner._local_environment(),
@@ -175,38 +177,40 @@ def test_gate_issue_live_revalidation_rejects_forged_pass_receipt(tmp_path: Path
         completed_at=timestamp,
         exit_code=0,
         status="PASS",
-        summary="self-reported pass",
+        summary="already verified",
     )
-    gates._write_verification_receipt(forged)
+    gates._write_verification_receipt(receipt)
     gates.record_review_from_payload(
         "REQ-001",
         0,
         {
-            "verification_receipt_refs": [forged.receipt_id],
-            "implementation_session_ids": [forged.session_id],
-            "implementation_run_ids": [forged.run_id],
+            "verification_receipt_refs": [receipt.receipt_id],
+            "implementation_session_ids": [receipt.session_id],
+            "implementation_run_ids": [receipt.run_id],
             "verdict": "PASS",
             "resolved_findings": ["none claimed"],
         },
         reviewer_session_id="independent-reviewer",
     )
 
-    with pytest.raises(PhaseGateError, match="Verification Suite local 失败"):
-        gates.issue_from_payload(
-            "REQ-001",
-            0,
-            {
-                "acceptance_results": [
-                    AcceptanceResult(
-                        "AC-1", "PASS", "claimed", (forged.receipt_id,)
-                    ).to_dict()
-                ],
-                "regression_summary": "claimed pass",
-            },
-            issued_by="codex:issuer",
-        )
+    monkeypatch.setattr(
+        PhaseVerificationRunner,
+        "_execute_commands",
+        lambda *_args, **_kwargs: pytest.fail("issue 不得重跑 local command suite"),
+    )
+    record = gates.issue_from_payload(
+        "REQ-001",
+        0,
+        {
+            "acceptance_results": [
+                AcceptanceResult("AC-1", "PASS", "verified", (receipt.receipt_id,)).to_dict()
+            ],
+            "regression_summary": "stored local receipt verified",
+        },
+        issued_by="codex:issuer",
+    )
 
-    assert not gates.path_for("REQ-001", 0).exists()
+    assert record.verification_receipt_refs == (receipt.receipt_id,)
 
 
 def test_github_suite_imports_only_exact_sha_successful_required_jobs(
@@ -237,7 +241,10 @@ def test_github_suite_imports_only_exact_sha_successful_required_jobs(
         "updated_at": "2026-09-05T01:05:00Z",
     }
 
+    requests: list[str] = []
+
     def read(url: str) -> dict[str, object]:
+        requests.append(url)
         if "/runs?" in url:
             return {"workflow_runs": [run]}
         if url.endswith("/actions/runs/42"):
@@ -251,11 +258,16 @@ def test_github_suite_imports_only_exact_sha_successful_required_jobs(
     receipt = runner.run(
         "REQ-001", phase=0, suite_id="ci", session_id="implementer"
     )
+    requests.clear()
     runner.revalidate("REQ-001", phase=0, receipt=receipt)
 
     assert receipt.issuer == "github-actions-api"
     assert receipt.run_id == "github-actions-42-attempt-1"
     assert receipt.source_url == "https://github.com/owner/repo/actions/runs/42"
+    assert requests == [
+        "https://api.github.com/repos/owner/repo/actions/runs/42",
+        "https://api.github.com/repos/owner/repo/actions/runs/42/attempts/1/jobs?per_page=100&page=1",
+    ]
 
 
 def test_github_suite_rejects_missing_required_job(tmp_path: Path) -> None:

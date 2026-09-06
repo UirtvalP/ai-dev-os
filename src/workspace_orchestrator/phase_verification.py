@@ -113,22 +113,17 @@ class PhaseVerificationRunner:
         phase: int,
         receipt: VerificationReceipt,
     ) -> None:
-        """Live-check a stored receipt without minting replacement evidence."""
+        """重新核验已存 Receipt；仅远端 CI 需要再次查询外部事实。"""
 
-        normalized = requirement_id.upper()
-        commit_sha = self.gates.git.head_sha()
-        if not self.gates.git.is_clean():
-            raise PhaseGateError("Gate 签发重验前工作树必须干净")
-        if receipt.requirement_id != normalized or receipt.commit_sha != commit_sha:
-            raise PhaseGateError("Verification Receipt 未绑定当前 Requirement exact SHA")
-        suite = self.gates.verification_suite(
-            normalized, phase, receipt.suite_id, revision=commit_sha
+        suite = self.validate_stored_receipt(
+            requirement_id, phase=phase, receipt=receipt
         )
-        self._require_static_binding(receipt, suite)
+        commit_sha = self.gates.git.head_sha()
         if suite.kind == "command":
-            if receipt.environment != self._local_environment() or receipt.source_url is not None:
-                raise PhaseGateError("本地 Verification Receipt 环境或来源不匹配")
-            self._execute_commands(suite)
+            # 本地 command Receipt 已由不可变内容指纹、exact SHA、干净工作树、
+            # suite/issuer/argv/status 和环境身份绑定。签 Gate 时不把同一冻结
+            # suite 再跑一次；这不是新的 PASS，也不会写 replacement Receipt。
+            pass
         elif suite.kind == "github-actions":
             match = re.fullmatch(
                 r"github-actions-([1-9][0-9]*)-attempt-([1-9][0-9]*)",
@@ -162,6 +157,32 @@ class PhaseVerificationRunner:
             raise PhaseGateError(f"不支持 Verification Suite kind={suite.kind}")
         if self.gates.git.head_sha() != commit_sha or not self.gates.git.is_clean():
             raise PhaseGateError("Gate 签发重验期间 HEAD 或工作树发生变化")
+
+    def validate_stored_receipt(
+        self,
+        requirement_id: str,
+        *,
+        phase: int,
+        receipt: VerificationReceipt,
+    ) -> VerificationSuiteDefinition:
+        """校验存储 Receipt 的本地元数据绑定，不执行命令也不查询 CI。"""
+
+        normalized = requirement_id.upper()
+        commit_sha = self.gates.git.head_sha()
+        if not self.gates.git.is_clean():
+            raise PhaseGateError("Gate 签发重验前工作树必须干净")
+        if receipt.requirement_id != normalized or receipt.commit_sha != commit_sha:
+            raise PhaseGateError("Verification Receipt 未绑定当前 Requirement exact SHA")
+        suite = self.gates.verification_suite(
+            normalized, phase, receipt.suite_id, revision=commit_sha
+        )
+        self._require_static_binding(receipt, suite)
+        if (
+            suite.kind == "command"
+            and (receipt.environment != self._local_environment() or receipt.source_url is not None)
+        ):
+            raise PhaseGateError("本地 Verification Receipt 环境或来源不匹配")
+        return suite
 
     @staticmethod
     def _local_environment() -> str:
