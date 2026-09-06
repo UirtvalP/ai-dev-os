@@ -304,9 +304,7 @@ def _candidate_path_entry_safe(candidate_user: str, entry: str) -> bool:
          "-writable", "-print", "-quit"],
         capture_output=True, check=False, timeout=30, shell=False,
     )
-    if writable_file.returncode != 0:
-        raise ValueError(f"candidate PATH 文件权限无法验证：{entry}")
-    return not writable_file.stdout.strip()
+    return writable_file.returncode == 0 and not writable_file.stdout.strip()
 
 
 def _verify_candidate_path(candidate_user: str, entries: list[str]) -> None:
