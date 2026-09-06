@@ -22,6 +22,9 @@ from .phase_gate import (
 from .workspace import now_iso
 
 JsonReader = Callable[[str], Mapping[str, object]]
+StructuredRunner = Callable[
+    [str, int, VerificationSuiteDefinition, str, str], VerificationReceipt
+]
 COMMAND_TIMEOUT_SECONDS = 900
 
 
@@ -71,9 +74,16 @@ def _timestamp(value: object, label: str) -> str:
 class PhaseVerificationRunner:
     """Executes only suites committed in the exact-HEAD GateDefinition."""
 
-    def __init__(self, gates: GateStore, *, json_reader: JsonReader = _read_github_json) -> None:
+    def __init__(
+        self,
+        gates: GateStore,
+        *,
+        json_reader: JsonReader = _read_github_json,
+        structured_runner: StructuredRunner | None = None,
+    ) -> None:
         self.gates = gates
         self.json_reader = json_reader
+        self.structured_runner = structured_runner
 
     def run(
         self,
@@ -91,7 +101,17 @@ class PhaseVerificationRunner:
         suite = self.gates.verification_suite(
             requirement_id, phase, suite_id, revision=commit_sha
         )
-        if suite.kind == "command":
+        if phase >= 4:
+            if self.structured_runner is None:
+                raise PhaseGateError("Phase 4+ 缺少结构化 Verification Provider")
+            receipt = self.structured_runner(
+                requirement_id.upper(), phase, suite, session_id, commit_sha
+            )
+            self._require_structured_authority(
+                requirement_id.upper(), phase=phase, commit_sha=commit_sha,
+                receipt=receipt, suite=suite,
+            )
+        elif suite.kind == "command":
             receipt = self._run_commands(
                 requirement_id.upper(), commit_sha, suite, session_id
             )
@@ -113,7 +133,7 @@ class PhaseVerificationRunner:
         phase: int,
         receipt: VerificationReceipt,
     ) -> None:
-        """重新核验已存 Receipt；仅远端 CI 需要再次查询外部事实。"""
+        """重新核验已存 Receipt；远端 CI/OIDC 证据会再次查询外部事实。"""
 
         suite = self.validate_stored_receipt(
             requirement_id, phase=phase, receipt=receipt
@@ -124,10 +144,17 @@ class PhaseVerificationRunner:
             # suite/issuer/argv/status 和环境身份绑定。签 Gate 时不把同一冻结
             # suite 再跑一次；这不是新的 PASS，也不会写 replacement Receipt。
             pass
-        elif suite.kind == "github-actions":
+        elif suite.kind == "github-actions" or (
+            suite.kind == "github-attestation" and suite.execution_kind == "github-actions"
+        ):
+            structured_run_id = (
+                receipt.structured_receipt.get("run_id")
+                if receipt.structured_receipt is not None
+                else receipt.run_id
+            )
             match = re.fullmatch(
                 r"github-actions-([1-9][0-9]*)-attempt-([1-9][0-9]*)",
-                receipt.run_id,
+                str(structured_run_id),
             )
             if match is None:
                 raise PhaseGateError("GitHub Verification Receipt 缺少可信 run ID/attempt")
@@ -143,16 +170,28 @@ class PhaseVerificationRunner:
                 expected_attempt=run_attempt,
             )
             expected = self._github_receipt_fields(suite, facts)
-            actual = (
-                receipt.run_id,
-                receipt.environment,
-                receipt.started_at,
-                receipt.completed_at,
-                receipt.source_url,
-                receipt.summary,
-            )
-            if actual != expected:
+            if suite.kind == "github-actions":
+                actual = (
+                    receipt.run_id,
+                    receipt.environment,
+                    receipt.started_at,
+                    receipt.completed_at,
+                    receipt.source_url,
+                    receipt.summary,
+                )
+                matches_live = actual == expected
+            else:
+                matches_live = (
+                    receipt.run_id,
+                    receipt.started_at,
+                    receipt.completed_at,
+                ) == (expected[0], expected[2], expected[3])
+            if not matches_live:
                 raise PhaseGateError("GitHub Verification Receipt 与实时 API 事实不一致")
+        elif suite.kind == "github-attestation" and suite.execution_kind == "command":
+            # validate_stored_receipt already re-ran gh attestation verification and
+            # live attestor/candidate API checks. The protected workflow is not dispatched twice.
+            pass
         else:  # pragma: no cover - GateDefinition rejects this first.
             raise PhaseGateError(f"不支持 Verification Suite kind={suite.kind}")
         if self.gates.git.head_sha() != commit_sha or not self.gates.git.is_clean():
@@ -177,12 +216,107 @@ class PhaseVerificationRunner:
             normalized, phase, receipt.suite_id, revision=commit_sha
         )
         self._require_static_binding(receipt, suite)
+        if phase >= 4:
+            self._require_structured_authority(
+                normalized, phase=phase, commit_sha=commit_sha, receipt=receipt, suite=suite
+            )
         if (
             suite.kind == "command"
             and (receipt.environment != self._local_environment() or receipt.source_url is not None)
         ):
             raise PhaseGateError("本地 Verification Receipt 环境或来源不匹配")
         return suite
+
+    def _require_structured_authority(
+        self,
+        requirement_id: str,
+        *,
+        phase: int,
+        commit_sha: str,
+        receipt: VerificationReceipt,
+        suite: VerificationSuiteDefinition,
+    ) -> None:
+        """Phase 4+ only trusts an injected, externally protected attestation boundary."""
+
+        verifier = self.gates.structured_receipt_verifier
+        if verifier is None:
+            raise PhaseGateError("Phase 4+ 缺少受保护 Verification Receipt 验签器")
+        if (
+            receipt.structured_receipt is None
+            or receipt.signed_envelope is None
+            or receipt.verification_plan is None
+        ):
+            raise PhaseGateError("Phase 4+ 必须提供结构化、签名 Verification Receipt")
+        plan = receipt.verification_plan
+        expected_plan = {
+            "requirement_id": requirement_id,
+            "phase": phase,
+            "candidate_sha": commit_sha,
+        }
+        if any(plan.get(name) != value for name, value in expected_plan.items()):
+            raise PhaseGateError("结构化 Verification Plan 未绑定当前 Phase exact SHA")
+        payload = receipt.signed_envelope.get("payload")
+        if not isinstance(payload, Mapping) or dict(payload) != dict(receipt.structured_receipt):
+            raise PhaseGateError("签名 envelope payload 与结构化 Receipt 不一致")
+        try:
+            verified = verifier(
+                receipt.signed_envelope,
+                plan,
+                receipt.run_id,
+                receipt.attempt,
+            )
+        except Exception as exc:
+            raise PhaseGateError(f"结构化 Verification Receipt 验签失败：{exc}") from exc
+        if dict(verified) != dict(receipt.structured_receipt):
+            raise PhaseGateError("验签器返回的结构化 Receipt 与持久证据不一致")
+        plan_suites = plan.get("suites")
+        results = verified.get("results")
+        if not isinstance(plan_suites, list) or not isinstance(results, list):
+            raise PhaseGateError("结构化 Receipt 必须精确证明当前外层 Suite")
+        if any(not isinstance(item, Mapping) for item in (*plan_suites, *results)):
+            raise PhaseGateError("结构化 Receipt 必须精确证明当前外层 Suite")
+        try:
+            if suite.execution_kind == "command":
+                decoded_command = json.loads(receipt.command)
+                if not isinstance(decoded_command, list):
+                    raise TypeError
+                expected_commands = tuple(tuple(item) for item in decoded_command)
+            else:
+                expected_commands = ((
+                    "github-actions", str(suite.repository), str(suite.workflow),
+                    str(suite.required_event), *suite.required_jobs,
+                ),)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PhaseGateError("外层 Verification Receipt command 无效") from exc
+        expected_ids = tuple(
+            receipt.suite_id if len(expected_commands) == 1 else f"{receipt.suite_id}::{index}"
+            for index in range(1, len(expected_commands) + 1)
+        )
+        plan_ids = tuple(str(item.get("suite_id") or "") for item in plan_suites)
+        result_ids = tuple(str(item.get("suite_id") or "") for item in results)
+        plan_commands = tuple(tuple(item.get("argv", ())) for item in plan_suites)
+        if (
+            verified.get("receipt_id") != receipt.receipt_id
+            or verified.get("provider_id") != receipt.issuer
+            or plan_ids != expected_ids
+            or result_ids != expected_ids
+            or plan_commands != expected_commands
+            or suite.fingerprint != receipt.suite_fingerprint
+            or suite.command_summary != receipt.command
+            or suite.expected_issuer != receipt.issuer
+        ):
+            raise PhaseGateError("签名 Receipt 未精确绑定外层 suite/command/issuer/receipt_id")
+        if (
+            verified.get("requirement_id") != requirement_id
+            or verified.get("phase") != phase
+            or verified.get("candidate_sha") != commit_sha
+            or verified.get("run_id") != receipt.run_id
+            or verified.get("attempt") != receipt.attempt
+            or verified.get("started_at") != receipt.started_at
+            or verified.get("completed_at") != receipt.completed_at
+            or verified.get("result") != "PASS"
+        ):
+            raise PhaseGateError("结构化 Verification Receipt 上下文或结果无效")
 
     @staticmethod
     def _local_environment() -> str:

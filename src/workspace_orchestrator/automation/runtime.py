@@ -85,10 +85,57 @@ class AutomationRuntime:
         store: WorkspaceStore,
         agent_provider: AgentProvider,
         task_provider: TaskProvider | None = None,
+        phase_gates: GateStore | None = None,
     ) -> None:
         self.store = store
         self.agent_provider = agent_provider
         self._task_provider = task_provider
+        self._phase_gates = phase_gates
+
+    def _phase_review_evidence(
+        self, requirement_id: str,
+    ) -> tuple[int | None, tuple[dict[str, Any], ...] | None]:
+        gates = self._phase_gates or GateStore(self.store)
+        if not gates.is_required(requirement_id):
+            return None, None
+        meta = self.store.load(requirement_id)["meta"]
+        current_task = meta.get("requirement_task_id")
+        definition = next(
+            (item for item in gates.definitions(requirement_id) if item.task_id == current_task),
+            None,
+        )
+        if definition is None or definition.phase < 4:
+            return definition.phase if definition is not None else None, None
+        receipt_dir = self.store.path_for(requirement_id) / "verification-receipts"
+        receipts = []
+        for path in sorted(receipt_dir.glob("*.json")) if receipt_dir.is_dir() else ():
+            receipt = gates.read_verification_receipt(requirement_id, path.stem)
+            if receipt.commit_sha != gates.git.head_sha():
+                continue
+            try:
+                from workspace_orchestrator.phase_verification import PhaseVerificationRunner
+
+                suite = PhaseVerificationRunner(gates).validate_stored_receipt(
+                    requirement_id, phase=definition.phase, receipt=receipt,
+                )
+            except PhaseGateError:
+                continue
+            if suite.suite_id in {item.suite_id for item in definition.verification_suites}:
+                assert receipt.structured_receipt is not None
+                receipts.append(dict(receipt.structured_receipt))
+        observed: set[str] = set()
+        for structured in receipts:
+            raw_results = structured.get("results")
+            if isinstance(raw_results, list):
+                observed.update(
+                    str(result.get("suite_id", "")).split("::", 1)[0]
+                    for result in raw_results
+                    if isinstance(result, dict)
+                )
+        expected = {item.suite_id for item in definition.verification_suites}
+        if observed != expected:
+            raise WorkspaceError("Phase 4+ Review 缺少完整、已验签的结构化 Receipt")
+        return definition.phase, tuple(receipts)
 
     def _provider(self, requirement_id: str) -> TaskProvider | None:
         if self._task_provider is not None:
@@ -137,7 +184,11 @@ class AutomationRuntime:
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
         )
-        return build_review_packet(self.store, requirement_id, tasks=tasks, git=git).fingerprint
+        phase, receipts = self._phase_review_evidence(requirement_id)
+        return build_review_packet(
+            self.store, requirement_id, tasks=tasks, git=git,
+            phase=phase, structured_receipts=receipts,
+        ).fingerprint
 
     def sync_reviews(self, requirement_id: str | None = None) -> tuple[str, ...]:
         """同步所有待审查结果和离线待补偿状态，不创建或完成 Review 卡。"""
@@ -666,7 +717,11 @@ class AutomationRuntime:
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
         )
-        packet = build_review_packet(self.store, requirement_id, tasks=tasks, git=git)
+        phase, receipts = self._phase_review_evidence(requirement_id)
+        packet = build_review_packet(
+            self.store, requirement_id, tasks=tasks, git=git,
+            phase=phase, structured_receipts=receipts,
+        )
         blockers = validate_review_packet(packet, git_error=git.get("error"))
         if blockers:
             return blockers, None
@@ -705,8 +760,10 @@ class AutomationRuntime:
                     dict(self.store.load(requirement_id)["meta"].get("git") or {}),
                     execution_root=self.store.working_root,
                 )
+                refreshed_phase, refreshed_receipts = self._phase_review_evidence(requirement_id)
                 refreshed = build_review_packet(
-                    self.store, requirement_id, tasks=refreshed_tasks, git=refreshed_git
+                    self.store, requirement_id, tasks=refreshed_tasks, git=refreshed_git,
+                    phase=refreshed_phase, structured_receipts=refreshed_receipts,
                 )
                 if refreshed_error or refreshed.fingerprint != packet.fingerprint:
                     return ("Review Packet 发布期间审查证据发生变化，请重试",), None

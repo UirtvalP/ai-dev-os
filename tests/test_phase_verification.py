@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,14 +51,14 @@ class FakeGit:
         )
 
 
-def _gates(tmp_path: Path, suite: dict[str, object]) -> GateStore:
+def _gates(tmp_path: Path, suite: dict[str, object], *, phase: int = 0) -> GateStore:
     workspace = WorkspaceStore(tmp_path)
     requirement_id = workspace.create("Verification", task_provider=None)
-    definition_path = GateStore.definition_path(requirement_id, 0)
+    definition_path = GateStore.definition_path(requirement_id, phase)
     definition = {
         "schema_version": 1,
         "requirement_id": requirement_id,
-        "phase": 0,
+        "phase": phase,
         "task_id": "TASK-1",
         "next_task_id": None,
         "plan_source_path": "plan.md",
@@ -211,6 +212,183 @@ def test_gate_issue_local_command_receipt_does_not_rerun_suite(
     )
 
     assert record.verification_receipt_refs == (receipt.receipt_id,)
+
+
+def test_phase4_structured_receipt_fails_closed_without_authority(tmp_path: Path) -> None:
+    gates = _gates(
+        tmp_path,
+        {"id": "local", "kind": "command", "commands": [["python", "-V"]]},
+    )
+    payload = {
+        "requirement_id": "REQ-001",
+        "phase": 4,
+        "candidate_sha": SHA,
+        "run_id": "run-1",
+        "attempt": 1,
+        "result": "PASS",
+    }
+    receipt = VerificationReceipt(
+        "receipt-1", "REQ-001", SHA, "local", "a" * 64,
+        "workspace-command-runner", "run-1", "implementer", "command", "env",
+        now_iso(), now_iso(), 0, "PASS", "ok",
+        structured_receipt=payload,
+        signed_envelope={"payload": payload, "signature": "signed"},
+        verification_plan={"requirement_id": "REQ-001", "phase": 4, "candidate_sha": SHA},
+    )
+
+    with pytest.raises(PhaseGateError, match="缺少受保护"):
+        PhaseVerificationRunner(gates)._require_structured_authority(
+            "REQ-001", phase=4, commit_sha=SHA, receipt=receipt,
+            suite=gates.verification_suite("REQ-001", 0, "local", revision=SHA),
+        )
+
+
+def test_phase4_structured_receipt_uses_injected_authority(tmp_path: Path) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def verify(
+        envelope: Mapping[str, object],
+        plan: Mapping[str, object],
+        run_id: str,
+        attempt: int,
+    ) -> dict[str, object]:
+        calls.append((run_id, attempt))
+        assert envelope["signature"] == "signed"
+        assert plan["candidate_sha"] == SHA
+        payload = envelope["payload"]
+        assert isinstance(payload, Mapping)
+        return dict(payload)
+
+    gates = _gates(
+        tmp_path,
+        {"id": "local", "kind": "command", "commands": [["python", "-V"]]},
+    )
+    gates.structured_receipt_verifier = verify
+    suite = gates.verification_suite("REQ-001", 0, "local", revision=SHA)
+    receipt_started = now_iso()
+    receipt_completed = now_iso()
+    payload = {
+        "requirement_id": "REQ-001", "phase": 4, "candidate_sha": SHA,
+        "run_id": "run-1", "attempt": 2, "result": "PASS",
+        "receipt_id": "receipt-1", "provider_id": suite.expected_issuer,
+        "started_at": receipt_started,
+        "completed_at": receipt_completed,
+        "results": [{"suite_id": "local", "status": "PASS"}],
+    }
+    receipt = VerificationReceipt(
+        "receipt-1", "REQ-001", SHA, "local", suite.fingerprint,
+        suite.expected_issuer, "run-1", "implementer", suite.command_summary, "env",
+        receipt_started, receipt_completed, 0, "PASS", "ok",
+        structured_receipt=payload,
+        signed_envelope={"payload": payload, "signature": "signed"},
+        verification_plan={
+            "requirement_id": "REQ-001", "phase": 4, "candidate_sha": SHA,
+            "suites": [{"suite_id": "local", "argv": ["python", "-V"]}],
+        },
+        attempt=2,
+    )
+
+    PhaseVerificationRunner(gates)._require_structured_authority(
+        "REQ-001", phase=4, commit_sha=SHA, receipt=receipt, suite=suite
+    )
+    assert calls == [("run-1", 2)]
+
+    copied = VerificationReceipt.from_dict({**receipt.to_dict(), "receipt_id": "copied-receipt"})
+    with pytest.raises(PhaseGateError, match="未精确绑定外层"):
+        PhaseVerificationRunner(gates)._require_structured_authority(
+            "REQ-001", phase=4, commit_sha=SHA, receipt=copied, suite=suite
+        )
+
+
+def test_phase4_attestation_revalidate_verifies_signature_and_live_ci_without_redispatch(
+    tmp_path: Path,
+) -> None:
+    gates = _gates(
+        tmp_path,
+        {
+            "id": "ci",
+            "kind": "github-attestation",
+            "attested_kind": "github-actions",
+            "repository": "owner/repo",
+            "workflow": "ci.yml",
+            "required_event": "pull_request",
+            "required_jobs": ["linux", "windows"],
+        },
+        phase=4,
+    )
+    suite = gates.verification_suite("REQ-001", 4, "ci", revision=SHA)
+    started = "2026-09-05T01:00:00+00:00"
+    completed = "2026-09-05T01:05:00+00:00"
+    payload = {
+        "requirement_id": "REQ-001",
+        "phase": 4,
+        "candidate_sha": SHA,
+        "run_id": "github-actions-42-attempt-1",
+        "attempt": 1,
+        "result": "PASS",
+        "receipt_id": "ci-receipt",
+        "provider_id": "github-actions-api",
+        "started_at": started,
+        "completed_at": completed,
+        "results": [{"suite_id": "ci", "status": "PASS"}],
+    }
+    plan = {
+        "requirement_id": "REQ-001",
+        "phase": 4,
+        "candidate_sha": SHA,
+        "suites": [{
+            "suite_id": "ci",
+            "argv": ["github-actions", "owner/repo", "ci.yml", "pull_request", "linux", "windows"],
+        }],
+    }
+    receipt = VerificationReceipt(
+        "ci-receipt", "REQ-001", SHA, "ci", suite.fingerprint,
+        suite.expected_issuer, "github-actions-42-attempt-1", "implementer",
+        suite.command_summary, "GitHub Actions OIDC attestor", started, completed,
+        0, "PASS", "attested",
+        source_url="https://github.com/owner/repo/actions/runs/321",
+        structured_receipt=payload,
+        signed_envelope={"payload": payload, "signature": "signed"},
+        verification_plan=plan,
+    )
+    verifier_calls: list[tuple[str, int]] = []
+
+    def verify(
+        _envelope: Mapping[str, object], _plan: Mapping[str, object],
+        run_id: str, attempt: int,
+    ) -> Mapping[str, object]:
+        verifier_calls.append((run_id, attempt))
+        return payload
+
+    gates.structured_receipt_verifier = verify
+    run = {
+        "id": 42, "run_attempt": 1, "head_sha": SHA, "status": "completed",
+        "event": "pull_request", "conclusion": "success",
+        "path": ".github/workflows/ci.yml", "repository": {"full_name": "owner/repo"},
+        "jobs_url": "https://api.github.com/repos/owner/repo/actions/runs/42/jobs",
+        "html_url": "https://github.com/owner/repo/actions/runs/42",
+        "run_started_at": "2026-09-05T01:00:00Z", "updated_at": "2026-09-05T01:05:00Z",
+    }
+    requests: list[str] = []
+
+    def read(url: str) -> Mapping[str, object]:
+        requests.append(url)
+        if url.endswith("/actions/runs/42"):
+            return run
+        return {"total_count": 2, "jobs": [_job("linux", 101), _job("windows", 102)]}
+
+    runner = PhaseVerificationRunner(
+        gates,
+        json_reader=read,
+        structured_runner=lambda *_args: pytest.fail("revalidate 不得重新 dispatch workflow"),
+    )
+    runner.revalidate("REQ-001", phase=4, receipt=receipt)
+
+    assert verifier_calls == [("github-actions-42-attempt-1", 1)]
+    assert requests == [
+        "https://api.github.com/repos/owner/repo/actions/runs/42",
+        "https://api.github.com/repos/owner/repo/actions/runs/42/attempts/1/jobs?per_page=100&page=1",
+    ]
 
 
 def test_github_suite_imports_only_exact_sha_successful_required_jobs(

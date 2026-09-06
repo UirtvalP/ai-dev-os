@@ -14,6 +14,7 @@ from ..adapters.base import TaskProvider
 from ..automation.runtime import AutomationRuntime
 from ..orchestration.contracts import _sha, fingerprint
 from ..orchestration.store import OrchestrationStore
+from ..phase_gate import GateStore
 from ..review import require_current_review_packet, review_requirement
 from ..review_packet import build_review_packet, validate_review_packet
 from ..workspace import WorkspaceError, WorkspaceStore
@@ -28,10 +29,11 @@ class WorkspaceReviewAuthority:
 
     def __init__(
         self, workspace: WorkspaceStore, task_provider: TaskProvider | None,
-        *, clock: Callable[[], float] = time.time,
+        *, clock: Callable[[], float] = time.time, phase_gates: GateStore | None = None,
     ) -> None:
         self.workspace, self.provider, self.clock = workspace, task_provider, clock
         self.git = TrustedGit(workspace.project_root)
+        self.phase_gates = phase_gates
 
     def _git_context(self, snapshot: str, sha: str, tree: str) -> dict[str, Any]:
         _sha(sha, "candidate_sha")
@@ -60,7 +62,14 @@ class WorkspaceReviewAuthority:
             raise IntegrationError("review_rejected", "Requirement Review 未通过：" + "；".join(review.blockers))
         tasks = self.provider.list_tasks(requirement_id) if self.provider is not None else ()
         context = self._git_context(snapshot, sha, tree)
-        packet = build_review_packet(self.workspace, requirement_id, tasks=tasks, git=context)
+        packet_runtime = AutomationRuntime(
+            self.workspace, CodexAgentProvider(), self.provider, phase_gates=self.phase_gates,
+        )
+        phase, receipts = packet_runtime._phase_review_evidence(requirement_id)
+        packet = build_review_packet(
+            self.workspace, requirement_id, tasks=tasks, git=context,
+            phase=phase, structured_receipts=receipts,
+        )
         blockers = validate_review_packet(packet)
         if blockers:
             raise IntegrationError("review_rejected", "；".join(blockers))
@@ -77,7 +86,10 @@ class WorkspaceReviewAuthority:
             except WorkspaceError as exc:
                 if not publish:
                     raise IntegrationError("stale_review", str(exc)) from exc
-                runtime = AutomationRuntime(self.workspace, CodexAgentProvider(), self.provider)
+                runtime = AutomationRuntime(
+                    self.workspace, CodexAgentProvider(), self.provider,
+                    phase_gates=self.phase_gates,
+                )
                 errors, _ = runtime._publish_review_packet(
                     requirement_id, self.provider,
                     git_context=lambda: self._git_context(snapshot, sha, tree),

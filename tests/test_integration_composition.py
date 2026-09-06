@@ -21,6 +21,8 @@ from workspace_orchestrator.orchestration.contracts import (
     VerificationCommand,
 )
 from workspace_orchestrator.orchestration.store import OrchestrationStore
+from workspace_orchestrator.phase_gate import VerificationSuiteDefinition
+from workspace_orchestrator.verification_provider import VerificationProviderError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -95,6 +97,130 @@ def test_existing_verification_configuration_is_used_without_a_second_registry(p
     commands = composition.load_verification_commands(workspace)
     assert commands[0].command_id == "legacy-1" and commands[0].timeout_seconds == 12
     assert commands[0].argv[1:] == ("-m", "pytest")
+
+
+def test_phase4_authority_uses_fixed_os_location_and_fails_closed_when_missing(
+    project: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    workspace, _, _ = project
+    fixed = tmp_path / "protected" / "verification-authority"
+    monkeypatch.setattr(composition, "_authority_root", lambda: fixed)
+
+    with pytest.raises(WorkspaceError, match="policy|authority|不可用"):
+        composition.configured_phase_verification(workspace, phase=4)
+
+    legacy = composition.configured_phase_verification(workspace, phase=3)
+    assert legacy.gates.structured_receipt_verifier is None
+
+
+def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
+    project: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    workspace, _, _ = project
+    authority = tmp_path / "protected"
+    authority.mkdir()
+    (authority / "github-oidc-policy.json").write_text("{}", encoding="utf-8")
+    (authority / "policy.json").write_text("{}", encoding="utf-8")
+    (authority / "trust-store.json").write_text("{}", encoding="utf-8")
+    calls: list[tuple[str, int]] = []
+
+    class FakeVerifier:
+        def __init__(self, policy: object) -> None:
+            assert policy == "github-policy"
+
+        def verify(
+            self, envelope: object, plan: object, run_id: str, attempt: int,
+        ) -> dict[str, object]:
+            calls.append((run_id, attempt))
+            return {"source": "github", "envelope": envelope, "plan": plan}
+
+    class FakeClient:
+        def __init__(self, policy: object) -> None:
+            assert policy == "github-policy"
+
+        def execute(self, **kwargs: object) -> object:
+            assert kwargs == {
+                "suite_id": "p4-suite",
+                "candidate_sha": "1" * 40,
+                "execution_kind": "command",
+                "ci_workflow": None,
+                "ci_event": None,
+            }
+            payload = {
+                "receipt_id": "receipt-1",
+                "run_id": "github-attestation-321-attempt-1",
+                "attempt": 1,
+                "started_at": "2026-09-06T00:00:00+00:00",
+                "completed_at": "2026-09-06T00:01:00+00:00",
+            }
+            return SimpleNamespace(
+                receipt=SimpleNamespace(**payload, to_dict=lambda: payload),
+                plan=SimpleNamespace(to_dict=lambda: {"plan": True}),
+                envelope=SimpleNamespace(to_dict=lambda: {"payload": payload}),
+                attestor_run_id="321",
+                attestor_run_attempt=1,
+                source_url="https://github.com/owner/repo/actions/runs/321",
+            )
+
+    monkeypatch.setattr(composition, "_authority_root", lambda: authority)
+    monkeypatch.setattr(composition, "_require_protected_authority", lambda *_args: None)
+    monkeypatch.setattr(
+        composition.GitHubAttestationTrustPolicy,
+        "load",
+        classmethod(lambda _cls, *_args, **_kwargs: "github-policy"),
+    )
+    monkeypatch.setattr(composition, "GitHubAttestationVerifier", FakeVerifier)
+    monkeypatch.setattr(composition, "GitHubAttestorClient", FakeClient)
+    monkeypatch.setattr(
+        composition.AttestorPolicy,
+        "load",
+        classmethod(lambda *_args, **_kwargs: pytest.fail("不得降级到本地 policy")),
+    )
+
+    configured = composition.configured_phase_verification(workspace, phase=4)
+    verifier = configured.gates.structured_receipt_verifier
+    assert verifier is not None
+    assert verifier({"signed": True}, {"candidate": True}, "123", 2)["source"] == "github"
+    assert calls == [("123", 2)]
+    structured_runner = configured.runner.structured_runner
+    assert structured_runner is not None
+    suite = VerificationSuiteDefinition(
+        "p4-suite", "github-attestation", commands=(("python", "-V"),),
+        attested_kind="command",
+    )
+    outer = structured_runner("REQ-020", 4, suite, "session-1", "1" * 40)
+    assert outer.signed_envelope == {"payload": outer.structured_receipt}
+    assert outer.source_url == "https://github.com/owner/repo/actions/runs/321"
+
+
+def test_phase4_missing_gh_is_unavailable_and_never_falls_back_to_local_keys(
+    project: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    workspace, _, _ = project
+    authority = tmp_path / "protected"
+    authority.mkdir()
+    (authority / "github-oidc-policy.json").write_text("{}", encoding="utf-8")
+    (authority / "policy.json").write_text("{}", encoding="utf-8")
+    (authority / "trust-store.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(composition, "_authority_root", lambda: authority)
+    monkeypatch.setattr(composition, "_require_protected_authority", lambda *_args: None)
+    monkeypatch.setattr(
+        composition.GitHubAttestationTrustPolicy,
+        "load",
+        classmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            VerificationProviderError("attestor_unavailable", "GitHub CLI 不可用")
+        )),
+    )
+    monkeypatch.setattr(
+        composition.AttestorPolicy,
+        "load",
+        classmethod(lambda *_args, **_kwargs: pytest.fail("不得降级到本地 key")),
+    )
+
+    with pytest.raises(VerificationProviderError) as failure:
+        composition.configured_phase_verification(workspace, phase=4)
+    assert failure.value.code == "attestor_unavailable"
 
 
 def test_operator_command_contract_preserves_extensions_and_rejects_empty(project: Any, tmp_path: Path) -> None:

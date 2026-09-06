@@ -138,7 +138,14 @@ def test_v2_plan_and_complete_gate_definition_chain_are_one_contract() -> None:
             f"p{phase}-local-common-quality",
             f"p{phase}-github-ci-matrix",
         ]
-        assert [suite["kind"] for suite in suites] == ["command", "github-actions"]
+        expected_kinds = (
+            ["github-attestation", "github-attestation"]
+            if phase == 4
+            else ["command", "github-actions"]
+        )
+        assert [suite["kind"] for suite in suites] == expected_kinds
+        if phase == 4:
+            assert [suite["attested_kind"] for suite in suites] == ["command", "github-actions"]
         commands = suites[0]["commands"]
         for program, option in product(("ai-dev-os", "workspace"), ("--help", "--version")):
             assert [
@@ -177,9 +184,9 @@ def test_ci_matrix_job_names_and_installed_smokes_match_all_phase_gates() -> Non
     }
     for path in (root / ".ai-dev-os" / "gate-definitions" / "REQ-020").glob("phase-*.json"):
         definition = json.loads(path.read_text(encoding="utf-8"))
-        github_suite = next(
-            suite for suite in definition["verification_suites"] if suite["kind"] == "github-actions"
-        )
+        github_suite = next(suite for suite in definition["verification_suites"] if (
+            suite["kind"] == "github-actions" or suite.get("attested_kind") == "github-actions"
+        ))
         assert github_suite["workflow"] == "ci.yml"
         assert set(github_suite["required_jobs"]) == expected_jobs
     for program, option in product(("ai-dev-os", "workspace"), ("--help", "--version")):

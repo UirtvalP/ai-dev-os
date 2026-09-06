@@ -718,6 +718,84 @@ def test_review_packet_evidence_change_updates_revision(tmp_path: Path) -> None:
     assert "第二版证据" in tasks.get_task(second["requirement_review_task_id"]).description
 
 
+def test_phase4_review_packet_consumes_structured_receipt_not_markdown(tmp_path: Path) -> None:
+    store, requirement_id, tasks, _runtime = _reviewable_runtime(tmp_path)
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "verification.md",
+        "# 验证\n\n## misleading\n\n状态：FAIL\n\n- stale command\n",
+    )
+    receipt = {
+        "receipt_id": "receipt-1",
+        "run_id": "run-1",
+        "result": "PASS",
+        "results": [
+            {
+                "suite_id": "p4-unit",
+                "status": "PASS",
+                "stdout_preview": "42 passed",
+                "stderr_preview": "",
+            }
+        ],
+    }
+
+    packet = build_review_packet(
+        store,
+        requirement_id,
+        tasks=tasks.list_tasks(requirement_id),
+        git={"worktree": str(tmp_path)},
+        phase=4,
+        structured_receipts=[receipt],
+    )
+
+    assert packet.verification[0].name == "p4-unit"
+    assert packet.verification[0].commands[0] == "structured-receipt:receipt-1"
+    assert packet.verification[0].result == "42 passed"
+    assert "stale command" not in render_review_packet(packet, 1)
+
+
+def test_phase4_review_packet_rejects_missing_structured_receipt(tmp_path: Path) -> None:
+    store, requirement_id, _tasks, _runtime = _reviewable_runtime(tmp_path)
+
+    with pytest.raises(ValueError, match="缺少结构化"):
+        build_review_packet(store, requirement_id, phase=4)
+
+
+def test_runtime_phase4_publish_passes_structured_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    data = store.load(requirement_id)
+    store.write_text(
+        data["path"] / "verification.md",
+        "# 验证\n\n## stale\n\n状态：FAIL\n\n- markdown must not win\n",
+    )
+    store.write_text(
+        data["path"] / "state.md",
+        data["state"].replace("## 已完成\n\n无", "## 已完成\n\n- Phase 4 接线"),
+    )
+    receipt = {
+        "receipt_id": "receipt-runtime", "run_id": "run-runtime", "result": "PASS",
+        "results": [{"suite_id": "p4-unit", "status": "PASS", "stdout_preview": "PASS"}],
+    }
+    monkeypatch.setattr(
+        runtime, "_phase_review_evidence", lambda _requirement_id: (4, (receipt,)),
+    )
+
+    blockers, review_task = runtime._publish_review_packet(
+        requirement_id, tasks,
+        git_context=lambda: {
+            "worktree": str(tmp_path), "changed_files": ("phase4.py",),
+            "diff": "phase4 structured receipt wiring",
+        },
+    )
+
+    assert blockers == ()
+    assert review_task is not None
+    assert "structured-receipt:receipt-runtime" in review_task.description
+    assert "markdown must not win" not in review_task.description
+
+
 def test_review_packet_publish_failure_blocks_review_ready(tmp_path: Path) -> None:
     class OfflinePublishTasks(FakeTasks):
         def publish_review(self, task_id: str, content: str) -> Task:

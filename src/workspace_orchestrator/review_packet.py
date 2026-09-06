@@ -80,6 +80,8 @@ def build_review_packet(
     *,
     tasks: Sequence[Task] = (),
     git: dict[str, Any] | None = None,
+    phase: int | None = None,
+    structured_receipts: Sequence[dict[str, Any]] | None = None,
 ) -> ReviewPacket:
     data = store.load(requirement_id)
     requirement = markdown_sections(data["requirement"])
@@ -93,20 +95,56 @@ def build_review_packet(
         )
     )
     verification: list[ReviewVerification] = []
-    for name, body in verification_doc.items():
-        statuses = re.findall(r"(?im)^(?:Status|状态)[:：]\s*(\S+)", body)
-        commands = tuple(
-            line.removeprefix("- ").strip()
-            for line in body.splitlines()
-            if line.strip().startswith("- ")
-        )
-        results = re.findall(r"(?im)^(?:Result|结果)[:：]\s*(.+)$", body)
-        result = results[-1].strip() if results else "未记录结果摘要"
-        verification.append(
-            ReviewVerification(
-                name, commands, statuses[-1].upper() if statuses else "MISSING", result
+    if phase is not None and phase >= 4:
+        if not structured_receipts:
+            raise ValueError("Phase 4+ Review Packet 缺少结构化 Verification Receipt")
+        for receipt in structured_receipts:
+            if receipt.get("result") != "PASS" or not isinstance(receipt.get("results"), list):
+                raise ValueError("Phase 4+ Review Packet 收到未通过或无效的结构化 Receipt")
+            receipt_id = str(receipt.get("receipt_id") or "").strip()
+            run_id = str(receipt.get("run_id") or "").strip()
+            if not receipt_id or not run_id:
+                raise ValueError("Phase 4+ 结构化 Receipt 缺少 receipt_id/run_id")
+            for item in receipt["results"]:
+                if not isinstance(item, dict):
+                    raise TypeError("Phase 4+ 结构化 Receipt results 包含无效对象")
+                suite_id = str(item.get("suite_id") or "").strip()
+                status = str(item.get("status") or "MISSING").upper()
+                if not suite_id:
+                    raise ValueError("Phase 4+ 结构化 Receipt 缺少 suite_id")
+                summary = str(
+                    item.get("stderr_preview")
+                    or item.get("stdout_preview")
+                    or item.get("error_code")
+                    or "结构化结果已记录"
+                )
+                verification.append(
+                    ReviewVerification(
+                        suite_id,
+                        (
+                            f"structured-receipt:{receipt_id}",
+                            f"run:{run_id}",
+                            f"suite:{suite_id}",
+                        ),
+                        status,
+                        summary,
+                    )
+                )
+    else:
+        for name, body in verification_doc.items():
+            statuses = re.findall(r"(?im)^(?:Status|状态)[:：]\s*(\S+)", body)
+            commands = tuple(
+                line.removeprefix("- ").strip()
+                for line in body.splitlines()
+                if line.strip().startswith("- ")
             )
-        )
+            results = re.findall(r"(?im)^(?:Result|结果)[:：]\s*(.+)$", body)
+            result = results[-1].strip() if results else "未记录结果摘要"
+            verification.append(
+                ReviewVerification(
+                    name, commands, statuses[-1].upper() if statuses else "MISSING", result
+                )
+            )
     git = git or {}
     scope = _clean_items(bullets(requirement.get("Scope", "")))
     if not scope and requirement.get("Scope", "").strip():

@@ -5,11 +5,12 @@
   "task_id": "AID-173",
   "next_task_id": "AID-175",
   "plan_source_path": ".ai-dev-os/plans/REQ-020/phase-4.md",
-  "plan_source_fingerprint": "30f3e298c8de3ea906aca933e7c003952f55bf132f8713687795c20d0241479c",
+  "plan_source_fingerprint": "ff113c7aaf4b8747921c3fd466d095d86064df4812e258552647a4048f221acd",
   "verification_suites": [
     {
       "id": "p4-local-common-quality",
-      "kind": "command",
+      "kind": "github-attestation",
+      "attested_kind": "command",
       "commands": [
         ["uv", "build"],
         ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"],
@@ -25,7 +26,8 @@
     },
     {
       "id": "p4-github-ci-matrix",
-      "kind": "github-actions",
+      "kind": "github-attestation",
+      "attested_kind": "github-actions",
       "repository": "UirtvalP/ai-dev-os",
       "workflow": "ci.yml",
       "required_event": "pull_request",

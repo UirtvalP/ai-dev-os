@@ -7,7 +7,7 @@ import json
 import os
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -259,11 +259,13 @@ class VerificationReceipt:
     source_url: str | None = None
     schema_version: int = SCHEMA_VERSION
     _extra_fields_json: str = "{}"
+    structured_receipt: Mapping[str, object] | None = None
+    signed_envelope: Mapping[str, object] | None = None
+    verification_plan: Mapping[str, object] | None = None
+    attempt: int = 1
 
     def to_dict(self) -> dict[str, object]:
-        return _with_extra(
-            self._extra_fields_json,
-            {
+        payload: dict[str, object] = {
                 "schema_version": self.schema_version,
                 "receipt_id": self.receipt_id,
                 "requirement_id": self.requirement_id,
@@ -281,14 +283,42 @@ class VerificationReceipt:
                 "status": self.status,
                 "summary": self.summary,
                 "source_url": self.source_url,
-            },
-        )
+        }
+        if self.structured_receipt is not None:
+            payload["structured_receipt"] = dict(self.structured_receipt)
+        if self.signed_envelope is not None:
+            payload["signed_envelope"] = dict(self.signed_envelope)
+        if self.verification_plan is not None:
+            payload["verification_plan"] = dict(self.verification_plan)
+        if any(
+            value is not None
+            for value in (
+                self.structured_receipt,
+                self.signed_envelope,
+                self.verification_plan,
+            )
+        ) or self.attempt != 1:
+            payload["attempt"] = self.attempt
+        return _with_extra(self._extra_fields_json, payload)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> Self:
         exit_code = payload.get("exit_code")
         if isinstance(exit_code, bool) or not isinstance(exit_code, int):
             raise PhaseGateError("VerificationReceipt exit_code 必须是整数")
+        attempt = payload.get("attempt", 1)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise PhaseGateError("VerificationReceipt attempt 必须是正整数")
+        structured = payload.get("structured_receipt")
+        envelope = payload.get("signed_envelope")
+        plan = payload.get("verification_plan")
+        for value, label in (
+            (structured, "structured_receipt"),
+            (envelope, "signed_envelope"),
+            (plan, "verification_plan"),
+        ):
+            if value is not None and not isinstance(value, Mapping):
+                raise PhaseGateError(f"VerificationReceipt {label} 必须是 JSON 对象")
         return cls(
             receipt_id=_required_string(payload, "receipt_id"),
             requirement_id=_required_string(payload, "requirement_id"),
@@ -306,6 +336,10 @@ class VerificationReceipt:
             status=_required_string(payload, "status"),
             summary=_required_string(payload, "summary"),
             source_url=_optional_string(payload, "source_url"),
+            structured_receipt=dict(structured) if isinstance(structured, Mapping) else None,
+            signed_envelope=dict(envelope) if isinstance(envelope, Mapping) else None,
+            verification_plan=dict(plan) if isinstance(plan, Mapping) else None,
+            attempt=attempt,
             schema_version=_schema_version(payload),
             _extra_fields_json=_extra_json(
                 payload,
@@ -328,6 +362,10 @@ class VerificationReceipt:
                         "status",
                         "summary",
                         "source_url",
+                        "structured_receipt",
+                        "signed_envelope",
+                        "verification_plan",
+                        "attempt",
                     }
                 ),
             ),
@@ -345,6 +383,13 @@ class VerificationSuiteDefinition:
     workflow: str | None = None
     required_event: str | None = None
     required_jobs: tuple[str, ...] = ()
+    attested_kind: str | None = None
+
+    @property
+    def execution_kind(self) -> str:
+        """Return the suite contract executed inside the protected attestor."""
+
+        return self.attested_kind or self.kind
 
     @property
     def fingerprint(self) -> str:
@@ -352,15 +397,15 @@ class VerificationSuiteDefinition:
 
     @property
     def expected_issuer(self) -> str:
-        if self.kind == "command":
+        if self.execution_kind == "command":
             return "workspace-command-runner"
-        if self.kind == "github-actions":
+        if self.execution_kind == "github-actions":
             return "github-actions-api"
         raise PhaseGateError(f"不支持 Verification Suite kind={self.kind}")
 
     @property
     def command_summary(self) -> str:
-        if self.kind == "command":
+        if self.execution_kind == "command":
             return json.dumps(self.commands, ensure_ascii=False, separators=(",", ":"))
         return (
             f"github-actions:{self.repository}:{self.workflow}:{self.required_event}:"
@@ -372,9 +417,12 @@ class VerificationSuiteDefinition:
             "id": self.suite_id,
             "kind": self.kind,
         }
-        if self.kind == "command":
+        execution_kind = self.execution_kind
+        if self.kind == "github-attestation":
+            result["attested_kind"] = execution_kind
+        if execution_kind == "command":
             result["commands"] = [list(command) for command in self.commands]
-        elif self.kind == "github-actions":
+        elif execution_kind == "github-actions":
             result.update(
                 {
                     "repository": self.repository,
@@ -391,7 +439,12 @@ class VerificationSuiteDefinition:
         kind = _required_string(payload, "kind")
         if _RECEIPT_ID_PATTERN.fullmatch(suite_id) is None:
             raise PhaseGateError("Verification Suite ID 只能包含安全字符")
-        if kind == "command":
+        raw_execution_kind = payload.get("attested_kind") if kind == "github-attestation" else kind
+        if not isinstance(raw_execution_kind, str):
+            raise PhaseGateError("github-attestation Verification Suite 必须声明 attested_kind")
+        if kind == "github-attestation" and raw_execution_kind not in ("command", "github-actions"):
+            raise PhaseGateError("github-attestation attested_kind 不受支持")
+        if raw_execution_kind == "command":
             raw_commands = payload.get("commands")
             if not isinstance(raw_commands, list) or not raw_commands:
                 raise PhaseGateError("command Verification Suite 必须声明 commands")
@@ -404,8 +457,13 @@ class VerificationSuiteDefinition:
                 ):
                     raise PhaseGateError("Verification Suite command 必须是非空字符串数组")
                 commands.append(tuple(raw_command))
-            return cls(suite_id=suite_id, kind=kind, commands=tuple(commands))
-        if kind == "github-actions":
+            return cls(
+                suite_id=suite_id,
+                kind=kind,
+                commands=tuple(commands),
+                attested_kind=raw_execution_kind if kind == "github-attestation" else None,
+            )
+        if raw_execution_kind == "github-actions":
             required_jobs = _string_tuple(payload, "required_jobs")
             if not required_jobs:
                 raise PhaseGateError("github-actions Verification Suite 必须声明 required_jobs")
@@ -418,6 +476,7 @@ class VerificationSuiteDefinition:
                 workflow=_required_string(payload, "workflow"),
                 required_event=_required_string(payload, "required_event"),
                 required_jobs=required_jobs,
+                attested_kind=raw_execution_kind if kind == "github-attestation" else None,
             )
         raise PhaseGateError(f"不支持 Verification Suite kind={kind}")
 
@@ -899,9 +958,13 @@ class GateStore:
         self,
         workspace_store: WorkspaceStore,
         git: GitRevisionReader | None = None,
+        structured_receipt_verifier: Callable[
+            [Mapping[str, object], Mapping[str, object], str, int], Mapping[str, object]
+        ] | None = None,
     ) -> None:
         self.workspace_store = workspace_store
         self.git = git or LocalGitProvider(workspace_store.working_root)
+        self.structured_receipt_verifier = structured_receipt_verifier
 
     def path_for(self, requirement_id: str, phase: int) -> Path:
         if phase < 0:
@@ -1106,6 +1169,10 @@ class GateStore:
             raise PhaseGateError("GateDefinition Acceptance ID 重复：" + ", ".join(duplicates))
         if not definition.verification_suites:
             raise PhaseGateError("GateDefinition verification_suites 不能为空")
+        if definition.phase != 4 and any(
+            suite.kind == "github-attestation" for suite in definition.verification_suites
+        ):
+            raise PhaseGateError("github-attestation Verification Suite 仅允许 Phase 4 使用")
         suite_ids = [suite.suite_id for suite in definition.verification_suites]
         duplicate_suites = sorted(
             item for item, count in Counter(suite_ids).items() if count > 1
@@ -1806,9 +1873,19 @@ class GateStore:
                 raise PhaseGateError(
                     f"Verification Receipt {receipt.receipt_id} 未执行提交内声明的命令"
                 )
-            if suite.kind == "github-actions" and not receipt.source_url:
+            if suite.kind in ("github-actions", "github-attestation") and not receipt.source_url:
                 raise PhaseGateError(
                     f"Verification Receipt {receipt.receipt_id} 缺少 GitHub run URL"
+                )
+            if record.phase >= 4:
+                from .phase_verification import PhaseVerificationRunner
+
+                PhaseVerificationRunner(self)._require_structured_authority(
+                    record.requirement_id,
+                    phase=record.phase,
+                    commit_sha=record.commit_sha,
+                    receipt=receipt,
+                    suite=suite,
                 )
             observed_suites.add(suite.suite_id)
         missing_suites = sorted(set(suites) - observed_suites)

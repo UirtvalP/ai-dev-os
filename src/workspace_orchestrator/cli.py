@@ -16,12 +16,12 @@ from .automation.session_runtime import require_session_id
 from .automation.task_attach import configured_task_provider
 from .console import configure_standard_streams
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
+from .integration_composition import configured_phase_verification
 from .models import WorkflowComplexity
 from .phase_gate import (
     GateStore,
     PhaseTransitionGuard,
 )
-from .phase_verification import PhaseVerificationRunner
 from .workflow import route_workflow
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections
 
@@ -41,6 +41,26 @@ def _display_state(value: str) -> str:
     }
     label = labels.get(value)
     return f"{value}（{label}）" if label else value
+
+
+def _automation_runtime(
+    store: WorkspaceStore, agent_provider: CodexAgentProvider,
+    requirement_id: str | None = None,
+) -> AutomationRuntime:
+    requirement_id = (requirement_id or store.current_id()).upper()
+    gates = GateStore(store)
+    phase_gates = gates
+    if gates.is_required(requirement_id):
+        current_task = store.load(requirement_id)["meta"].get("requirement_task_id")
+        definition = next(
+            (item for item in gates.definitions(requirement_id) if item.task_id == current_task),
+            None,
+        )
+        if definition is not None:
+            phase_gates = configured_phase_verification(
+                store, phase=definition.phase,
+            ).gates
+    return AutomationRuntime(store, agent_provider, phase_gates=phase_gates)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _status(store: WorkspaceStore, requirement_id: str) -> str:
-    sync_messages = AutomationRuntime(store, CodexAgentProvider()).sync_reviews(requirement_id)
+    sync_messages = _automation_runtime(
+        store, CodexAgentProvider(), requirement_id,
+    ).sync_reviews(requirement_id)
     data = store.load(requirement_id)
     meta = data["meta"]
     state = markdown_sections(data["state"])
@@ -259,7 +281,7 @@ def run(args: argparse.Namespace) -> str:
             )
         else:
             requirement_id = store.create(args.title, **create_options)
-        visibility = AutomationRuntime(store, agent_provider).sync_taskboard_visibility()
+        visibility = _automation_runtime(store, agent_provider).sync_taskboard_visibility()
         suffix = "\n面板同步待重试：" + "；".join(visibility) if visibility else ""
         return f"已创建 {requirement_id}{suffix}"
     if args.command == "current":
@@ -300,17 +322,21 @@ def run(args: argparse.Namespace) -> str:
     if args.command == "cancel":
         return json.dumps(request_cancel(store, args.task_id), ensure_ascii=False, indent=2)
     if args.command == "phase":
-        gates = GateStore(store)
         if args.phase_command == "reopen":
-            journal = gates.reopen(
+            journal = GateStore(store).reopen(
                 args.requirement_id,
                 args.phase,
                 reason=args.reason,
                 session_id=require_session_id(agent_provider),
             )
             return json.dumps(journal, ensure_ascii=False, indent=2)
+        selected_phase = (
+            args.completed_phase if args.phase_command == "advance" else args.phase
+        )
+        phase_verification = configured_phase_verification(store, phase=selected_phase)
+        gates = phase_verification.gates
         if args.phase_command == "run-verification":
-            receipt = PhaseVerificationRunner(gates).run(
+            receipt = phase_verification.runner.run(
                 args.requirement_id,
                 phase=args.phase,
                 suite_id=args.suite,
@@ -382,7 +408,7 @@ def run(args: argparse.Namespace) -> str:
         )
         return f"已交接 {args.requirement_id.upper()}"
     if args.command == "finalize":
-        finalize_result = AutomationRuntime(store, agent_provider).finalize(
+        finalize_result = _automation_runtime(store, agent_provider, args.requirement_id).finalize(
             args.requirement_id,
             completed=args.completed,
             current_state=args.current_state,
@@ -410,7 +436,9 @@ def run(args: argparse.Namespace) -> str:
             f"{finalize_result.verification}"
         )
     if args.command == "review":
-        review_result = AutomationRuntime(store, agent_provider).review(args.requirement_id)
+        review_result = _automation_runtime(
+            store, agent_provider, args.requirement_id,
+        ).review(args.requirement_id)
         if review_result.passed:
             return (
                 f"意图审查：{review_result.intent_status}\n"
@@ -422,13 +450,13 @@ def run(args: argparse.Namespace) -> str:
             f"审查受阻：{args.requirement_id.upper()}\n{details}"
         )
     if args.command == "confirm":
-        AutomationRuntime(store, agent_provider).confirm(
+        _automation_runtime(store, agent_provider, args.requirement_id).confirm(
             args.requirement_id,
             user_confirmed=args.user_confirmed,
         )
         return f"用户已确认：{args.requirement_id.upper()} 已进入 done；外部 Task 未自动完成"
     if args.command == "request-changes":
-        AutomationRuntime(store, agent_provider).request_changes(
+        _automation_runtime(store, agent_provider, args.requirement_id).request_changes(
             args.requirement_id,
             feedback=args.feedback,
             next_action=args.next_action,
