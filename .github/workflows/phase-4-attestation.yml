@@ -1,0 +1,137 @@
+name: Phase 4 trusted attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Candidate commit to verify (40 lowercase hex characters)
+        required: true
+        type: string
+      suite_id:
+        description: Suite authorized by the trusted Phase 4 policy
+        required: true
+        type: choice
+        options:
+          - p4-local-common-quality
+          - p4-github-ci-matrix
+      ci_run_id:
+        description: Completed CI run ID (required for p4-github-ci-matrix)
+        required: false
+        type: string
+      ci_run_attempt:
+        description: Completed CI run attempt (required for p4-github-ci-matrix)
+        required: false
+        default: "1"
+        type: string
+
+concurrency:
+  group: phase-4-attestation-${{ inputs.candidate_sha }}-${{ inputs.suite_id }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Execute trusted Phase 4 runner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted attestor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate without executing its attestor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout identities
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          test "$(git -C trusted rev-parse HEAD)" = "$WORKFLOW_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.0"
+          enable-cache: false
+
+      - name: Execute trusted runner
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          SUITE_ID: ${{ inputs.suite_id }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ inputs.ci_run_attempt }}
+        run: |
+          args=(
+            --policy trusted/.github/phase-4-attestation-policy.json
+            --suite-id "$SUITE_ID"
+            --candidate-sha "$CANDIDATE_SHA"
+            --candidate-root candidate
+            --output phase4-output
+          )
+          if test -n "$CI_RUN_ID"; then
+            args+=(--ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT")
+          fi
+          python trusted/scripts/github_attestation_runner.py "${args[@]}"
+
+      - name: Upload unsigned execution facts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase4-execution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase4-output
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest verified Receipt
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download trusted execution facts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: phase4-execution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase4-output
+
+      - name: Attest exact Receipt bytes
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: phase4-output/phase4-receipt.json
+
+      - name: Preserve attestation bundle with the plan and envelope
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" phase4-output/phase4-attestation-bundle.json
+
+      - name: Upload attested Phase 4 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase4-attestation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase4-output
+          if-no-files-found: error
+          retention-days: 14

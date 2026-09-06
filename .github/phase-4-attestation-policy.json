@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "policy_id": "REQ-020-phase-4-github-oidc-v1",
+  "project_id": "ai-dev-os",
+  "requirement_id": "REQ-020",
+  "phase": 4,
+  "repository": "UirtvalP/ai-dev-os",
+  "workflow_path": ".github/workflows/phase-4-attestation.yml",
+  "workflow_ref": "refs/heads/main",
+  "external_authority": {
+    "config_filename": "github-oidc-policy.json",
+    "windows_path": "C:/ProgramData/ai-dev-os/verification-authority/github-oidc-policy.json",
+    "posix_path": "/etc/ai-dev-os/verification-authority/github-oidc-policy.json",
+    "required_pins": [
+      "repository",
+      "workflow_path",
+      "workflow_ref",
+      "workflow_sha256",
+      "runner_path",
+      "runner_sha256",
+      "attestor_policy_path",
+      "attestor_policy_fingerprint",
+      "action_sha",
+      "gh_path",
+      "gh_sha256"
+    ],
+    "pinned_values": {
+      "workflow_sha256": "484575da688a8708cddc51d6043d4011ed96ef69d81fed34cdb172a4798d5cb4",
+      "runner_sha256": "cc6d755be7742fe7c8979ac8ec148a5187ca219a673084628badc1a0e64bf0f7",
+      "action_sha": "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
+    },
+    "fallback": "forbidden"
+  },
+  "suites": {
+    "p4-local-common-quality": {
+      "kind": "command",
+      "provider_id": "workspace-command-runner",
+      "commands": [
+        {"suite_type": "custom", "argv": ["uv", "build"]},
+        {"suite_type": "e2e", "argv": ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--help"]},
+        {"suite_type": "e2e", "argv": ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--help"]},
+        {"suite_type": "e2e", "argv": ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "ai-dev-os", "--version"]},
+        {"suite_type": "e2e", "argv": ["uv", "tool", "run", "--no-cache", "--isolated", "--from", ".", "workspace", "--version"]},
+        {"suite_type": "unit", "argv": ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "pytest", "-q"]},
+        {"suite_type": "lint", "argv": ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "ruff", "check", "."]},
+        {"suite_type": "type", "argv": ["uv", "run", "--frozen", "--extra", "dev", "python", "-m", "mypy", "src"]},
+        {"suite_type": "custom", "argv": ["uv", "lock", "--check"]},
+        {"suite_type": "custom", "argv": ["git", "diff", "--check", "origin/main", "HEAD"]}
+      ]
+    },
+    "p4-github-ci-matrix": {
+      "kind": "github-actions",
+      "provider_id": "github-actions-api",
+      "repository": "UirtvalP/ai-dev-os",
+      "workflow": "ci.yml",
+      "required_event": "pull_request",
+      "required_jobs": [
+        "ubuntu-latest / Python 3.11",
+        "ubuntu-latest / Python 3.14",
+        "windows-latest / Python 3.11",
+        "windows-latest / Python 3.14"
+      ]
+    }
+  },
+  "policy_fingerprint": "240eab9bc47668693d8bfa6c8efae9147bfa156f39331f65fbad84a204be39e1"
+}
