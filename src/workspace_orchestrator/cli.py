@@ -281,7 +281,11 @@ def run(args: argparse.Namespace) -> str:
             )
         else:
             requirement_id = store.create(args.title, **create_options)
-        visibility = _automation_runtime(store, agent_provider).sync_taskboard_visibility()
+        visibility = (
+            ()
+            if args.no_task_provider
+            else _automation_runtime(store, agent_provider).sync_taskboard_visibility()
+        )
         suffix = "\n面板同步待重试：" + "；".join(visibility) if visibility else ""
         return f"已创建 {requirement_id}{suffix}"
     if args.command == "current":

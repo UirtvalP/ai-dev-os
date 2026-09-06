@@ -1,0 +1,3 @@
+.github/workflows/phase-4-attestation.yml text eol=lf
+.github/phase-4-attestation-policy.json text eol=lf
+scripts/github_attestation_runner.py text eol=lf
