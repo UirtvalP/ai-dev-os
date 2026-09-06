@@ -295,9 +295,16 @@ def test_candidate_path_freezes_command_from_writable_runner_directory(
         return CompletedProcess(command, 0, b"", b"")
 
     monkeypatch.setattr(runner.subprocess, "run", access_check)
-    monkeypatch.setattr(
-        runner, "_run_checked", lambda command, **_kwargs: CompletedProcess(command, 0, b"", b""),
-    )
+    def checked(command: list[str], **_kwargs: object) -> CompletedProcess[bytes]:
+        if command[:4] == [
+            "/usr/bin/sudo", "--non-interactive", "/bin/chown", "--recursive",
+        ]:
+            trusted_bin = temporary / "trusted-bin"
+            assert (trusted_bin.stat().st_mode & 0o222) == 0
+            assert all((item.stat().st_mode & 0o222) == 0 for item in trusted_bin.iterdir())
+        return CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(runner, "_run_checked", checked)
 
     result = runner._candidate_path(
         "phase4candidate1", os.pathsep.join((str(writable), str(system))),
