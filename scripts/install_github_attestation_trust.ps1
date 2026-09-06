@@ -8,20 +8,46 @@ if ($target -ne "C:\ProgramData\ai-dev-os\verification-authority") {
     throw "只允许安装到固定系统信任目录"
 }
 
-New-Item -ItemType Directory -Path $target -Force | Out-Null
-$workerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-& icacls.exe $target /remove:d $workerIdentity /T /C | Out-Null
-& icacls.exe $target /grant:r "BUILTIN\Administrators:(OI)(CI)F" /T /C | Out-Null
+if (Test-Path -LiteralPath $target) {
+    & "$env:SystemRoot\System32\takeown.exe" /F $target /A | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "无法取得系统信任目录所有权" }
+    foreach ($name in @("github-oidc-policy.json", "install-receipt.json")) {
+        $existing = Join-Path $target $name
+        if (Test-Path -LiteralPath $existing) {
+            & "$env:SystemRoot\System32\takeown.exe" /F $existing /A | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "无法取得系统信任文件所有权：$name" }
+        }
+    }
+} else {
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+}
+$adminSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+$maintenanceAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+$maintenanceAcl.SetAccessRuleProtection($true, $false)
+$maintenanceAcl.SetOwner($adminSid)
+$maintenanceAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "FullControl", "ContainerInherit,ObjectInherit", "None", $allow))
+Set-Acl -LiteralPath $target -AclObject $maintenanceAcl
+foreach ($name in @("github-oidc-policy.json", "install-receipt.json")) {
+    $existing = Join-Path $target $name
+    if (Test-Path -LiteralPath $existing) {
+        $fileMaintenanceAcl = [System.Security.AccessControl.FileSecurity]::new()
+        $fileMaintenanceAcl.SetAccessRuleProtection($true, $false)
+        $fileMaintenanceAcl.SetOwner($adminSid)
+        $fileMaintenanceAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "FullControl", $allow))
+        Set-Acl -LiteralPath $existing -AclObject $fileMaintenanceAcl
+    }
+}
 $policy = @{
     schema_version = 1
     repository = "UirtvalP/ai-dev-os"
     workflow_path = ".github/workflows/phase-4-attestation.yml"
     workflow_ref = "refs/heads/main"
-    workflow_sha256 = "97e9c3544076fdfe9ba092792ae8e7c4bb302903064026e654e43bf4e4639b4f"
+    workflow_sha256 = "3c3128467d36ccb9e1e74d4a2d5f884bcfa9203b30e515c42e5f3e5d248f07eb"
     runner_path = "scripts/github_attestation_runner.py"
-    runner_sha256 = "cc6d755be7742fe7c8979ac8ec148a5187ca219a673084628badc1a0e64bf0f7"
+    runner_sha256 = "80275f196c8e779351e8e5ac1f748acd2d28d1863c31d3754f26ec0491199f33"
     attestor_policy_path = ".github/phase-4-attestation-policy.json"
-    attestor_policy_fingerprint = "e28d6586071f7d613d6b0ecc99c03cefeb30fb369f6968ac9b9ea0ac369ad137"
+    attestor_policy_fingerprint = "9c2fc6810cb95764b01f3af0a378ce34cbc5a706e73d34d4981e1ba8a52787d2"
     action_sha = "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
     gh_path = "C:\Program Files\GitHub CLI\gh.exe"
     gh_sha256 = "2ae2b350c227a618f2d8965b1900aeee13446ff42e17ef0bd5a0b6405c593cfb"
@@ -42,9 +68,23 @@ $receipt = @{
     [System.Text.UTF8Encoding]::new($false)
 )
 
-& icacls.exe $target /inheritance:r | Out-Null
-& icacls.exe $target /setowner "BUILTIN\Administrators" /T /C | Out-Null
-& icacls.exe $target /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)RX" "BUILTIN\Users:(OI)(CI)RX" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "无法收紧系统信任目录 ACL"
+$systemSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")
+$usersSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-545")
+$inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$none = [System.Security.AccessControl.PropagationFlags]::None
+$directoryAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+$directoryAcl.SetAccessRuleProtection($true, $false)
+$directoryAcl.SetOwner($systemSid)
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($systemSid, "FullControl", $inherit, $none, $allow))
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "ReadAndExecute", $inherit, $none, $allow))
+$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($usersSid, "ReadAndExecute", $inherit, $none, $allow))
+Set-Acl -LiteralPath $target -AclObject $directoryAcl
+foreach ($path in @($policyPath, (Join-Path $target "install-receipt.json"))) {
+    $fileAcl = [System.Security.AccessControl.FileSecurity]::new()
+    $fileAcl.SetAccessRuleProtection($true, $false)
+    $fileAcl.SetOwner($systemSid)
+    $fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($systemSid, "FullControl", $allow))
+    $fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "ReadAndExecute", $allow))
+    $fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($usersSid, "ReadAndExecute", $allow))
+    Set-Acl -LiteralPath $path -AclObject $fileAcl
 }

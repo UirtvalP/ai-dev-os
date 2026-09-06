@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import subprocess
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -65,7 +66,9 @@ def _require_protected_authority(root: Path, *filenames: str) -> None:
         raise PhaseGateError("Phase 4+ 受保护 authority 配置不可用")
     if any(_worker_can_write(path) for path in paths):
         raise PhaseGateError("Phase 4+ authority 可被当前 Worker 写入，拒绝信任")
-    if os.name != "nt":
+    if os.name == "nt":
+        _require_windows_authority_acl(paths)
+    else:
         for path in paths:
             stat = path.stat()
             if stat.st_uid != 0 or stat.st_mode & 0o022:
@@ -88,6 +91,47 @@ def _worker_can_write(path: Path) -> bool:
         # Unknown access failures are not proof of a protected authority.
         return True
     return True
+
+
+def _require_windows_authority_acl(paths: tuple[Path, ...]) -> None:
+    powershell = Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    script_template = (
+        "$a=Get-Acl -LiteralPath '__PATH__';"
+        "$o=([System.Security.Principal.NTAccount]$a.Owner).Translate("
+        "[System.Security.Principal.SecurityIdentifier]).Value;"
+        "$r=@($a.Access|%{[pscustomobject]@{sid=$_.IdentityReference.Translate("
+        "[System.Security.Principal.SecurityIdentifier]).Value;type=$_.AccessControlType.ToString();"
+        "rights=[int64]$_.FileSystemRights;inherited=$_.IsInherited}});"
+        "[pscustomobject]@{owner=$o;protected=$a.AreAccessRulesProtected;rules=$r}|"
+        "ConvertTo-Json -Compress -Depth 4"
+    )
+    dangerous = 0x00010000 | 0x00040000 | 0x00080000 | 0x00000100 | 0x00000002
+    for path in paths:
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise PhaseGateError("Phase 4+ Windows authority 不得是 reparse point")
+        try:
+            script = script_template.replace("__PATH__", str(path).replace("'", "''"))
+            completed = subprocess.run(
+                [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, check=False, timeout=10,
+                env={"SystemRoot": "C:\\Windows"},
+            )
+            payload = json.loads(completed.stdout)
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            raise PhaseGateError("无法验证 Windows authority ACL") from exc
+        if completed.returncode != 0 or payload.get("owner") != "S-1-5-18" or not payload.get("protected"):
+            raise PhaseGateError("Windows authority owner/ACL 不受保护")
+        rules = payload.get("rules")
+        if not isinstance(rules, list) or not rules:
+            raise PhaseGateError("Windows authority ACL 规则不可用")
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get("inherited") or rule.get("type") != "Allow":
+                raise PhaseGateError("Windows authority ACL 含非预期规则")
+            sid, rights = rule.get("sid"), rule.get("rights")
+            if sid not in {"S-1-5-18", "S-1-5-32-544", "S-1-5-32-545"} or not isinstance(rights, int):
+                raise PhaseGateError("Windows authority ACL principal 不受信")
+            if sid != "S-1-5-18" and rights & dangerous:
+                raise PhaseGateError("Windows authority ACL 可被非 SYSTEM 修改")
 
 
 def _plan_from_mapping(payload: Mapping[str, object]) -> VerificationPlan:

@@ -162,6 +162,9 @@ def test_workflow_and_repository_policy_pin_trusted_attestor_contract() -> None:
     assert "ref: ${{ github.workflow_sha }}" in workflow
     assert "python trusted/scripts/github_attestation_runner.py" in workflow
     assert "candidate/scripts/github_attestation_runner.py" not in workflow
+    assert "sudo chown -R phase4candidate:phase4candidate candidate" in workflow
+    assert "chmod 700 phase4-output" in workflow
+    assert "--candidate-user phase4candidate" in workflow
     assert (
         "actions/attest-build-provenance@"
         "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
