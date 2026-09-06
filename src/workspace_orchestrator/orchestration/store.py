@@ -271,7 +271,15 @@ class OrchestrationStore:
             if self._read() != previous:
                 raise OrchestrationStoreError("Supervisor 状态在变更期间发生 revision 冲突")
             validate_lease(self._now(updated))
-            os.replace(temporary, self.root / "state.json")
+            target = self.root / "state.json"
+            for attempt in range(20):
+                try:
+                    os.replace(temporary, target)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
             if os.name != "nt":
                 descriptor = os.open(self.root, os.O_RDONLY)
                 try:

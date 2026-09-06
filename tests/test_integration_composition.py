@@ -368,7 +368,7 @@ def test_real_supervisor_git_verification_and_v1_review_compose_to_single_merge(
     workers = FakeWorkers(ledger, protected)
     port = FixtureCommandPort()
 
-    stable_wall = time.time() + 1.0
+    stable_wall = time.time()
     stable_monotonic = time.monotonic()
 
     def clock() -> float:
