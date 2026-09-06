@@ -109,9 +109,12 @@ def test_claude_exit_without_result_is_failure(tmp_path: Path) -> None:
     adapter = runtime("eof")
     try:
         opened = adapter.start(request(tmp_path))
-        assert opened.session and opened.turn_id
-        result = adapter.wait(opened.session, opened.turn_id, timeout_seconds=3)
-        assert result.returncode != 0 and result.error
+        assert opened.session
+        if opened.turn_id:
+            result = adapter.wait(opened.session, opened.turn_id, timeout_seconds=3)
+            assert result.returncode != 0 and result.error
+        else:
+            assert not opened.ok and opened.error and opened.error.code == "eof"
     finally:
         adapter.close()
 
