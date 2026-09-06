@@ -10,9 +10,8 @@ if ($target -ne "C:\ProgramData\ai-dev-os\verification-authority") {
 
 New-Item -ItemType Directory -Path $target -Force | Out-Null
 $workerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-# Remove the previous explicit deny while this elevated installer refreshes the
-# authority, then restore the deny after all files have been written.
 & icacls.exe $target /remove:d $workerIdentity /T /C | Out-Null
+& icacls.exe $target /grant:r "BUILTIN\Administrators:(OI)(CI)F" /T /C | Out-Null
 $policy = @{
     schema_version = 1
     repository = "UirtvalP/ai-dev-os"
@@ -45,8 +44,7 @@ $receipt = @{
 
 & icacls.exe $target /inheritance:r | Out-Null
 & icacls.exe $target /setowner "BUILTIN\Administrators" /T /C | Out-Null
-& icacls.exe $target /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "BUILTIN\Users:(OI)(CI)RX" /T /C | Out-Null
-& icacls.exe $target /deny "$workerIdentity`:(OI)(CI)W" /T /C | Out-Null
+& icacls.exe $target /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)RX" "BUILTIN\Users:(OI)(CI)RX" /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "无法收紧系统信任目录 ACL"
 }
