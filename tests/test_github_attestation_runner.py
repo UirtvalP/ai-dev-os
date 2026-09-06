@@ -254,6 +254,7 @@ def test_candidate_path_drops_missing_entries_and_keeps_verified_directories(
     tool = existing / "tool"
     tool.write_bytes(b"tool")
     tool.chmod(0o755)
+    (tmp_path / "trusted-bin").mkdir(mode=0o700)
     missing = tmp_path / "future-tools"
     monkeypatch.setattr(
         runner.subprocess, "run",
