@@ -301,7 +301,9 @@ def test_concurrent_port_instances_serialize_complete_ledger_transactions(tmp_pa
     with ThreadPoolExecutor(2) as pool:
         jobs = [pool.submit(increment, port) for port in (first, second)]
         for job in jobs:
-            job.result(timeout=10)
+            # 文件锁本身允许争用 10 秒；额外预留调度时间，避免高负载 Windows CI
+            # 让测试等待期限与锁期限相互竞速。
+            job.result(timeout=30)
     assert first.store.snapshot()["data"]["count"] == 24
 
 
