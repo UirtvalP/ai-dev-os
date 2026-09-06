@@ -682,6 +682,14 @@ def build_receipt(
     suite = suites[suite_id]
     if not isinstance(suite, dict):
         raise TypeError("suite policy 无效")
+    declared_phase = suite.get("phase")
+    suite_phase = declared_phase if declared_phase is not None else policy.get("phase")
+    if (
+        type(suite_phase) is not int
+        or suite_phase < 4
+        or declared_phase is not None and not suite_id.startswith(f"p{suite_phase}-")
+    ):
+        raise ValueError("suite phase 与 suite ID 不匹配")
     contract = _suite_contract(suite_id, suite)
     environment = {
         "runner_environment": "github-hosted",
@@ -691,7 +699,7 @@ def build_receipt(
     plan: dict[str, object] = {
         "project_id": policy["project_id"],
         "requirement_id": policy["requirement_id"],
-        "phase": policy["phase"],
+        "phase": suite_phase,
         "candidate_sha": candidate_sha,
         "candidate_tree": candidate_tree_sha,
         "policy_fingerprint": policy["policy_fingerprint"],
@@ -737,7 +745,7 @@ def build_receipt(
         "receipt_id": f"{suite_id}-{receipt_run_id}",
         "project_id": policy["project_id"],
         "requirement_id": policy["requirement_id"],
-        "phase": policy["phase"],
+        "phase": suite_phase,
         "candidate_sha": candidate_sha,
         "candidate_tree": candidate_tree_sha,
         "plan_fingerprint": fingerprint(plan),

@@ -15,6 +15,10 @@ on:
         options:
           - p4-local-common-quality
           - p4-github-ci-matrix
+          - p5-local-common-quality
+          - p5-github-ci-matrix
+          - p6-local-common-quality
+          - p6-github-ci-matrix
       request_id:
         description: Unique caller request identity used to locate exactly one run
         required: true
