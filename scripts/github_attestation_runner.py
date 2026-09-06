@@ -288,23 +288,31 @@ def _candidate_identity(candidate_user: str) -> tuple[str, str, str]:
     return uid, gid, group
 
 
+def _candidate_path_entry_safe(candidate_user: str, entry: str) -> bool:
+    writable = subprocess.run(
+        ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
+         "/usr/bin/test", "-w", entry],
+        capture_output=True, check=False, timeout=10, shell=False,
+    )
+    if writable.returncode == 0:
+        return False
+    if writable.returncode != 1:
+        raise ValueError(f"candidate PATH 目录无法验证：{entry}")
+    writable_file = subprocess.run(
+        ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
+         "/usr/bin/find", "-L", entry, "-maxdepth", "1", "-type", "f",
+         "-writable", "-print", "-quit"],
+        capture_output=True, check=False, timeout=30, shell=False,
+    )
+    if writable_file.returncode != 0:
+        raise ValueError(f"candidate PATH 文件权限无法验证：{entry}")
+    return not writable_file.stdout.strip()
+
+
 def _verify_candidate_path(candidate_user: str, entries: list[str]) -> None:
     for entry in entries:
-        writable = subprocess.run(
-            ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
-             "/usr/bin/test", "-w", entry],
-            capture_output=True, check=False, timeout=10, shell=False,
-        )
-        if writable.returncode != 1:
-            raise ValueError(f"candidate PATH 目录可写或无法验证：{entry}")
-        writable_file = subprocess.run(
-            ["/usr/bin/sudo", "--non-interactive", "--user", candidate_user, "--",
-             "/usr/bin/find", "-L", entry, "-maxdepth", "1", "-type", "f",
-             "-writable", "-print", "-quit"],
-            capture_output=True, check=False, timeout=30, shell=False,
-        )
-        if writable_file.returncode != 0 or writable_file.stdout.strip():
-            raise ValueError(f"candidate PATH 包含可写文件或无法验证：{entry}")
+        if not _candidate_path_entry_safe(candidate_user, entry):
+            raise ValueError(f"candidate PATH 目录或文件可写：{entry}")
 
 
 def _candidate_path(
@@ -316,7 +324,9 @@ def _candidate_path(
     existing = [entry for entry in entries if Path(entry).is_dir()]
     if not existing:
         raise ValueError("candidate PATH 不包含现存目录")
-    _verify_candidate_path(candidate_user, existing)
+    verified = [
+        entry for entry in existing if _candidate_path_entry_safe(candidate_user, entry)
+    ]
     trusted_bin: Path | None = None
     for command_name in dict.fromkeys(command_names):
         if Path(command_name).name != command_name:
@@ -351,8 +361,8 @@ def _candidate_path(
             raise ValueError("candidate command 冻结校验失败")
     if trusted_bin is not None:
         trusted_bin.chmod(0o555)
-        existing.insert(0, str(trusted_bin))
-    return os.pathsep.join(existing)
+        verified.insert(0, str(trusted_bin))
+    return os.pathsep.join(verified)
 
 
 def _verify_canonical_checkout(root: Path, candidate_sha: str) -> None:
