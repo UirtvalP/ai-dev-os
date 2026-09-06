@@ -317,8 +317,10 @@ def test_phase4_attestation_revalidate_verifies_signature_and_live_ci_without_re
         phase=4,
     )
     suite = gates.verification_suite("REQ-001", 4, "ci", revision=SHA)
-    started = "2026-09-05T01:00:00+00:00"
-    completed = "2026-09-05T01:05:00+00:00"
+    # Signed attestors may preserve GitHub's RFC 3339 ``Z`` spelling while the
+    # live reader canonicalizes the same instant to ``+00:00``.
+    started = "2026-09-05T01:00:00Z"
+    completed = "2026-09-05T01:05:00Z"
     payload = {
         "requirement_id": "REQ-001",
         "phase": 4,

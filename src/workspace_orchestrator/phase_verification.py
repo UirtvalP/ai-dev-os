@@ -174,8 +174,8 @@ class PhaseVerificationRunner:
                 actual = (
                     receipt.run_id,
                     receipt.environment,
-                    receipt.started_at,
-                    receipt.completed_at,
+                    _timestamp(receipt.started_at, "Receipt started_at"),
+                    _timestamp(receipt.completed_at, "Receipt completed_at"),
                     receipt.source_url,
                     receipt.summary,
                 )
@@ -183,8 +183,8 @@ class PhaseVerificationRunner:
             else:
                 matches_live = (
                     receipt.run_id,
-                    receipt.started_at,
-                    receipt.completed_at,
+                    _timestamp(receipt.started_at, "Receipt started_at"),
+                    _timestamp(receipt.completed_at, "Receipt completed_at"),
                 ) == (expected[0], expected[2], expected[3])
             if not matches_live:
                 raise PhaseGateError("GitHub Verification Receipt 与实时 API 事实不一致")
