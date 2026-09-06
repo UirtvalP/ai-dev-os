@@ -80,7 +80,7 @@ class FakeGh:
             "headBranch": "main",
             "status": "in_progress",
             "conclusion": None,
-            "url": "https://github.com/owner/repo/actions/runs/321",
+            "url": "https://github.com/owner/repo/actions/runs/321/attempts/2",
         }]
 
     def __call__(

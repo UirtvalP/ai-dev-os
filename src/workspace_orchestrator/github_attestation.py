@@ -433,7 +433,8 @@ class GitHubAttestorClient:
     ) -> str:
         observed_id, observed_attempt = self._run_identity(run)
         url = run.get("url")
-        expected_url = f"https://github.com/{self.policy.repository}/actions/runs/{run_id}"
+        base_url = f"https://github.com/{self.policy.repository}/actions/runs/{run_id}"
+        expected_urls = {base_url, f"{base_url}/attempts/{attempt}"}
         if (
             observed_id != run_id
             or observed_attempt != attempt
@@ -442,7 +443,7 @@ class GitHubAttestorClient:
             or run.get("headBranch") != "main"
             or run.get("status") != "completed"
             or run.get("conclusion") != "success"
-            or url != expected_url
+            or url not in expected_urls
         ):
             raise VerificationProviderError("stale_verification", "attestor run 最终事实不匹配")
         return url
