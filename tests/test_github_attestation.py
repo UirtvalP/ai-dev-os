@@ -6,11 +6,13 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Self
 from urllib.parse import unquote
 
 import pytest
 
 from scripts import github_attestation_runner as runner
+from workspace_orchestrator import github_attestation
 from workspace_orchestrator.github_attestation import (
     GitHubAttestationTrustPolicy,
     GitHubAttestationVerifier,
@@ -22,6 +24,37 @@ CANDIDATE_SHA = "1" * 40
 CANDIDATE_TREE = "2" * 40
 WORKFLOW_SHA = "3" * 40
 ACTION_SHA = "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
+
+
+def test_live_github_reader_uses_configured_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    class Response:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"status":"completed"}'
+
+    def open_request(request: object, *, timeout: int) -> Response:
+        captured.extend((request, timeout))
+        return Response()
+
+    monkeypatch.setenv("GITHUB_TOKEN", "authenticated-token")
+    monkeypatch.setattr(github_attestation, "urlopen", open_request)
+
+    assert github_attestation._read_github_json("https://api.github.com/example") == {
+        "status": "completed",
+    }
+    request = captured[0]
+    assert request.get_header("Authorization") == "Bearer authenticated-token"  # type: ignore[attr-defined]
+    assert captured[1] == 30
 
 
 def _repository_policy() -> tuple[dict[str, object], bytes]:

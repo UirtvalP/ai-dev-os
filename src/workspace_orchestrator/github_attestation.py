@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -44,13 +45,17 @@ class CommandRunner(Protocol):
 
 
 def _read_github_json(url: str) -> Mapping[str, object]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ai-dev-os-github-attestation",
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "ai-dev-os-github-attestation",
-        },
+        headers=headers,
     )
     with urlopen(request, timeout=30) as response:
         payload = json.loads(response.read())
