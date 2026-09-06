@@ -309,7 +309,9 @@ def test_candidate_path_excludes_readonly_directory_with_writable_file(
 ) -> None:
     tools = tmp_path / "tools"
     tools.mkdir()
-    (tools / "uv").write_bytes(b"mutable")
+    tool = tools / "uv"
+    tool.write_bytes(b"mutable")
+    tool.chmod(0o755)
 
     def access_check(command: list[str], **_kwargs: object) -> CompletedProcess[bytes]:
         if command[5] == "/usr/bin/test":
