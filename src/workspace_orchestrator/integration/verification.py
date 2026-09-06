@@ -1008,11 +1008,13 @@ environment 来自可信执行器，而不是候选配置中的环境变量。�
     def __init__(
         self, *, protected_roots: tuple[Path, ...], environment: dict[str, str] | None = None,
         readonly_tools: tuple[Path, ...] = (), command_port: VerificationCommandPort | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if not protected_roots:
             raise LegacyVerificationError("invalid_protection", "验证必须声明控制面保护根")
         self.protected_roots = tuple(_physical_path(path) for path in protected_roots)
         self.command_port = command_port or WindowsIsolatedCommandPort(readonly_tools=readonly_tools)
+        self.clock = clock
         actual = self.command_port.environment()
         self.environment = copy.deepcopy(actual if environment is None else environment)
         if self.environment != actual:
@@ -1314,7 +1316,7 @@ environment 来自可信执行器，而不是候选配置中的环境变量。�
         expected = (plan.candidate_sha, plan.candidate_tree)
         if self._candidate(git, workspace) != expected:
             raise LegacyVerificationError("stale_verification", "验证计划不是当前候选提交和 tree")
-        started_at = datetime.now(UTC).isoformat()
+        started_at = datetime.fromtimestamp(self.clock(), UTC).isoformat()
         run_id = f"verification-{uuid4().hex}"
         temporary_root = Path(tempfile.mkdtemp(prefix="ai-dev-os-verification-")).resolve()
         snapshot = temporary_root / "candidate"
@@ -1360,7 +1362,8 @@ environment 来自可信执行器，而不是候选配置中的环境变量。�
                 run_id, plan.plan_id, plan.requirement_id, plan.task_id,
                 plan.candidate_sha, plan.candidate_tree, copy.deepcopy(self.environment),
                 plan.commands_fingerprint, tuple(results), started_at,
-                datetime.now(UTC).isoformat(), self.provider_id, self.provider_version,
+                datetime.fromtimestamp(self.clock(), UTC).isoformat(),
+                self.provider_id, self.provider_version,
                 extra={
                     "commands": [command.to_dict() for command in plan.commands],
                     "execution_evidence": evidence,

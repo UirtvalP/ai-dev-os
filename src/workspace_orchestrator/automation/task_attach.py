@@ -209,6 +209,18 @@ def ensure_requirement_space_task(
                         requirement_space_closed=True,
                     )
                 return current
+            if current is not None and (
+                meta.get("requirement_space_task_id") != current.id
+                or meta.get("requirement_space_closed") is not False
+            ):
+                meta = store.touch_meta(
+                    requirement_id,
+                    requirement_space_task_id=current.id,
+                    requirement_space_closed=False,
+                )
+                desired = _requirement_space_task(
+                    store, requirement_id, title=expected_title,
+                )
             if current is None:
                 if meta.get("requirement_space_closed"):
                     return None

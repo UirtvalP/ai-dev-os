@@ -557,10 +557,16 @@ class WorkspaceStore:
 
     @staticmethod
     def read_json(path: Path) -> Any:
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise WorkspaceError(f"无法读取 {path}：{exc}") from exc
+        for attempt in range(20):
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except PermissionError as exc:
+                if attempt == 19:
+                    raise WorkspaceError(f"无法读取 {path}：{exc}") from exc
+                time.sleep(0.01 * (attempt + 1))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise WorkspaceError(f"无法读取 {path}：{exc}") from exc
+        raise AssertionError("unreachable")
 
     @staticmethod
     def write_json(path: Path, value: object) -> None:

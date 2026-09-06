@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -366,11 +367,20 @@ def test_real_supervisor_git_verification_and_v1_review_compose_to_single_merge(
     protected = (workspace.root, root)
     workers = FakeWorkers(ledger, protected)
     port = FixtureCommandPort()
-    verifier = LegacyVerificationAdapter(protected_roots=protected, command_port=port)
+
+    stable_wall = time.time() + 1.0
+    stable_monotonic = time.monotonic()
+
+    def clock() -> float:
+        return stable_wall + (time.monotonic() - stable_monotonic)
+
+    verifier = LegacyVerificationAdapter(
+        protected_roots=protected, command_port=port, clock=clock,
+    )
     controller = RequirementSupervisor(
         ledger, owner="integration-fixture", workers=workers, runtimes=lambda: (runtime(),),
         max_workers=2, protected_roots=protected, candidate_reader=workspaces.read_candidate,
-        verification_executor=verifier,
+        verification_executor=verifier, clock=clock,
     )
     controller.acquire()
     controller.initialize(prepared)
@@ -393,8 +403,9 @@ def test_real_supervisor_git_verification_and_v1_review_compose_to_single_merge(
     workspace.write_text(data["path"] / "verification.md", "## Verification\n\n- fixture\n\nStatus: PASS\n")
     service = IntegrationService(
         root, snapshot_reader=lambda req: ledger.snapshot(),
-        review_authority=WorkspaceReviewAuthority(workspace, None), verifier=verifier,
+        review_authority=WorkspaceReviewAuthority(workspace, None, clock=clock), verifier=verifier,
         workspace_provider=workspaces, preserved_roots=(workspace.root,),
+        clock=clock,
     )
     receipt = service.integrate(request.requirement_id, "one-merge", base, commands, verifier.environment)
     assert receipt.status == "merged"
