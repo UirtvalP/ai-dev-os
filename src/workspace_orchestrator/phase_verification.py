@@ -9,7 +9,7 @@ import re
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
@@ -172,8 +172,13 @@ class PhaseVerificationRunner:
             expected = self._github_receipt_fields(suite, facts)
             receipt_started = _timestamp(receipt.started_at, "Receipt started_at")
             receipt_completed = _timestamp(receipt.completed_at, "Receipt completed_at")
-            if datetime.fromisoformat(receipt_completed) < datetime.fromisoformat(receipt_started):
+            receipt_started_at = datetime.fromisoformat(receipt_started)
+            receipt_completed_at = datetime.fromisoformat(receipt_completed)
+            expected_completed_at = datetime.fromisoformat(expected[3])
+            if receipt_completed_at < receipt_started_at:
                 raise PhaseGateError("GitHub Verification Receipt 完成时间早于开始时间")
+            if abs(receipt_completed_at - expected_completed_at) > timedelta(seconds=1):
+                raise PhaseGateError("GitHub Verification Receipt 完成时间与实时 API 偏差超过 1 秒")
             if suite.kind == "github-actions":
                 actual = (
                     receipt.run_id,

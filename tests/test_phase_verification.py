@@ -394,6 +394,10 @@ def test_phase4_attestation_revalidate_verifies_signature_and_live_ci_without_re
         "https://api.github.com/repos/owner/repo/actions/runs/42/attempts/1/jobs?per_page=100&page=1",
     ]
 
+    run["updated_at"] = "2026-09-05T01:04:58Z"
+    with pytest.raises(PhaseGateError, match="完成时间与实时 API 偏差超过 1 秒"):
+        runner.revalidate("REQ-001", phase=4, receipt=receipt)
+
 
 def test_github_suite_imports_only_exact_sha_successful_required_jobs(
     tmp_path: Path,
