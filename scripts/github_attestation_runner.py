@@ -351,7 +351,9 @@ def _candidate_path(
             os.close(descriptor)
         if trusted_bin is None:
             trusted_bin = trusted_root / "trusted-bin"
-            trusted_bin.mkdir(mode=0o700)
+            trusted_bin.mkdir(mode=0o700, exist_ok=True)
+            if not trusted_bin.is_dir():
+                raise ValueError("trusted-bin 必须是目录")
         target = trusted_bin / command_name
         target.write_bytes(content)
         target.chmod(0o555)
@@ -535,6 +537,9 @@ def _execute_commands(
         try:
             trusted_tools = Path(tempfile.mkdtemp(prefix="phase4-tools-", dir=root.parent))
             trusted_tools.chmod(0o711)
+            # 在切换到隔离候选身份前创建唯一可写子目录；部分托管 Runner 会在
+            # useradd/sudo 身份探测后拒绝于 workspace 内新建子目录。
+            (trusted_tools / "trusted-bin").mkdir(mode=0o700)
             probe_user, probe_identity = _create_candidate_user(candidate_user, 0)
             commands = tuple(
                 str(suite["argv"][0]) for suite in contract
