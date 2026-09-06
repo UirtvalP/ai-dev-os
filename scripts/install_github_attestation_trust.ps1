@@ -56,6 +56,22 @@ $policy = @{
     gh_path = "C:\Program Files\GitHub CLI\gh.exe"
     gh_sha256 = "2ae2b350c227a618f2d8965b1900aeee13446ff42e17ef0bd5a0b6405c593cfb"
 }
+$historicalPolicies = @(
+    @{
+        schema_version = 1
+        repository = "UirtvalP/ai-dev-os"
+        workflow_path = ".github/workflows/phase-4-attestation.yml"
+        workflow_ref = "refs/heads/main"
+        workflow_sha256 = "c5883681616c6685e175aa7f694681093c46ce3918b0546a7eb2658c983a79c3"
+        runner_path = "scripts/github_attestation_runner.py"
+        runner_sha256 = "9df1aab2f90601144ac5d586eace68425565d2ef5b56ad14966713cffdfddfee"
+        attestor_policy_path = ".github/phase-4-attestation-policy.json"
+        attestor_policy_fingerprint = "6d4f4a1127e93bb3d35896fe7cca0eb98955b655a2331e7b9293913d640b39de"
+        action_sha = "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
+        gh_path = "C:\Program Files\GitHub CLI\gh.exe"
+        gh_sha256 = "2ae2b350c227a618f2d8965b1900aeee13446ff42e17ef0bd5a0b6405c593cfb"
+    }
+)
 $json = $policy | ConvertTo-Json -Depth 4
 $policyPath = Join-Path $target "github-oidc-policy.json"
 if (Test-Path -LiteralPath $policyPath) {
@@ -73,6 +89,15 @@ if (Test-Path -LiteralPath $policyPath) {
 }
 [System.IO.File]::WriteAllText($policyPath, $json + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false))
+foreach ($historicalPolicy in $historicalPolicies) {
+    $fingerprint = [string]$historicalPolicy.attestor_policy_fingerprint
+    $historyPath = Join-Path $target "github-oidc-policy-$fingerprint.json"
+    [System.IO.File]::WriteAllText(
+        $historyPath,
+        ($historicalPolicy | ConvertTo-Json -Depth 4) + [Environment]::NewLine,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
 
 $receipt = @{
     installed_at = [DateTimeOffset]::UtcNow.ToString("o")
