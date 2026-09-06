@@ -57,6 +57,17 @@ class CommandQueue:
         return tuple(DashboardCommand(**row) for row in self._read()
                      if row["session_id"] == session_id and row["status"] == "queued")
 
+    def history(
+        self, *, requirement_id: str | None = None, session_id: str | None = None,
+    ) -> tuple[DashboardCommand, ...]:
+        """按固定控制范围读取队列历史，不让 Dashboard 成为另一套事实源。"""
+
+        return tuple(
+            DashboardCommand(**row) for row in self._read()
+            if (requirement_id is None or row["requirement_id"] == requirement_id)
+            and (session_id is None or row["session_id"] == session_id)
+        )
+
     def update(self, command_id: str, status: CommandStatus, result: str = "") -> DashboardCommand:
         if status not in {"delivered", "completed", "failed", "cancelled"}:
             raise WorkspaceError("指令状态无效")

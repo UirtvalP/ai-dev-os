@@ -343,6 +343,23 @@ Windows LPAC；Linux 尚未接入同等后端时报告不可用，不降级为�
 人工退回留言继续由原 Hook 写回 Workspace 并补偿任务状态；它使旧审批失效，但不会
 直接篡改 Supervisor 的冻结计划或把旧候选重新视为已验收。
 
+## V2 远程 Dashboard（Phase 5 MVP）
+
+Dashboard 只监听本机回环地址，公网发布必须由 Cloudflare Tunnel 等安全隧道承担。首次启动会在
+`--token-file` 指定位置生成至少 32 字节的随机 token；浏览器页面本身不包含 token，所有状态与消息
+API 都要求 `Authorization: Bearer <token>`。远程 Runtime 固定使用 `read-only` sandbox，并拒绝审批，
+远端不能选择其他 Requirement、Session 或发送审批决定。
+
+```text
+ai-dev-os dashboard serve REQ-ID --new-session --root PROJECT --port 8765 --token-file TOKEN_FILE
+ai-dev-os dashboard serve REQ-ID --session CODEX_SESSION_ID --root PROJECT --port 8765 --token-file TOKEN_FILE
+cloudflared --config EMPTY_CONFIG tunnel --url http://127.0.0.1:8765 --protocol http2
+```
+
+若 PATH 中的 Codex CLI 旧于目标会话使用的模型，可在启动 Dashboard 前用 `AI_DEV_OS_CODEX` 指向当前
+Codex 可执行文件。两个命令以前台方式运行时分别按 `Ctrl+C` 即可停止；后台运行时应保存并终止各自
+PID。Quick Tunnel 域名是临时入口，长期入口应改用受管命名隧道，但仍不得把本机服务改为公网监听。
+
 合并前后保留 `MergeReceipt`，但 Phase 3 不签发 RequirementCompletionToken，也不会部署。
 `recovery_required` 表示尚未交付；main 已变更而 post-merge 失败时保留现场，不回滚或掩盖用户文件。
 ref 前崩溃且原子发布记录证明尚未发布时，`reconcile` 重新检查当前证据和 Review；

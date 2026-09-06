@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -77,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
     events.add_argument("--after", type=int, default=0, help="排他事件序号（默认：0）")
     events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
+    dashboard = commands.add_parser("dashboard", help="启动带认证的本机 Dashboard 控制面")
+    dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
+    serve = dashboard_commands.add_parser("serve", help="在回环地址启动远程控制入口")
+    serve.add_argument("requirement_id", help="固定 Requirement ID")
+    session_target = serve.add_mutually_exclusive_group(required=True)
+    session_target.add_argument("--session", help="固定 Codex Session ID")
+    session_target.add_argument("--new-session", action="store_true", help="创建专用 Codex Session")
+    serve.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
+    serve.add_argument("--host", default="127.0.0.1", help="只允许回环地址")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--token-file", type=Path, required=True, help="token 文件；不存在时自动生成")
+    serve.add_argument("--run-id", help="事件分片 ID；默认 remote-<session>")
     orchestration = commands.add_parser("orchestration", help="V2 单写者计划、执行与恢复控制面")
     orchestration_commands = orchestration.add_subparsers(dest="orchestration_command", required=True)
     for action, description in (
@@ -306,6 +319,24 @@ def run(args: argparse.Namespace) -> str:
             args.run_id, after=args.after, limit=args.limit
         )
         return json.dumps([item.to_dict() for item in events], ensure_ascii=False, indent=2)
+    if args.command == "dashboard":
+        from .remote_control import RemoteController, load_or_create_token, serve_remote_control
+
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        run_id = args.run_id or f"remote-{args.session or 'new-session'}"
+        token = load_or_create_token(args.token_file)
+        controller = RemoteController(
+            store, args.requirement_id, args.session, run_id=run_id,
+        )
+        print(json.dumps({
+            "status": "serving", "host": args.host, "port": args.port,
+            "requirement_id": args.requirement_id, "session_id": args.session,
+            "token_file": str(args.token_file.expanduser().resolve()),
+            "pid": os.getpid(), "safety": {"sandbox": "read-only", "approvals": "deny"},
+        }, ensure_ascii=False), flush=True)
+        serve_remote_control(controller, token=token, host=args.host, port=args.port)
+        return ""
     if args.command == "init":
         result = initialize_project(args.path)
         registry_message = _sync_registry_after_local_success(result.root, action="接入")
