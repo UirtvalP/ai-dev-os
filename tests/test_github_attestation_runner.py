@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 
@@ -94,6 +95,147 @@ def test_command_receipt_records_process_unavailable_as_error(tmp_path: Path) ->
     assert receipt["results"][0]["error_code"] == "process_unavailable"
 
 
+def test_isolated_commands_receive_fresh_candidate_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    copies = []
+    users = []
+
+    monkeypatch.setattr(runner, "_verify_canonical_checkout", lambda *_args: None)
+    def create_user(_prefix: str, index: int) -> tuple[str, tuple[str, str, str]]:
+        identity = (f"phase4candidate{index}", (str(998 + index), "999", "candidate"))
+        users.append(identity)
+        return identity
+
+    monkeypatch.setattr(runner, "_create_candidate_user", create_user)
+    monkeypatch.setattr(runner, "_validate_candidate_path", lambda *_args: None)
+
+    def fresh(*_args: object) -> tuple[Path, Path]:
+        temporary = tmp_path / f"copy-{len(copies)}"
+        work = temporary / "work"
+        work.mkdir(parents=True)
+        copies.append(work)
+        return temporary, work
+
+    def execute(
+        command: list[str], *, cwd: Path, **_kwargs: object,
+    ) -> CompletedProcess[bytes]:
+        assert command[:3] == ["/usr/bin/sudo", "--non-interactive", "--user"]
+        if len(copies) == 1:
+            (cwd / "poisoned").write_text("yes", encoding="utf-8")
+        else:
+            assert not (cwd / "poisoned").exists()
+        return CompletedProcess(command, 0, b"ok", b"")
+
+    monkeypatch.setattr(runner, "_fresh_candidate_copy", fresh)
+    monkeypatch.setattr(runner.subprocess, "run", execute)
+    monkeypatch.setattr(runner, "_terminate_candidate", lambda _uid: None)
+    monkeypatch.setattr(runner, "_remove_candidate_copy", lambda _path: None)
+    monkeypatch.setattr(runner, "_delete_candidate_user", lambda *_args: None)
+    contract = [
+        {"suite_id": f"suite::{index}", "suite_type": "unit", "argv": ["tool"],
+         "timeout_seconds": 10, "cwd": ".", "artifacts": []}
+        for index in (1, 2)
+    ]
+
+    results, *_ = runner._execute_commands(
+        contract, candidate, candidate_sha=SHA, candidate_user="phase4candidate",
+    )
+
+    assert [result["status"] for result in results] == ["PASS", "PASS"]
+    assert copies[0] != copies[1]
+    assert users[0][0] != users[1][0]
+    assert users[0][1][0] != users[1][1][0]
+
+
+def test_materialize_tree_copies_exact_blob_bytes_without_archive_transforms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    destination = tmp_path / "destination"
+    candidate.mkdir()
+    destination.mkdir()
+    content = b"$Format:%H$\n"
+    (candidate / "module.py").write_bytes(content)
+    blob = runner._git_blob_sha(content)
+
+    monkeypatch.setattr(
+        runner, "_run_checked",
+        lambda *_args, **_kwargs: CompletedProcess(
+            [], 0, f"100644 blob {blob}\tmodule.py\0".encode(), b"",
+        ),
+    )
+
+    runner._materialize_tree(candidate, SHA, destination)
+
+    assert (destination / "module.py").read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("record", "content"),
+    [
+        (f"100644 blob {'0' * 40}\tmodule.py\0".encode(), b"different\n"),
+        (f"120000 blob {'0' * 40}\tmodule.py\0".encode(), b"target\n"),
+        (f"160000 commit {'0' * 40}\tsubmodule\0".encode(), b""),
+    ],
+)
+def test_materialize_tree_rejects_blob_mismatch_links_and_gitlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: bytes, content: bytes,
+) -> None:
+    candidate = tmp_path / "candidate"
+    destination = tmp_path / "destination"
+    candidate.mkdir()
+    destination.mkdir()
+    (candidate / "module.py").write_bytes(content)
+    monkeypatch.setattr(
+        runner, "_run_checked",
+        lambda *_args, **_kwargs: CompletedProcess([], 0, record, b""),
+    )
+
+    with pytest.raises(ValueError):
+        runner._materialize_tree(candidate, SHA, destination)
+
+
+def test_isolated_command_fails_closed_when_candidate_process_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    work = tmp_path / "copy" / "work"
+    candidate.mkdir()
+    work.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_verify_canonical_checkout", lambda *_args: None)
+    monkeypatch.setattr(
+        runner, "_create_candidate_user",
+        lambda _prefix, _index: ("phase4candidate1", ("999", "999", "candidate")),
+    )
+    monkeypatch.setattr(runner, "_validate_candidate_path", lambda *_args: None)
+    monkeypatch.setattr(
+        runner, "_fresh_candidate_copy", lambda *_args: (work.parent, work),
+    )
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda command, **_kwargs: CompletedProcess(command, 0, b"", b""),
+    )
+    monkeypatch.setattr(
+        runner, "_terminate_candidate", lambda _uid: "candidate_process_survived",
+    )
+    monkeypatch.setattr(runner, "_remove_candidate_copy", lambda _path: None)
+    monkeypatch.setattr(runner, "_delete_candidate_user", lambda *_args: None)
+    contract = [{
+        "suite_id": "suite::1", "suite_type": "unit", "argv": ["tool"],
+        "timeout_seconds": 10, "cwd": ".", "artifacts": [],
+    }]
+
+    results, *_ = runner._execute_commands(
+        contract, candidate, candidate_sha=SHA, candidate_user="phase4candidate",
+    )
+
+    assert results[0]["status"] == "ERROR"
+    assert results[0]["error_code"] == "candidate_process_survived"
+
+
 def test_github_suite_requires_exact_completed_run_and_each_required_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -162,7 +304,8 @@ def test_workflow_and_repository_policy_pin_trusted_attestor_contract() -> None:
     assert "ref: ${{ github.workflow_sha }}" in workflow
     assert "python trusted/scripts/github_attestation_runner.py" in workflow
     assert "candidate/scripts/github_attestation_runner.py" not in workflow
-    assert "sudo chown -R phase4candidate:phase4candidate candidate" in workflow
+    assert "sudo useradd" not in workflow
+    assert "sudo chown -R phase4candidate:phase4candidate candidate" not in workflow
     assert "chmod 700 phase4-output" in workflow
     assert "--candidate-user phase4candidate" in workflow
     assert (
@@ -175,6 +318,9 @@ def test_workflow_and_repository_policy_pin_trusted_attestor_contract() -> None:
     pins = policy["external_authority"]["pinned_values"]
     assert pins["workflow_sha256"] == hashlib.sha256(workflow.encode()).hexdigest()
     runner_text = (root / "scripts/github_attestation_runner.py").read_text(encoding="utf-8")
+    assert "git archive" not in runner_text
+    assert '"ls-tree", "--recursive"' in runner_text
+    assert "_create_candidate_user" in runner_text
     assert pins["runner_sha256"] == hashlib.sha256(runner_text.encode()).hexdigest()
     installer = (root / "scripts/install_github_attestation_trust.ps1").read_text(
         encoding="utf-8",
