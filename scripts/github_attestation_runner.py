@@ -421,7 +421,8 @@ def _materialize_tree(candidate_root: Path, candidate_sha: str, destination: Pat
 def _fresh_candidate_copy(
     root: Path, candidate_sha: str, candidate_user: str, candidate_group: str,
 ) -> tuple[Path, Path]:
-    temporary = Path(tempfile.mkdtemp(prefix="phase4-command-", dir=root.parent))
+    # GitHub Workspace 挂载不会向动态创建的隔离 UID 授予可靠访问权限。
+    temporary = Path(tempfile.mkdtemp(prefix="phase4-command-"))
     temporary.chmod(0o711)
     work = temporary / "work"
     work.mkdir()
