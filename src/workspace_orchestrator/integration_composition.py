@@ -181,18 +181,39 @@ def configured_phase_verification(
     authority = _authority_root()
     github_policy_path = authority / "github-oidc-policy.json"
     if github_policy_path.exists():
-        _require_protected_authority(authority, "github-oidc-policy.json")
+        historical_paths = tuple(sorted(authority.glob("github-oidc-policy-*.json")))
+        _require_protected_authority(
+            authority,
+            "github-oidc-policy.json",
+            *(path.name for path in historical_paths),
+        )
         github_policy = GitHubAttestationTrustPolicy.load(
             github_policy_path, repository=workspace.project_root,
         )
-        github_verifier = GitHubAttestationVerifier(github_policy)
+        policies = (
+            github_policy,
+            *(
+                GitHubAttestationTrustPolicy.load(path, repository=workspace.project_root)
+                for path in historical_paths
+            ),
+        )
+        policies_by_fingerprint: dict[str, GitHubAttestationTrustPolicy] = {}
+        for candidate_policy in policies:
+            fingerprint = candidate_policy.attestor_policy_fingerprint
+            if fingerprint in policies_by_fingerprint:
+                raise PhaseGateError("GitHub OIDC authority 包含重复 policy fingerprint")
+            policies_by_fingerprint[fingerprint] = candidate_policy
         github_client = GitHubAttestorClient(github_policy)
 
         def verify_github(
             raw_envelope: Mapping[str, object], raw_plan: Mapping[str, object],
             run_id: str, attempt: int,
         ) -> dict[str, object]:
-            return dict(github_verifier.verify(raw_envelope, raw_plan, run_id, attempt))
+            fingerprint = raw_plan.get("policy_fingerprint")
+            if not isinstance(fingerprint, str) or fingerprint not in policies_by_fingerprint:
+                raise PhaseGateError("Verification Plan 未绑定受保护的当前或历史 GitHub policy")
+            verifier = GitHubAttestationVerifier(policies_by_fingerprint[fingerprint])
+            return dict(verifier.verify(raw_envelope, raw_plan, run_id, attempt))
 
         gates = GateStore(workspace, structured_receipt_verifier=verify_github)
 

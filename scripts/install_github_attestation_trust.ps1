@@ -11,7 +11,11 @@ if ($target -ne "C:\ProgramData\ai-dev-os\verification-authority") {
 if (Test-Path -LiteralPath $target) {
     & "$env:SystemRoot\System32\takeown.exe" /F $target /A | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "无法取得系统信任目录所有权" }
-    foreach ($name in @("github-oidc-policy.json", "install-receipt.json")) {
+    $managedNames = @("github-oidc-policy.json", "install-receipt.json") + @(
+        Get-ChildItem -LiteralPath $target -Filter "github-oidc-policy-*.json" -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Name }
+    )
+    foreach ($name in $managedNames) {
         $existing = Join-Path $target $name
         if (Test-Path -LiteralPath $existing) {
             & "$env:SystemRoot\System32\takeown.exe" /F $existing /A | Out-Null
@@ -28,7 +32,7 @@ $maintenanceAcl.SetAccessRuleProtection($true, $false)
 $maintenanceAcl.SetOwner($adminSid)
 $maintenanceAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "FullControl", "ContainerInherit,ObjectInherit", "None", $allow))
 Set-Acl -LiteralPath $target -AclObject $maintenanceAcl
-foreach ($name in @("github-oidc-policy.json", "install-receipt.json")) {
+foreach ($name in $managedNames) {
     $existing = Join-Path $target $name
     if (Test-Path -LiteralPath $existing) {
         $fileMaintenanceAcl = [System.Security.AccessControl.FileSecurity]::new()
@@ -54,6 +58,19 @@ $policy = @{
 }
 $json = $policy | ConvertTo-Json -Depth 4
 $policyPath = Join-Path $target "github-oidc-policy.json"
+if (Test-Path -LiteralPath $policyPath) {
+    $previous = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json
+    $previousFingerprint = [string]$previous.attestor_policy_fingerprint
+    if ($previousFingerprint -notmatch '^[a-f0-9]{64}$') {
+        throw "现有 GitHub OIDC policy fingerprint 无效，拒绝覆盖"
+    }
+    if ($previousFingerprint -ne $policy.attestor_policy_fingerprint) {
+        $historyPath = Join-Path $target "github-oidc-policy-$previousFingerprint.json"
+        if (-not (Test-Path -LiteralPath $historyPath)) {
+            Copy-Item -LiteralPath $policyPath -Destination $historyPath
+        }
+    }
+}
 [System.IO.File]::WriteAllText($policyPath, $json + [Environment]::NewLine,
     [System.Text.UTF8Encoding]::new($false))
 
@@ -79,7 +96,11 @@ $directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]
 $directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($adminSid, "ReadAndExecute", $inherit, $none, $allow))
 $directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($usersSid, "ReadAndExecute", $inherit, $none, $allow))
 Set-Acl -LiteralPath $target -AclObject $directoryAcl
-foreach ($path in @($policyPath, (Join-Path $target "install-receipt.json"))) {
+$protectedPaths = @($policyPath, (Join-Path $target "install-receipt.json")) + @(
+    Get-ChildItem -LiteralPath $target -Filter "github-oidc-policy-*.json" -File |
+        ForEach-Object { $_.FullName }
+)
+foreach ($path in $protectedPaths) {
     $fileAcl = [System.Security.AccessControl.FileSecurity]::new()
     $fileAcl.SetAccessRuleProtection($true, $false)
     $fileAcl.SetOwner($systemSid)

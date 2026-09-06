@@ -125,10 +125,11 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
     (authority / "policy.json").write_text("{}", encoding="utf-8")
     (authority / "trust-store.json").write_text("{}", encoding="utf-8")
     calls: list[tuple[str, int]] = []
+    policy = SimpleNamespace(attestor_policy_fingerprint="a" * 64)
 
     class FakeVerifier:
-        def __init__(self, policy: object) -> None:
-            assert policy == "github-policy"
+        def __init__(self, selected_policy: object) -> None:
+            assert selected_policy is policy
 
         def verify(
             self, envelope: object, plan: object, run_id: str, attempt: int,
@@ -137,8 +138,8 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
             return {"source": "github", "envelope": envelope, "plan": plan}
 
     class FakeClient:
-        def __init__(self, policy: object) -> None:
-            assert policy == "github-policy"
+        def __init__(self, selected_policy: object) -> None:
+            assert selected_policy is policy
 
         def execute(self, **kwargs: object) -> object:
             assert kwargs == {
@@ -170,7 +171,7 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
     monkeypatch.setattr(
         composition.GitHubAttestationTrustPolicy,
         "load",
-        classmethod(lambda _cls, *_args, **_kwargs: "github-policy"),
+        classmethod(lambda _cls, *_args, **_kwargs: policy),
     )
     monkeypatch.setattr(composition, "GitHubAttestationVerifier", FakeVerifier)
     monkeypatch.setattr(composition, "GitHubAttestorClient", FakeClient)
@@ -183,7 +184,9 @@ def test_phase4_prefers_github_oidc_policy_without_local_authority_fallback(
     configured = composition.configured_phase_verification(workspace, phase=4)
     verifier = configured.gates.structured_receipt_verifier
     assert verifier is not None
-    assert verifier({"signed": True}, {"candidate": True}, "123", 2)["source"] == "github"
+    assert verifier(
+        {"signed": True}, {"candidate": True, "policy_fingerprint": "a" * 64}, "123", 2,
+    )["source"] == "github"
     assert calls == [("123", 2)]
     structured_runner = configured.runner.structured_runner
     assert structured_runner is not None
