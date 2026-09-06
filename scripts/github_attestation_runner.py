@@ -360,13 +360,13 @@ def _candidate_path(
         if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(content).digest():
             raise ValueError("candidate command 冻结校验失败")
     if trusted_bin is not None:
+        for target in trusted_bin.iterdir():
+            target.chmod(0o555)
+        trusted_bin.chmod(0o555)
         _run_checked([
             "/usr/bin/sudo", "--non-interactive", "/bin/chown", "--recursive",
             "root:root", str(trusted_bin),
         ])
-        for target in trusted_bin.iterdir():
-            target.chmod(0o555)
-        trusted_bin.chmod(0o555)
         verified.insert(0, str(trusted_bin))
     return os.pathsep.join(verified)
 
