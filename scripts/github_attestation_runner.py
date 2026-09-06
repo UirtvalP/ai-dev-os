@@ -427,10 +427,11 @@ def _fresh_candidate_copy(
     work = temporary / "work"
     work.mkdir()
     _materialize_tree(root, candidate_sha, work)
-    (work / ".phase4-home").mkdir()
+    home = temporary / "home"
+    home.mkdir()
     _run_checked([
         "/usr/bin/sudo", "--non-interactive", "/bin/chown", "--recursive",
-        f"{candidate_user}:{candidate_group}", str(work),
+        f"{candidate_user}:{candidate_group}", str(work), str(home),
     ])
     return temporary, work
 
@@ -547,7 +548,7 @@ def _execute_commands(
             commands = tuple(
                 str(suite["argv"][0]) for suite in contract
                 if suite["argv"] != ["git", "diff", "--check", "origin/main", "HEAD"]
-            )
+            ) + ("git", "realpath", "dirname")
             isolated_path = _candidate_path(
                 probe_user, environment.get("PATH", ""),
                 command_names=commands, trusted_root=trusted_tools,
@@ -607,8 +608,8 @@ def _execute_commands(
                     command = [
                         "/usr/bin/sudo", "--non-interactive", "--user", active_user, "--",
                         "/usr/bin/env", "-i", f"PATH={isolated_path}",
-                        f"HOME={execution_root / '.phase4-home'}",
-                        f"TMPDIR={execution_root / '.phase4-home'}", *command,
+                        f"HOME={temporary / 'home'}",
+                        f"TMPDIR={temporary / 'home'}", *command,
                     ]
             completed = subprocess.run(
                 command,
