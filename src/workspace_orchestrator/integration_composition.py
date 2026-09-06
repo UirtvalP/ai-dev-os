@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -62,13 +63,31 @@ def _require_protected_authority(root: Path, *filenames: str) -> None:
     paths = (root, *(root / filename for filename in filenames))
     if any(not path.exists() for path in paths):
         raise PhaseGateError("Phase 4+ 受保护 authority 配置不可用")
-    if any(os.access(path, os.W_OK) for path in paths):
+    if any(_worker_can_write(path) for path in paths):
         raise PhaseGateError("Phase 4+ authority 可被当前 Worker 写入，拒绝信任")
     if os.name != "nt":
         for path in paths:
             stat = path.stat()
             if stat.st_uid != 0 or stat.st_mode & 0o022:
                 raise PhaseGateError("Phase 4+ authority owner/mode 不受保护")
+
+
+def _worker_can_write(path: Path) -> bool:
+    """Probe effective permissions; ``os.access`` does not honor Windows ACLs reliably."""
+
+    try:
+        if path.is_dir():
+            with tempfile.NamedTemporaryFile(dir=path, prefix=".authority-probe-"):
+                pass
+        else:
+            with path.open("r+b"):
+                pass
+    except PermissionError:
+        return False
+    except OSError:
+        # Unknown access failures are not proof of a protected authority.
+        return True
+    return True
 
 
 def _plan_from_mapping(payload: Mapping[str, object]) -> VerificationPlan:
