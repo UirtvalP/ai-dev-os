@@ -283,7 +283,7 @@ const token=document.getElementById('token'); token.value=sessionStorage.getItem
 function headers(){return {'Authorization':'Bearer '+token.value,'Content-Type':'application/json'}}
 async function request(path,opts={}){const r=await fetch(path,{...opts,headers:headers()});const j=await r.json();if(!r.ok)throw Error(j.error||j.result||r.status);return j}
 function textFromThread(thread){if(!thread)return '尚未建立 Runtime 连接';const turns=thread.turns||[];return turns.map(t=>JSON.stringify(t,null,2)).join('\n\n')||JSON.stringify(thread,null,2)}
-async function connect(){sessionStorage.setItem('ai-dev-os-token',token.value);try{const s=await request('/api/status');meta.textContent=s.requirement_id+' / '+s.session_id+' / '+(s.connected?'已连接':'等待首条消息');conversation.textContent=textFromThread(s.thread)+'\n\n事件：\n'+JSON.stringify(s.events,null,2)}catch(e){meta.textContent='连接失败：'+e.message}}
-async function sendMessage(){result.textContent='发送中…';try{const r=await request('/api/message',{method:'POST',body:JSON.stringify({message:message.value,command_id:crypto.randomUUID()})});result.textContent=r.result||r.status;await connect()}catch(e){result.textContent='失败：'+e.message}}
+async function connect(){sessionStorage.setItem('ai-dev-os-token',token.value);try{const s=await request('api/status');meta.textContent=s.requirement_id+' / '+s.session_id+' / '+(s.connected?'已连接':'等待首条消息');conversation.textContent=textFromThread(s.thread)+'\n\n事件：\n'+JSON.stringify(s.events,null,2)}catch(e){meta.textContent='连接失败：'+e.message}}
+async function sendMessage(){result.textContent='发送中…';try{const r=await request('api/message',{method:'POST',body:JSON.stringify({message:message.value,command_id:crypto.randomUUID()})});result.textContent=r.result||r.status;await connect()}catch(e){result.textContent='失败：'+e.message}}
 setInterval(()=>{if(token.value)connect()},5000);
 </script></body></html>"""

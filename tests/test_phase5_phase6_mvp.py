@@ -15,7 +15,11 @@ from workspace_orchestrator.deployment import (
     DeploymentService,
 )
 from workspace_orchestrator.integration.contracts import MergeReceipt
-from workspace_orchestrator.remote_control import RemoteController, load_or_create_token
+from workspace_orchestrator.remote_control import (
+    _DASHBOARD_HTML,
+    RemoteController,
+    load_or_create_token,
+)
 from workspace_orchestrator.workspace import WorkspaceStore
 
 
@@ -78,6 +82,12 @@ def test_dashboard_token_is_generated_and_reused(tmp_path: Path) -> None:
     first = load_or_create_token(token_path)
     assert len(first.encode()) >= 32
     assert load_or_create_token(token_path) == first
+
+
+def test_dashboard_browser_api_paths_support_reverse_proxy_prefix() -> None:
+    assert "request('api/status')" in _DASHBOARD_HTML
+    assert "request('api/message'" in _DASHBOARD_HTML
+    assert "request('/api/" not in _DASHBOARD_HTML
 
 
 def test_remote_controller_can_create_dedicated_session(tmp_path: Path) -> None:
