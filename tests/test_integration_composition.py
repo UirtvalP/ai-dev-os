@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import time
 from dataclasses import replace
@@ -363,16 +364,19 @@ def test_real_supervisor_git_verification_and_v1_review_compose_to_single_merge(
     native(root, "push", "origin", "main")
     prepared = composition.prepare_git_request(workspace, request, expected_main_sha=base)
     workspaces = composition.configured_git_workspaces(workspace)
-    ledger = orchestration_composition.control_store(workspace, request.requirement_id)
+    ticks = itertools.count()
+    clock_base = time.time()
+
+    def clock() -> float:
+        return clock_base + next(ticks) * 0.001
+
+    ledger = OrchestrationStore(
+        workspace.path_for(request.requirement_id) / "orchestration" / "supervisor",
+        clock=clock,
+    )
     protected = (workspace.root, root)
     workers = FakeWorkers(ledger, protected)
     port = FixtureCommandPort()
-
-    stable_wall = time.time()
-    stable_monotonic = time.monotonic()
-
-    def clock() -> float:
-        return stable_wall + (time.monotonic() - stable_monotonic)
 
     verifier = LegacyVerificationAdapter(
         protected_roots=protected, command_port=port, clock=clock,
@@ -393,7 +397,8 @@ def test_real_supervisor_git_verification_and_v1_review_compose_to_single_merge(
     commands = (VerificationCommand("check", ("fixture",)),)
     for task in prepared.tasks:
         controller.verify_task(task.task_id, commands, verifier.environment)
-    assert controller.status()["data"]["status"] == "ready_for_integration"
+    supervisor = controller.status()["data"]
+    assert supervisor["status"] == "ready_for_integration", supervisor
     controller.close()
 
     data = workspace.load(request.requirement_id)
