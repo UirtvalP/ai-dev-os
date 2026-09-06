@@ -1,4 +1,5 @@
 name: Phase 4 trusted attestation
+run-name: phase4-attestation-${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
@@ -14,6 +15,10 @@ on:
         options:
           - p4-local-common-quality
           - p4-github-ci-matrix
+      request_id:
+        description: Unique caller request identity used to locate exactly one run
+        required: true
+        type: string
       ci_run_id:
         description: Completed CI run ID (required for p4-github-ci-matrix)
         required: false
