@@ -110,7 +110,7 @@ def test_isolated_commands_receive_fresh_candidate_copies(
         return identity
 
     monkeypatch.setattr(runner, "_create_candidate_user", create_user)
-    monkeypatch.setattr(runner, "_validate_candidate_path", lambda *_args: None)
+    monkeypatch.setattr(runner, "_candidate_path", lambda *_args: os.environ.get("PATH", ""))
 
     def fresh(*_args: object) -> tuple[Path, Path]:
         temporary = tmp_path / f"copy-{len(copies)}"
@@ -210,7 +210,7 @@ def test_isolated_command_fails_closed_when_candidate_process_survives(
         runner, "_create_candidate_user",
         lambda _prefix, _index: ("phase4candidate1", ("999", "999", "candidate")),
     )
-    monkeypatch.setattr(runner, "_validate_candidate_path", lambda *_args: None)
+    monkeypatch.setattr(runner, "_candidate_path", lambda *_args: os.environ.get("PATH", ""))
     monkeypatch.setattr(
         runner, "_fresh_candidate_copy", lambda *_args: (work.parent, work),
     )
@@ -234,6 +234,24 @@ def test_isolated_command_fails_closed_when_candidate_process_survives(
 
     assert results[0]["status"] == "ERROR"
     assert results[0]["error_code"] == "candidate_process_survived"
+
+
+def test_candidate_path_drops_missing_entries_and_keeps_verified_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = tmp_path / "tools"
+    existing.mkdir()
+    missing = tmp_path / "future-tools"
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda command, **_kwargs: CompletedProcess(command, 1, b"", b""),
+    )
+
+    result = runner._candidate_path(
+        "phase4candidate1", os.pathsep.join((str(existing), str(missing))),
+    )
+
+    assert result == str(existing)
 
 
 def test_github_suite_requires_exact_completed_run_and_each_required_job(
