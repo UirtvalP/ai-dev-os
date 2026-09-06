@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -25,6 +26,11 @@ class DashboardCommand:
     message: str
     status: CommandStatus = "queued"
     result: str = ""
+    created_at: str = ""
+    delivered_at: str | None = None
+    completed_at: str | None = None
+    attempt: int = 1
+    retry_of: str | None = None
 
 
 class CommandQueue:
@@ -40,11 +46,15 @@ class CommandQueue:
             raise WorkspaceError("Requirement、Session 和指令不能为空")
         if len(message) > self.max_message_length:
             raise WorkspaceError("指令超过长度限制")
-        command = DashboardCommand(command_id or f"cmd-{uuid4().hex}", requirement_id,
-                                   session_id, message)
+        identifier = command_id or f"cmd-{uuid4().hex}"
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", identifier) is None:
+            raise WorkspaceError("command_id 必须是 1 至 128 位安全标识符")
+        command = DashboardCommand(
+            identifier, requirement_id, session_id, message, created_at=_now(),
+        )
         with _file_lock(self.path.with_suffix(".lock")):
             rows = self._read()
-            previous = next((DashboardCommand(**row) for row in rows
+            previous = next((_command(row) for row in rows
                              if row["command_id"] == command.command_id), None)
             if previous:
                 if previous.requirement_id != requirement_id or previous.session_id != session_id \
@@ -56,7 +66,7 @@ class CommandQueue:
         return command
 
     def pending(self, session_id: str) -> tuple[DashboardCommand, ...]:
-        return tuple(DashboardCommand(**row) for row in self._read()
+        return tuple(_command(row) for row in self._read()
                      if row["session_id"] == session_id and row["status"] == "queued")
 
     def history(
@@ -65,10 +75,23 @@ class CommandQueue:
         """按固定控制范围读取队列历史，不让 Dashboard 成为另一套事实源。"""
 
         return tuple(
-            DashboardCommand(**row) for row in self._read()
+            _command(row) for row in self._read()
             if (requirement_id is None or row["requirement_id"] == requirement_id)
             and (session_id is None or row["session_id"] == session_id)
         )
+
+    def recover_delivered(self, requirement_id: str) -> tuple[DashboardCommand, ...]:
+        """重启时把结果未知的已投递指令转为显式失败，禁止静默遗失或重复执行。"""
+
+        recovered: list[DashboardCommand] = []
+        for command in self.history(requirement_id=requirement_id):
+            if command.status == "delivered":
+                recovered.append(self.update(
+                    command.command_id,
+                    "failed",
+                    "控制服务重启，投递结果未知；请核对 Agent 状态后显式重试",
+                ))
+        return tuple(recovered)
 
     def update(self, command_id: str, status: CommandStatus, result: str = "") -> DashboardCommand:
         if status not in {"delivered", "completed", "failed", "cancelled"}:
@@ -77,11 +100,80 @@ class CommandQueue:
             rows = self._read()
             for index, row in enumerate(rows):
                 if row["command_id"] == command_id:
-                    row = {**row, "status": status, "result": result}
+                    current = _command(row)
+                    if current.status in {"completed", "failed", "cancelled"}:
+                        return current
+                    timestamp = _now()
+                    row = {
+                        **asdict(current),
+                        "status": status,
+                        "result": result,
+                        "delivered_at": current.delivered_at or (
+                            timestamp if status == "delivered" else None
+                        ),
+                        "completed_at": timestamp if status in {
+                            "completed", "failed", "cancelled"
+                        } else None,
+                    }
                     rows[index] = row
                     self._write(rows)
-                    return DashboardCommand(**row)
+                    return _command(row)
         raise WorkspaceError("找不到指令")
+
+    def cancel(self, command_id: str) -> DashboardCommand:
+        """仅队列中的指令可直接取消；已投递指令由 RuntimeController 中断。"""
+
+        with _file_lock(self.path.with_suffix(".lock")):
+            rows = self._read()
+            for index, row in enumerate(rows):
+                if row["command_id"] != command_id:
+                    continue
+                command = _command(row)
+                if command.status != "queued":
+                    return command
+                command = DashboardCommand(
+                    **{
+                        **asdict(command),
+                        "status": "cancelled",
+                        "result": "用户在投递前取消",
+                        "completed_at": _now(),
+                    }
+                )
+                rows[index] = asdict(command)
+                self._write(rows)
+                return command
+        raise WorkspaceError("找不到指令")
+
+    def retry(self, command_id: str, *, retry_id: str) -> DashboardCommand:
+        """为失败指令创建一次显式重试；retry_id 保证浏览器重放不重复发送。"""
+
+        rows = self._read()
+        previous = next((_command(row) for row in rows if row["command_id"] == command_id), None)
+        if previous is None:
+            raise WorkspaceError("找不到指令")
+        if previous.status != "failed":
+            raise WorkspaceError("只有失败指令可以重试")
+        retried = self.enqueue(
+            previous.requirement_id,
+            previous.session_id,
+            previous.message,
+            command_id=retry_id,
+        )
+        if retried.retry_of is not None:
+            return retried
+        with _file_lock(self.path.with_suffix(".lock")):
+            current = self._read()
+            for index, row in enumerate(current):
+                if row["command_id"] == retry_id:
+                    row = {
+                        **asdict(_command(row)),
+                        "attempt": previous.attempt + 1,
+                        "retry_of": previous.command_id,
+                    }
+                    current[index] = row
+                    self._write(current)
+                    return _command(row)
+        raise WorkspaceError("重试指令持久化失败")
 
     def _read(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -89,13 +181,24 @@ class CommandQueue:
         value = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(value, list):
             raise WorkspaceError("Dashboard 指令队列损坏")
-        return value
+        return [asdict(_command(row)) for row in value]
 
     def _write(self, rows: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, self.path)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _command(row: dict[str, Any]) -> DashboardCommand:
+    """兼容 Phase 5 MVP 已持久化的无时间戳队列记录。"""
+
+    fields = DashboardCommand.__dataclass_fields__
+    return DashboardCommand(**{key: value for key, value in row.items() if key in fields})
 
 
 class DashboardService:

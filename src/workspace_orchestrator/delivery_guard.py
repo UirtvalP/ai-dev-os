@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 from .orchestration.store import OrchestrationStore
 from .workspace import WorkspaceError, WorkspaceStore
@@ -38,8 +40,46 @@ def is_v2_delivery(store: WorkspaceStore, requirement_id: str) -> bool:
 
 
 def require_delivery_completion(store: WorkspaceStore, requirement_id: str) -> None:
-    """Phase 3 不签发 CompletionToken；后续完成门禁在此替换，不提供布尔旁路。"""
-    if is_v2_delivery(store, requirement_id):
+    """V2 只接受与 Phase 6 exact-SHA Gate 一致的持久 CompletionToken。"""
+    if not is_v2_delivery(store, requirement_id):
+        return
+    workspace = store.path_for(requirement_id)
+    token_path = workspace / "deployment" / "completion-token.json"
+    gate_path = workspace / "phase-gates" / "phase-6.json"
+    try:
+        document = json.loads(token_path.read_text(encoding="utf-8"))
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         raise WorkspaceError(
             "V2 需求仍需完整交付 CompletionToken；Review/合并收据不能直接完成需求或触发部署"
-        )
+        ) from exc
+    if (
+        not isinstance(document, dict)
+        or not isinstance(document.get("source"), str)
+        or not isinstance(document.get("token"), dict)
+        or not isinstance(document.get("environment_policy"), dict)
+        or not isinstance(gate, dict)
+    ):
+        raise WorkspaceError("CompletionToken 缺失、损坏或与 Phase 6 Gate 不一致")
+    token = document["token"]
+    environment = document["environment_policy"]
+    source_path = Path(document["source"])
+    try:
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkspaceError("CompletionToken 的部署服务完成记录缺失或损坏") from exc
+    if (
+        source != token
+        or not isinstance(gate, dict)
+        or token.get("requirement_id") != requirement_id
+        or not isinstance(token.get("token_id"), str)
+        or not token["token_id"].startswith("completion-")
+        or gate.get("status") != "PASS"
+        or token.get("commit_sha") != gate.get("commit_sha")
+        or type(token.get("deployment_required")) is not bool
+        or environment.get("name") != token.get("environment")
+        or environment.get("deployment_required") != token.get("deployment_required")
+        or (token["deployment_required"] and not token.get("deployment_receipt_id"))
+        or (not token["deployment_required"] and token.get("deployment_receipt_id") is not None)
+    ):
+        raise WorkspaceError("CompletionToken 缺失、损坏或与 Phase 6 Gate 不一致")

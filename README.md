@@ -343,15 +343,20 @@ Windows LPAC；Linux 尚未接入同等后端时报告不可用，不降级为�
 人工退回留言继续由原 Hook 写回 Workspace 并补偿任务状态；它使旧审批失效，但不会
 直接篡改 Supervisor 的冻结计划或把旧候选重新视为已验收。
 
-## V2 远程 Dashboard（Phase 5 MVP）
+## V2 Dashboard / Event Plane
 
 Dashboard 只监听本机回环地址。当前正式入口复用已有云服务器、HTTPS 域名和 SSH 反向转发：
 `https://game.homebox2026.online/ai-dev-os/` → 云端 Nginx `127.0.0.1:18765` → 本机
 `127.0.0.1:8765`。不使用 Quick Tunnel，也不把 Dashboard 直接绑定公网地址。
 
 首次启动会在 `--token-file` 指定位置生成至少 32 字节的随机 token；浏览器页面本身不包含 token，
-所有状态与消息 API 都要求 `Authorization: Bearer <token>`。远程 Runtime 固定使用 `read-only`
-sandbox，并拒绝审批，远端不能选择其他 Requirement、Session 或发送审批决定。
+所有状态与指令 API 都要求 `Authorization: Bearer <token>`。服务端校验同源、请求大小、字段、游标、
+Session 的 Requirement 归属，并在 HTTP 投影边界脱敏；远程 Runtime 固定使用 `read-only` sandbox
+且拒绝审批。页面可查看 Requirement/Task DAG、Agent/Session/Turn、Git、Verification Receipt 与
+append-only Event 增量，并支持空闲新 Turn、运行中 steer、持久排队、取消/中断和失败显式重试。
+每个 command 都保存 ID、目标 Session、状态、投递/完成时间、结果、尝试次数与重试来源；相同 ID
+的网络重放不会重复投递。Dashboard 缓存可丢弃，重启后从 Workspace、JSONL Event Store 和命令队列
+重建，不成为第二套事实来源。
 
 ```powershell
 .\scripts\start_remote_dashboard.ps1
@@ -361,6 +366,20 @@ sandbox，并拒绝审批，远端不能选择其他 Requirement、Session 或�
 启动脚本会优先使用 Codex 桌面应用内置的最新 CLI，幂等启动本机 Dashboard 和专用 SSH 反向转发；
 停止脚本只终止 REQ-020 Dashboard 与它的 `18765 → 8765` 转发，不影响游戏 relay 或现有
 `codex-cursor` Named Tunnel。
+
+## V2 main-only Deployment Gate
+
+部署服务使用环境注册表选择 `DeploymentProvider`，幂等键绑定 project、environment、commit 与
+provider version。实际 Provider 调用前会再次实时解析本地 `main`、远端 `main`、工作树与 HEAD；
+feature、integration、detached、脏工作树、旧提交或远端漂移全部失败关闭。部署还必须同时绑定
+当前 `MergeReceipt`、post-merge `VerificationReceipt` 与 `DeploymentAuthorization`，且不预先要求
+尚未签发的 `CompletionToken`。
+
+每次尝试先保存 `in_progress` journal，再保存成功或失败 `DeploymentReceipt`，包含发起者、环境、
+main 证明、验证证据、开始/结束时间、结果和回滚指引。崩溃留下的不确定 journal 不会自动重放副作用。
+项目提供无外部副作用的 `DryRunDeploymentProvider` 和实时 Git main 适配器用于本地 E2E。最终只有与
+Phase 6 exact-SHA Gate 一致并持久化到 Requirement Workspace 的 `CompletionToken` 能解除 V2 完成门禁；
+无需部署与 deployment-required 两条路径使用同一确定性完成入口。
 
 合并前后保留 `MergeReceipt`，但 Phase 3 不签发 RequirementCompletionToken，也不会部署。
 `recovery_required` 表示尚未交付；main 已变更而 post-merge 失败时保留现场，不回滚或掩盖用户文件。
