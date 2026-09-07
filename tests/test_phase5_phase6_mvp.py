@@ -12,6 +12,8 @@ import pytest
 from workspace_orchestrator.agent_runtime.contracts import (
     AgentEvent,
     AgentRunResult,
+    ExecutionSpec,
+    RuntimeDescriptor,
     RuntimeOperationResult,
     RuntimeSessionRef,
 )
@@ -42,6 +44,7 @@ from workspace_orchestrator.remote_control import (
     load_or_create_token,
     serve_remote_control,
 )
+from workspace_orchestrator.workbench import WorkbenchExecutionService, WorkbenchStart
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -157,7 +160,7 @@ def test_dashboard_token_is_generated_and_reused(tmp_path: Path) -> None:
 
 def test_dashboard_browser_api_paths_support_reverse_proxy_prefix() -> None:
     assert "api('api/status" in DASHBOARD_HTML
-    assert "api('api/message'" in DASHBOARD_HTML
+    assert "'api/message'" in DASHBOARD_HTML
     assert "api('/api/" not in DASHBOARD_HTML
     assert 'aria-label="控制面导航"' in DASHBOARD_HTML
     assert 'aria-live="polite"' in DASHBOARD_HTML
@@ -170,6 +173,7 @@ def test_dashboard_browser_api_paths_support_reverse_proxy_prefix() -> None:
     ):
         assert label in DASHBOARD_HTML
     assert "projection||{},executions=(p.executions||[])" in DASHBOARD_HTML
+    assert "pendingReply" in DASHBOARD_HTML and "复用同一 command_id" in DASHBOARD_HTML
 
 
 def test_dashboard_projects_phase_gate_and_workspace_agents(tmp_path: Path) -> None:
@@ -693,6 +697,99 @@ def test_dashboard_http_execution_details_are_bounded_and_redacted(tmp_path: Pat
         assert isinstance(event_rows, list) and event_rows[0]["payload"]["token"] == "[REDACTED]"
         code, error = request_json(f"{base}/api/executions/{execution.id}?limit=201", token)
         assert code == 400 and "limit" in str(error["error"])
+
+
+class ExecutionReplyRuntime:
+    def __init__(self, events: RuntimeEventStore) -> None:
+        self.events = events
+        self.started = 0
+        self.resumed = 0
+
+    def describe(self):
+        return RuntimeDescriptor(
+            "reply-fake", "Reply Fake", "1", True,
+            ("start", "resume", "interactive_message", "event_stream"),
+        )
+
+    def list_models(self):
+        return ()
+
+    def start(self, spec: ExecutionSpec):
+        self.started += 1
+        session = RuntimeSessionRef(
+            "reply-fake", "original-session", spec.run_id, str(spec.workspace_path),
+            execution_id=spec.execution_id, sandbox=spec.sandbox,
+            requirement_id=spec.requirement_id, task_id=spec.task_id,
+        )
+        return RuntimeOperationResult("ok", session, "initial-turn")
+
+    def resume(self, session: RuntimeSessionRef, message: str):
+        self.resumed += 1
+        self.events.append(AgentEvent(
+            "http-reply-event", session.run_id, session.runtime_id, "message",
+            {"raw": {"message": message}}, session_id=session.session_id,
+            turn_id="reply-turn", requirement_id=session.requirement_id,
+            task_id=session.task_id, execution_id=session.execution_id,
+        ))
+        return RuntimeOperationResult("ok", session, "reply-turn", {
+            "status": "failed", "execution_id": "EXE-999999",
+            "session_id": "foreign", "turn_id": "foreign-turn",
+        })
+
+    def send_message(self, session, message):
+        return RuntimeOperationResult("ok", session, "next-turn")
+
+    def cancel(self, session):
+        return RuntimeOperationResult("unsupported", session)
+
+    def status(self, session):
+        return RuntimeOperationResult("ok", session)
+
+    def list_events(self, session, *, after=0, limit=1000):
+        return self.events.query(session_id=session.session_id, after=after, limit=limit)
+
+    stream_events = list_events
+
+    def archive(self, session):
+        return RuntimeOperationResult("unsupported", session)
+
+    def close(self):
+        pass
+
+
+def test_dashboard_http_replies_to_execution_original_session(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Execution reply HTTP")
+    starter = ExecutionReplyRuntime(RuntimeEventStore(store.root / "runtime-events"))
+    started = WorkbenchExecutionService(store, lambda *_: starter)
+    execution = started.start(WorkbenchStart(
+        requirement_id, "TASK-P7", "initial", "reply-fake",
+    ))
+    started.close()
+    reply_runtime = ExecutionReplyRuntime(RuntimeEventStore(store.root / "runtime-events"))
+    controller = RemoteController(
+        store, requirement_id, None, run_id="remote-p7",
+        workbench_runtime_factory=lambda *_: reply_runtime,
+    )
+    token = "p" * 48
+    with dashboard_server(controller, token) as base:
+        code, detail = request_json(f"{base}/api/executions/{execution.id}", token)
+        assert code == 200 and detail["reply"]["supported"] is True
+        code, result = request_json(
+            f"{base}/api/executions/{execution.id}/message", token,
+            payload={"message": "继续原 Session", "command_id": "http-p7-reply"},
+        )
+        assert code == 202
+        assert result["continued_original_session"] is True
+        assert result["session_id"] == "original-session"
+        assert result["status"] == "ok" and result["execution_id"] == execution.id
+        assert result["turn_id"] == "reply-turn"
+    assert starter.started == 1
+    assert reply_runtime.started == 0 and reply_runtime.resumed == 1
+    assert RuntimeEventStore(store.root / "runtime-events").replay(execution.id)[0].payload == {
+        "raw": {"message": "继续原 Session"},
+    }
+
 def test_dashboard_http_failed_retry_endpoint_is_idempotent(tmp_path: Path) -> None:
     root = tmp_path / "project"
     store = WorkspaceStore(root, execution_root=root)

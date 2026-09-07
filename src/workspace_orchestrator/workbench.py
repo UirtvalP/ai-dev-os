@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from threading import RLock
+from typing import Any, cast
 from uuid import uuid4
 
 from .agent_runtime.contracts import (
     AgentEvent,
     ExecutionSpec,
     ModelDescriptor,
+    OperationStatus,
     RuntimeDescriptor,
     RuntimeFailure,
     RuntimeOperationResult,
@@ -46,6 +50,8 @@ class WorkbenchExecutionService:
         self.events = RuntimeEventStore(workspace.root / "runtime-events")
         self.runtime_factory = runtime_factory
         self._runtimes: dict[str, StandardAgentRuntimePort] = {}
+        self._pending_cleanup: list[StandardAgentRuntimePort] = []
+        self._reply_lock = RLock()
 
     def start(self, request: WorkbenchStart) -> Execution:
         execution = self.executions.create(
@@ -135,7 +141,65 @@ class WorkbenchExecutionService:
         self._runtimes[prepared.id] = runtime
         return running
 
+    def reply_capability(self, requirement_id: str, execution_id: str) -> dict[str, object]:
+        """报告能否继续原 Session；探测不会启动或恢复 Agent。"""
+
+        execution = self._owned_execution(requirement_id, execution_id)
+        runtime = self._runtimes.get(execution.id)
+        created = runtime is None
+        try:
+            session = self._session_ref(execution)
+            runtime = runtime or self.runtime_factory(execution.runtime_id, self.events)
+            descriptor = runtime.describe()
+            supported = (
+                descriptor.available
+                and descriptor.runtime_id == execution.runtime_id
+                and descriptor.supports("resume")
+                and descriptor.supports("interactive_message")
+            )
+            reason = descriptor.reason
+            if descriptor.runtime_id != execution.runtime_id:
+                reason = "Runtime descriptor 身份与 Execution 不一致"
+            elif not descriptor.supports("resume"):
+                reason = "Runtime 不支持恢复原 Session"
+            elif not descriptor.supports("interactive_message"):
+                reason = "Runtime 不支持向原 Session 发送消息"
+            return {
+                "supported": supported,
+                "runtime_id": execution.runtime_id,
+                "session_id": session.session_id,
+                "capabilities": descriptor.canonical_capabilities,
+                "reason": reason,
+                "alternative": None if supported else "请在原生 Agent 中打开该 Session 继续；Workbench 不会新建 Agent。",
+            }
+        except Exception as exc:  # noqa: BLE001 -- Runtime 探测属于外部边界。
+            return {
+                "supported": False,
+                "runtime_id": execution.runtime_id,
+                "session_id": execution.session_id,
+                "capabilities": (),
+                "reason": str(exc),
+                "alternative": "请在原生 Agent 中打开该 Session 继续；Workbench 不会新建 Agent。",
+            }
+        finally:
+            if created and runtime is not None:
+                self._close_or_retain(runtime)
+
+    def reply(
+        self, requirement_id: str, execution_id: str, message: str, *, command_id: str,
+    ) -> RuntimeOperationResult:
+        """继续 Execution 的原 Session；此路径永不调用 Runtime.start。"""
+
+        with self._reply_lock:
+            return self._reply_locked(
+                requirement_id, execution_id, message, command_id=command_id,
+            )
+
     def close(self) -> None:
+        with self._reply_lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         errors: list[str] = []
         for execution_id, runtime in tuple(self._runtimes.items()):
             try:
@@ -150,6 +214,13 @@ class WorkbenchExecutionService:
                 errors.append(f"{execution_id}: {exc}")
             else:
                 self._runtimes.pop(execution_id, None)
+        for runtime in tuple(self._pending_cleanup):
+            try:
+                runtime.close()
+            except Exception as exc:  # noqa: BLE001 -- 保留引用供下次 close 重试。
+                errors.append(f"临时 Runtime: {exc}")
+            else:
+                self._pending_cleanup.remove(runtime)
         if errors:
             raise WorkspaceError("Runtime 清理未确认：" + "；".join(errors))
 
@@ -221,6 +292,224 @@ class WorkbenchExecutionService:
             raise WorkspaceError(
                 f"Workbench creation_key 已绑定不同启动请求：{request.creation_key}"
             )
+
+    def _owned_execution(self, requirement_id: str, execution_id: str) -> Execution:
+        execution = self.executions.get(execution_id)
+        if execution.requirement_id != requirement_id.upper():
+            raise WorkspaceError("Execution 不属于当前 Requirement")
+        return execution
+
+    def _session_ref(self, execution: Execution) -> RuntimeSessionRef:
+        raw = execution.result.get("session_ref")
+        if not isinstance(raw, dict):
+            raise WorkspaceError("Execution 没有可恢复的完整 SessionRef")
+        names = {item.name for item in fields(RuntimeSessionRef)}
+        try:
+            session = RuntimeSessionRef(**{name: raw[name] for name in names if name in raw})
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkspaceError(f"Execution SessionRef 损坏：{exc}") from exc
+        expected = RuntimeSessionRef(
+            execution.runtime_id, execution.session_id or "", execution.id,
+            execution.workspace_path, execution_id=execution.id,
+            sandbox=execution.execution_policy.get("sandbox"), model=execution.model,
+            reasoning_effort=execution.reasoning_effort,
+            requirement_id=execution.requirement_id, task_id=execution.task_id,
+        )
+        if session != expected or not session.session_id or not session.sandbox:
+            raise WorkspaceError("Execution SessionRef 身份与持久化 Execution 不一致")
+        return session
+
+    def _reply_locked(
+        self, requirement_id: str, execution_id: str, message: str, *, command_id: str,
+    ) -> RuntimeOperationResult:
+        execution = self._owned_execution(requirement_id, execution_id)
+        session = self._session_ref(execution)
+        replay = self._claim_reply(execution, message, command_id)
+        if replay is not None:
+            return replay
+        runtime = self._runtimes.get(execution.id)
+        created = runtime is None
+        operation: RuntimeOperationResult
+        try:
+            runtime = runtime or self.runtime_factory(execution.runtime_id, self.events)
+            descriptor = runtime.describe()
+            if not descriptor.available:
+                operation = self._reply_failure(
+                    "unavailable", session, descriptor.reason or "Runtime 不可用",
+                )
+            elif descriptor.runtime_id != execution.runtime_id:
+                operation = self._reply_failure(
+                    "failed", session, "Runtime descriptor 身份与 Execution 不一致",
+                    code="identity_mismatch",
+                )
+            elif created and not descriptor.supports("resume"):
+                operation = self._reply_failure(
+                    "unsupported", session, "Runtime 不支持恢复原 Session",
+                )
+            elif not descriptor.supports("interactive_message"):
+                operation = self._reply_failure(
+                    "unsupported", session, "Runtime 不支持向原 Session 发送消息",
+                )
+            else:
+                operation = (
+                    runtime.resume(session, message)
+                    if created else runtime.send_message(session, message)
+                )
+            if operation.session is not None and operation.session != session:
+                operation = self._reply_failure(
+                    "failed", session, "Runtime 返回的 Session 身份与 Execution 不一致",
+                    code="identity_mismatch",
+                )
+            elif operation.ok and (operation.session is None or not operation.turn_id):
+                operation = self._reply_failure(
+                    "failed", session, "Runtime 未返回完整 Session/Turn 身份",
+                    code="identity_mismatch",
+                )
+            delivery = "resume" if created else "send_message"
+            if not operation.ok:
+                operation = replace(operation, data={
+                    **operation.data,
+                    "delivery": delivery,
+                    "continued_original_session": False,
+                    "alternative": "请在原生 Agent 中打开该 Session 继续；Workbench 不会新建 Agent。",
+                })
+                self._persist_reply(execution, message, command_id, "completed", operation)
+                return operation
+            self._runtimes[execution.id] = runtime
+            operation = replace(operation, data={
+                **operation.data,
+                "delivery": delivery,
+                "continued_original_session": True,
+            })
+            # Provider 已接收后先落 durable receipt；后续失败不得自动重复投递。
+            self._persist_reply(execution, message, command_id, "delivered", operation)
+            timestamp = now_iso()
+            try:
+                self.executions.update(
+                    execution.id, status="running", turn_id=operation.turn_id,
+                    completed_at=None, last_progress_at=timestamp,
+                    result={
+                        **execution.result,
+                        "last_reply": {
+                            "command_id": command_id, "delivery": delivery,
+                            "turn_id": operation.turn_id, "at": timestamp,
+                        },
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 -- 已投递，必须报告未知而不是允许重试。
+                unknown = self._reply_failure(
+                    "failed", session,
+                    f"消息已由 Provider 接收，但 Execution 落盘失败：{exc}",
+                    code="execution_persist_failed",
+                )
+                unknown = replace(unknown, data={
+                    **unknown.data, "delivery_accepted": True, "turn_id": operation.turn_id,
+                })
+                self._persist_reply(execution, message, command_id, "delivery_unknown", unknown)
+                return unknown
+            self._persist_reply(execution, message, command_id, "completed", operation)
+            return operation
+        except Exception as exc:  # noqa: BLE001 -- Runtime 是外部进程/协议边界。
+            operation = self._reply_failure(
+                "failed", session, str(exc), code="runtime_reply_failed",
+            )
+            self._persist_reply(execution, message, command_id, "completed", operation)
+            return operation
+        finally:
+            if created and runtime is not None and execution.id not in self._runtimes:
+                self._close_or_retain(runtime)
+
+    def _claim_reply(
+        self, execution: Execution, message: str, command_id: str,
+    ) -> RuntimeOperationResult | None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", command_id) is None:
+            raise WorkspaceError("command_id 格式无效")
+        path = self._reply_path(execution, command_id)
+        with self.workspace.locked():
+            if path.exists():
+                record = self.workspace.read_json(path)
+                if (
+                    record.get("execution_id") != execution.id
+                    or record.get("message") != message
+                ):
+                    raise WorkspaceError("command_id 已绑定不同 Execution 回复")
+                stored = record.get("operation")
+                if isinstance(stored, dict):
+                    replay = self._operation_from_dict(stored)
+                    expected = self._session_ref(execution)
+                    if replay.session is not None and replay.session != expected:
+                        raise WorkspaceError("Execution reply receipt 的 Session 身份不匹配")
+                    if replay.ok and (replay.session is None or not replay.turn_id):
+                        raise WorkspaceError("Execution reply receipt 缺少完整 Session/Turn 身份")
+                    return replace(replay, data={**replay.data, "idempotent_replay": True})
+                return self._reply_failure(
+                    "failed", self._session_ref(execution),
+                    "相同 command_id 的投递仍在进行或结果未知；为避免重复发送不会自动重试",
+                    code="reply_in_progress",
+                )
+            self.workspace.write_json(path, {
+                "command_id": command_id, "execution_id": execution.id,
+                "requirement_id": execution.requirement_id, "message": message,
+                "state": "delivering", "updated_at": now_iso(),
+            })
+        return None
+
+    def _persist_reply(
+        self, execution: Execution, message: str, command_id: str, state: str,
+        operation: RuntimeOperationResult,
+    ) -> None:
+        with self.workspace.locked():
+            self.workspace.write_json(self._reply_path(execution, command_id), {
+                "command_id": command_id, "execution_id": execution.id,
+                "requirement_id": execution.requirement_id, "message": message,
+                "state": state, "updated_at": now_iso(),
+                "operation": self._operation_to_dict(operation),
+            })
+
+    def _reply_path(self, execution: Execution, command_id: str) -> Path:
+        return (
+            self.workspace.path_for(execution.requirement_id)
+            / "executions" / "replies" / f"{command_id}.json"
+        )
+
+    @staticmethod
+    def _operation_to_dict(operation: RuntimeOperationResult) -> dict[str, Any]:
+        return {
+            "status": operation.status,
+            "session": asdict(operation.session) if operation.session else None,
+            "turn_id": operation.turn_id,
+            "data": operation.data,
+            "error": operation.error.to_dict() if operation.error else None,
+        }
+
+    @staticmethod
+    def _operation_from_dict(raw: dict[str, Any]) -> RuntimeOperationResult:
+        session = RuntimeSessionRef(**raw["session"]) if raw.get("session") else None
+        error = RuntimeFailure(**raw["error"]) if raw.get("error") else None
+        return RuntimeOperationResult(
+            cast(OperationStatus, raw["status"]), session=session, turn_id=raw.get("turn_id"),
+            data=dict(raw.get("data", {})), error=error,
+        )
+
+    def _close_or_retain(self, runtime: StandardAgentRuntimePort) -> None:
+        try:
+            runtime.close()
+        except Exception:  # noqa: BLE001 -- 保留强引用，交给显式 close 重试。
+            self._pending_cleanup.append(runtime)
+
+    @staticmethod
+    def _reply_failure(
+        status: OperationStatus, session: RuntimeSessionRef, message: str,
+        *, code: str = "unsupported",
+    ) -> RuntimeOperationResult:
+        return RuntimeOperationResult(
+            status, session=session,
+            data={
+                "continued_original_session": False,
+                "alternative": "请在原生 Agent 中打开该 Session 继续；Workbench 不会新建 Agent。",
+            },
+            error=RuntimeFailure(code, message),
+        )
 
 
 class DemoWorkbenchRuntime:
