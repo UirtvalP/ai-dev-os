@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .agent_runtime.contracts import EventSink, RuntimeDescriptor
+from .agent_runtime.contracts import AgentEvent, EventSink, RuntimeDescriptor
 from .agent_runtime.events import RuntimeEventStore
 from .agent_runtime.execution import RuntimeExecutor
 from .agent_runtime.ports import AgentExecutionPort, AgentRuntimePort
+from .agent_runtime.service import AgentRuntime
 from .agent_runtime.stdio import JsonRpcStdioClient
 from .executions import ExecutionStore
 from .project_config import default_project_config, load_project_config
@@ -61,3 +62,20 @@ def runtime_descriptors() -> tuple[RuntimeDescriptor, ...]:
         finally:
             runtime.close()
     return tuple(result)
+
+
+def create_standard_runtime(
+    name: str, *, events: RuntimeEventStore,
+    event_sink: EventSink | None = None,
+    client_factory: Callable[..., JsonRpcStdioClient] = JsonRpcStdioClient,
+) -> AgentRuntime:
+    """为 Workbench 组装统一契约；具体 Adapter 仅在 Composition Root 出现。"""
+
+    def persist(event: AgentEvent) -> None:
+        stored = events.append(event)
+        if event_sink is not None:
+            event_sink(stored)
+
+    return AgentRuntime(
+        create_runtime(name, event_sink=persist, client_factory=client_factory), events,
+    )
