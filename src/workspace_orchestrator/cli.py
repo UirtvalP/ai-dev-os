@@ -327,7 +327,8 @@ def run(args: argparse.Namespace) -> str:
         return json.dumps(request_cancel(store, args.task_id), ensure_ascii=False, indent=2)
     if args.command == "phase":
         if args.phase_command == "reopen":
-            journal = GateStore(store).reopen(
+            gates = configured_phase_verification(store, phase=args.phase).gates
+            journal = gates.reopen(
                 args.requirement_id,
                 args.phase,
                 reason=args.reason,

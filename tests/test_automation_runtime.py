@@ -318,6 +318,41 @@ def test_interactive_entrypoints_block_unactivated_phase_task(
     assert store.load(requirement_id)["sessions"] == []
 
 
+def test_bootstrap_uses_injected_protected_gate_store(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Protected gated phase")
+    store.touch_meta(
+        requirement_id,
+        status="in_progress",
+        phase_gate_required=True,
+        requirement_task_id="AID-174",
+    )
+    tasks = FakeTasks()
+    tasks.tasks[requirement_id] = [
+        Task(id="AID-174", title="Phase 6", status="in_progress")
+    ]
+
+    class ProtectedGates(GateStore):
+        activation_checks = 0
+
+        def require_task_active(self, requirement_id: str, task_id: str) -> str:
+            self.activation_checks += 1
+            return "activated"
+
+    protected = ProtectedGates(store)
+    runtime = AutomationRuntime(
+        store,
+        CodexAgentProvider(environ={"CODEX_THREAD_ID": "thread-protected"}),
+        tasks,
+        phase_gates=protected,
+    )
+
+    runtime.bootstrap(requirement_id, task_ids=("AID-174",))
+
+    assert protected.activation_checks == 1
+    assert store.load(requirement_id)["sessions"][0]["task_ids"] == ["AID-174"]
+
+
 def test_black_box_c_multiple_requirements_returns_ambiguity_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -624,6 +659,32 @@ def test_gated_finalize_rechecks_valid_final_gate_before_legacy_completion(
     assert completion_checks == 2
     assert tasks.get_task("TASK-001").status == "done"
     assert store.load(requirement_id)["meta"]["status"] == "done"
+
+
+def test_gated_finalize_uses_injected_protected_gate_store(tmp_path: Path) -> None:
+    store, requirement_id, tasks, runtime = _reviewable_runtime(tmp_path)
+    store.touch_meta(
+        requirement_id,
+        manual_test_required=False,
+        phase_gate_required=True,
+        requirement_task_id="TASK-001",
+    )
+
+    class ProtectedGates(GateStore):
+        completion_checks = 0
+
+        def require_requirement_completion_ready(self, requirement_id: str) -> None:
+            self.completion_checks += 1
+
+    protected = ProtectedGates(store)
+    runtime._phase_gates = protected
+
+    result = runtime.finalize(requirement_id)
+
+    assert result.passed is True
+    assert result.requirement_completed is True
+    assert protected.completion_checks == 2
+    assert tasks.get_task("TASK-001").status == "done"
 
 
 def test_gated_confirm_requires_final_gate_before_requirement_done(

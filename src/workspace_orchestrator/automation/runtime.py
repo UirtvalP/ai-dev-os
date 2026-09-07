@@ -153,7 +153,8 @@ class AutomationRuntime:
         """所有交互式绑定路径共用同一阶段激活校验。"""
 
         try:
-            activation = GateStore(self.store).require_task_active(
+            gates = self._phase_gates or GateStore(self.store)
+            activation = gates.require_task_active(
                 requirement_id, task.id
             )
         except PhaseGateError as exc:
@@ -303,7 +304,7 @@ class AutomationRuntime:
             if attached_id == selected_id
             else ()
         )
-        gates = GateStore(self.store)
+        gates = self._phase_gates or GateStore(self.store)
         phase_gated = gates.is_required(selected_id)
         if phase_gated and provider is None:
             raise PhaseGateError(
@@ -503,7 +504,7 @@ class AutomationRuntime:
             return AutoFinishResult(False, "当前分支没有上游", requirement_id, task_ids)
         if not git.get("pushed"):
             return AutoFinishResult(False, "当前提交尚未与上游完全同步", requirement_id, task_ids)
-        gates = GateStore(self.store)
+        gates = self._phase_gates or GateStore(self.store)
         if gates.is_required(requirement_id):
             try:
                 gates.require_requirement_completion_ready(requirement_id)
@@ -606,7 +607,7 @@ class AutomationRuntime:
                         != expected["evidence_fingerprint"]
                     ):
                         return "finalize 恢复期间验收证据已变化，请重新 finalize"
-                    gates = GateStore(self.store)
+                    gates = self._phase_gates or GateStore(self.store)
                     if gates.is_required(requirement_id):
                         gates.require_requirement_completion_ready(requirement_id)
                     complete_tasks(provider, task_ids)
@@ -890,7 +891,7 @@ class AutomationRuntime:
             require_delivery_completion(self.store, requirement_id)
         except WorkspaceError as exc:
             return FinalizeResult(False, "状态：FAIL", (), blockers=(str(exc),))
-        gates = GateStore(self.store)
+        gates = self._phase_gates or GateStore(self.store)
         phase_gate_required = gates.is_required(requirement_id)
         if phase_gate_required:
             try:
