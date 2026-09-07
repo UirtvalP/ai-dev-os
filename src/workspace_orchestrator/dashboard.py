@@ -16,6 +16,7 @@ from .agent_runtime.events import RuntimeEventStore
 from .executions import Execution, ExecutionStore
 from .main_agent import RequirementOwner
 from .orchestration.store import OrchestrationStore
+from .supervisor_watchdog import load_watchdog_state
 from .workspace import WorkspaceError, WorkspaceStore, _file_lock, markdown_sections
 
 CommandStatus = Literal["queued", "delivered", "completed", "failed", "cancelled"]
@@ -215,15 +216,18 @@ class DashboardService:
                     after: int = 0, limit: int = 200) -> dict[str, Any]:
         snapshot = self.workspace.load(requirement_id)
         executions = ExecutionStore(self.workspace).list(requirement_id)
-        owner = RequirementOwner(self.workspace, requirement_id).load_optional()
+        owner_service = RequirementOwner(self.workspace, requirement_id)
+        owner = owner_service.load_optional()
+        supervisor = owner_service.supervisor_snapshot()
+        watchdog = supervisor["watchdog"]
         requirement_space = self._requirement_space(snapshot, executions)
         main_agent = owner.to_dict() if owner else None
         if owner is not None and main_agent is not None:
             main_agent["stale"] = (
                 not owner.source_fingerprint
-                or owner.source_fingerprint != RequirementOwner(
-                    self.workspace, requirement_id,
-                ).source_revision(snapshot, executions)
+                or owner.source_fingerprint != owner_service.source_revision(
+                    snapshot, executions, supervisor,
+                )
             )
         event_rows = () if run_id is None else self.events.replay(run_id, after=after, limit=limit)
         return {
@@ -235,6 +239,7 @@ class DashboardService:
                 "executions": [self._execution_summary(item) for item in reversed(executions)],
                 "task_graph": self._task_graph(requirement_id),
                 "execution_graph": self._execution_graph(executions),
+                "supervisor_watchdog": watchdog,
                 "main_agent": main_agent,
                 "requirement_space": requirement_space,
                 "verification": self._verification(requirement_id),
@@ -332,6 +337,11 @@ class DashboardService:
                 for item in executions if item.parent_execution_id
             ],
             "source": "execution-store",
+        }
+
+    def _watchdog(self, requirement_id: str) -> dict[str, Any]:
+        return load_watchdog_state(self.workspace, requirement_id) or {
+            "review_required": False, "signals": [],
         }
 
     def _requirement_space(
