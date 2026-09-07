@@ -17,6 +17,8 @@ from test_git_workspaces import native
 from workspace_orchestrator import integration_composition as composition
 from workspace_orchestrator import orchestration_composition, product_cli
 from workspace_orchestrator.delivery_guard import is_v2_delivery
+from workspace_orchestrator.executions import ExecutionStore
+from workspace_orchestrator.integration.contracts import MergeReceipt
 from workspace_orchestrator.orchestration.contracts import (
     PlanningRequest,
     TaskSpec,
@@ -324,7 +326,11 @@ def test_product_merge_uses_trusted_environment_and_no_cli_pass_flag(
 
     def integrate(*args: Any) -> Any:
         calls.append(args)
-        return SimpleNamespace(to_dict=lambda: {"status": "merged", "completion_token": None})
+        return MergeReceipt(
+            "receipt-cli", request.requirement_id, "retryable", "merged",
+            base, "a" * 40, "b" * 40, "refs/ai-dev-os/integration/retryable",
+            "auth-cli", "verify-cli", "post-cli", "2026-09-07T00:00:00+00:00",
+        )
 
     monkeypatch.setattr(product_cli, "discover_project_root", lambda root: root)
     monkeypatch.setattr(composition, "configured_integration", lambda *args: SimpleNamespace(integrate=integrate))
@@ -335,18 +341,27 @@ def test_product_merge_uses_trusted_environment_and_no_cli_pass_flag(
                              "--root", str(workspace.project_root), "--request-id", "retryable",
                              "--expected-main", base]) == 0
     assert calls == [(request.requirement_id, "retryable", base, commands, {"actual": "fixture"})]
-    assert json.loads(capsys.readouterr().out)["completion_token"] is None
+    output = json.loads(capsys.readouterr().out)
+    assert output["completion_token"] is None
+    integration_execution = ExecutionStore(workspace).get(output["execution_id"])
+    assert integration_execution.role == "integration"
+    assert integration_execution.status == "completed"
 
 
 def test_product_post_merge_recovery_requires_explicit_stable_identity(
     project: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    workspace, request, _ = project
+    workspace, request, base = project
     calls: list[Any] = []
 
     def recover(*args: Any) -> Any:
         calls.append(args)
-        return SimpleNamespace(to_dict=lambda: {"status": "merged", "receipt_id": "recovery-receipt"})
+        return MergeReceipt(
+            "recovery-receipt", request.requirement_id, "original", "merged",
+            base, "a" * 40, "b" * 40, "refs/ai-dev-os/integration/original",
+            "auth-recovery", "verify-recovery", "post-recovery",
+            "2026-09-07T00:00:00+00:00",
+        )
 
     monkeypatch.setattr(product_cli, "discover_project_root", lambda root: root)
     monkeypatch.setattr(composition, "configured_integration", lambda *args: SimpleNamespace(recover_post_merge=recover))

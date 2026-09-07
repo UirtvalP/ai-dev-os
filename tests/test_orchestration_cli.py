@@ -503,7 +503,7 @@ def test_configured_composition_wires_trusted_ports_without_model_or_worker_star
         workspace, requirement_id, owner="operator", max_workers=2,
         allow_network=True, allowed_worktree_roots=(allowed,),
     )
-    assert supervisor.lease is None and supervisor.workers is workers
+    assert supervisor.lease is None and supervisor.workers.delegate is workers
     assert supervisor.runtimes is _forbidden
     assert supervisor.max_workers == 2 and supervisor.allowed_worktree_roots == (allowed,)
     assert captured["workers"]["requirement_id"] == requirement_id

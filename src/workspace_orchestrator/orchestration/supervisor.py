@@ -438,9 +438,21 @@ class RequirementSupervisor:
     def _workspace_busy(self, task: TaskSpec, data: dict[str, Any]) -> bool:
         path = _task_path(task)
         for task_id, node in data["nodes"].items():
-            if (task_id != task.task_id and (node["active_attempt_id"] is not None
-                    or node["status"] in ("candidate_complete", "verifying") or _unknown_verification(node))
-                    and _overlaps(path, _task_path(TaskSpec.from_dict(node["spec"])))):
+            other = TaskSpec.from_dict(node["spec"])
+            occupied = (
+                node["active_attempt_id"] is not None
+                or node["status"] in ("candidate_complete", "verifying")
+                or _unknown_verification(node)
+            )
+            exclusive_evidence = (
+                node["status"] in ("candidate_complete", "verifying", "unknown")
+                or _unknown_verification(node)
+            )
+            if (
+                task_id != task.task_id and occupied
+                and _overlaps(path, _task_path(other))
+                and (exclusive_evidence or task.write_required or other.write_required)
+            ):
                 return True
         return False
 

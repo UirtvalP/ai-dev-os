@@ -129,7 +129,7 @@ def test_dispatch_identity_fence_and_worktree_conflicts_do_not_spawn(tmp_path):
     from dataclasses import replace
 
     port, task, launcher = make_port(tmp_path)
-    task = replace(task, prompt="hold")
+    task = replace(task, prompt="hold", write_required=True)
     try:
         port.dispatch("a1", 1, task, ROUTE)
         with pytest.raises(PolicyError, match="不同输入"):
@@ -144,6 +144,25 @@ def test_dispatch_identity_fence_and_worktree_conflicts_do_not_spawn(tmp_path):
         assert result.state == "failed" and result.error_class == "cancelled"
         assert len(launcher.calls) <= 1
     finally:
+        port.close()
+
+
+def test_real_worker_allows_two_live_read_only_attempts_in_same_worktree(tmp_path):
+    from dataclasses import replace
+
+    port, task, launcher = make_port(tmp_path)
+    task = replace(task, prompt="hold", write_required=False)
+    second = replace(task, task_id="T2")
+    try:
+        assert port.dispatch("a1", 1, task, ROUTE).state == "running"
+        assert port.dispatch("a2", 1, second, ROUTE).state == "running"
+        deadline = time.monotonic() + 5
+        while len(launcher.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(launcher.calls) == 2
+    finally:
+        port.cancel("a1", 1)
+        port.cancel("a2", 1)
         port.close()
 
 

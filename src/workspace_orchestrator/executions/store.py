@@ -22,6 +22,7 @@ class ExecutionStore:
         provider: str | None = None, model: str | None = None,
         reasoning_effort: str | None = None, prompt: str,
         workspace_path: Path | None = None, source: str = "workbench",
+        branch: str | None = None, worktree: str | None = None,
         parent_execution_id: str | None = None,
         creation_key: str | None = None,
         execution_policy: dict[str, Any] | None = None,
@@ -54,6 +55,7 @@ class ExecutionStore:
                 workspace_path=str((workspace_path or self.workspace.working_root).resolve()),
                 status="queued", created_at=timestamp, updated_at=timestamp,
                 prompt=prompt, parent_execution_id=parent_execution_id, source=source,
+                branch=branch, worktree=worktree,
                 creation_key=creation_key,
                 execution_policy=dict(execution_policy or {}),
             )
