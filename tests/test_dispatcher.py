@@ -137,6 +137,9 @@ def test_dispatcher_executes_unbound_in_progress_task_once(tmp_path: Path, monke
     assert call["model"] is None
     assert requirement_id in str(call["prompt"])
     assert "AID-1" in str(call["prompt"])
+    execution = ExecutionStore(store).list(requirement_id)[0]
+    assert f"AI Dev OS Execution {execution.id}" in str(call["prompt"])
+    assert "不依赖或接管原生 Codex/Claude/Cursor 生命周期" in str(call["prompt"])
     assert "请覆盖失败场景" in str(call["prompt"])
     assert tasks.task.status == "in_review"
 

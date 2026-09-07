@@ -10,7 +10,7 @@ from workspace_orchestrator.native_isolation import (
     require_native_isolation,
 )
 from workspace_orchestrator.product_cli import main
-from workspace_orchestrator.project_init import initialize_project, register_project
+from workspace_orchestrator.project_init import _apply_current_project_files, register_project
 from workspace_orchestrator.workspace import WorkspaceError
 
 
@@ -39,8 +39,10 @@ def test_project_add_preserves_native_agent_files_and_passes_isolation(
     assert not any((tmp_path / ".workspace").iterdir())
 
 
-def test_legacy_hook_project_fails_isolation_until_p10_migration(tmp_path: Path) -> None:
-    initialize_project(tmp_path)
+def test_legacy_hook_project_fails_isolation_until_p10_migration(
+    tmp_path: Path, capsys,
+) -> None:
+    _apply_current_project_files(tmp_path)
     report = audit_native_isolation(tmp_path)
     assert not report.isolated
     assert any("AGENTS.md" in item for item in report.violations)
@@ -52,6 +54,9 @@ def test_legacy_hook_project_fails_isolation_until_p10_migration(tmp_path: Path)
         assert "Native Isolation 失败" in str(exc)
     else:
         raise AssertionError("legacy lifecycle integration 必须 fail closed")
+    assert main(["migrate", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert audit_native_isolation(tmp_path).isolated
 
 
 def test_isolation_detects_claude_and_cursor_managed_commands(tmp_path: Path) -> None:

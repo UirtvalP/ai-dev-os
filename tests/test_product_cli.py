@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from workspace_orchestrator import __version__, cli, product_cli, user_config
+from workspace_orchestrator import __version__, cli, product_cli, project_init, user_config
 from workspace_orchestrator.adapters.package import ToolInstallerError, ToolUpgradeResult
 from workspace_orchestrator.product_cli import main
 from workspace_orchestrator.project_config import default_task_project_id
@@ -16,7 +16,6 @@ from workspace_orchestrator.project_init import (
     AGENTS_END,
     AGENTS_START,
     GITIGNORE_START,
-    initialize_project,
     register_project,
 )
 
@@ -46,15 +45,16 @@ def test_both_cli_versions_use_the_package_version(entry, program: str, capsys) 
     assert capsys.readouterr().out.strip() == f"{program} {__version__}"
 
 
-def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Path, capsys) -> None:
+def test_init_registers_workbench_without_changing_native_agent(tmp_path: Path, capsys) -> None:
     (tmp_path / "README.md").write_text("# Existing project\n", encoding="utf-8")
 
     assert main(["init", str(tmp_path)]) == 0
 
     output = capsys.readouterr().out
-    assert "AI Dev OS 已接入" in output
-    assert "workspace new" in output
-    assert (tmp_path / "AGENTS.md").is_file()
+    assert "Workbench 项目已注册" in output
+    assert "原生 Agent 生命周期保持不变" in output
+    assert not (tmp_path / "AGENTS.md").exists()
+    assert not (tmp_path / ".codex").exists()
     assert not (tmp_path / "USER_PRINCIPLES.md").exists()
     assert user_config.user_principles_path().is_file()
     assert "跨项目、长期有效" in user_config.user_principles_path().read_text(encoding="utf-8")
@@ -69,7 +69,7 @@ def test_init_onboards_existing_project_without_creating_workspace(tmp_path: Pat
     assert config["codex_model"] is None
     assert config["automation"]["auto_finish_pushed_thread"] is True
     assert GITIGNORE_START in (tmp_path / ".gitignore").read_text(encoding="utf-8")
-    assert not (tmp_path / ".workspace").exists()
+    assert (tmp_path / ".workspace").is_dir()
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Existing project\n"
 
 
@@ -101,7 +101,7 @@ def test_init_preserves_existing_content_and_is_idempotent(tmp_path: Path, capsy
 
     assert first == second
     assert agents.read_text(encoding="utf-8").startswith("# Existing instructions\n")
-    assert agents.read_text(encoding="utf-8").count(AGENTS_START) == 1
+    assert agents.read_text(encoding="utf-8").count(AGENTS_START) == 0
     assert principles.read_text(encoding="utf-8") == "# My principles\n"
     assert intent.read_text(encoding="utf-8") == "# My intent\n"
     assert gitignore.read_text(encoding="utf-8").startswith(".env\n")
@@ -152,15 +152,15 @@ def test_init_rejects_invalid_user_config_root_before_project_writes(
     assert not (tmp_path / "PROJECT_INTENT.md").exists()
 
 
-def test_init_rejects_incomplete_managed_block(tmp_path: Path, capsys) -> None:
+def test_init_does_not_inspect_or_modify_native_agents_file(tmp_path: Path, capsys) -> None:
     (tmp_path / "AGENTS.md").write_text(f"{AGENTS_START}\n", encoding="utf-8")
 
-    assert main(["init", str(tmp_path)]) == 2
-
-    assert "不完整的 AI Dev OS 托管区块" in capsys.readouterr().err
+    assert main(["init", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == f"{AGENTS_START}\n"
     assert not (tmp_path / "USER_PRINCIPLES.md").exists()
-    assert not (tmp_path / "PROJECT_INTENT.md").exists()
-    assert not (tmp_path / ".workspace").exists()
+    assert (tmp_path / "PROJECT_INTENT.md").exists()
+    assert (tmp_path / ".workspace").is_dir()
 
 
 def test_init_rejects_unknown_task_provider_before_other_writes(tmp_path: Path, capsys) -> None:
@@ -237,7 +237,9 @@ def test_init_does_not_duplicate_existing_ignore_rules(tmp_path: Path, capsys) -
     assert GITIGNORE_START not in gitignore.read_text(encoding="utf-8")
 
 
-def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> None:
+def test_init_preserves_outdated_managed_agents_block_for_explicit_migration(
+    tmp_path: Path, capsys,
+) -> None:
     agents = tmp_path / "AGENTS.md"
     agents.write_text(
         f"# Existing\n\n{AGENTS_START}\n旧的手工 bootstrap 指引\n<!-- ai-dev-os:end -->\n",
@@ -246,16 +248,13 @@ def test_init_updates_outdated_managed_agents_block(tmp_path: Path, capsys) -> N
 
     assert main(["init", str(tmp_path)]) == 0
 
-    output = capsys.readouterr().out
+    capsys.readouterr()
     content = agents.read_text(encoding="utf-8")
-    assert "已更新：AGENTS.md" in output
-    assert "全局安装的 `ai-dev-os hook`" in content
-    assert "运行时契约" in content
-    assert "~/.ai-dev-os/USER_PRINCIPLES.md" in content
-    assert "旧的手工 bootstrap 指引" not in content
+    assert "旧的手工 bootstrap 指引" in content
+    assert content.count(AGENTS_START) == 1
 
 
-def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
+def test_installed_wheel_init_keeps_hooks_off_and_explicit_import_is_available(
     tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -315,6 +314,13 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
         capture_output=True,
         env=subprocess_env,
     )
+    assert not (project / ".codex").exists()
+    subprocess.run(
+        [str(ai_dev_os), "integration", "enable", "codex-hooks", "--root", str(project)],
+        check=True,
+        capture_output=True,
+        env=subprocess_env,
+    )
     subprocess.run(
         [
             str(workspace),
@@ -334,7 +340,7 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
         "prompt": "继续 REQ-001",
     }
     result = subprocess.run(
-        [str(ai_dev_os), "hook"],
+        [str(ai_dev_os), "hook", "import-codex-thread"],
         input=json.dumps(event),
         text=True,
         encoding="utf-8",
@@ -344,10 +350,10 @@ def test_installed_wheel_init_delivers_hook_without_project_source_or_venv(
     )
 
     hooks = json.loads((project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert "REQ-001" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "AI Dev OS 运行时契约" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "~/.ai-dev-os/USER_PRINCIPLES.md" in result.stdout
-    assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "ai-dev-os hook"
+    assert "未接管当前 Codex 生命周期" in json.loads(result.stdout)["systemMessage"]
+    assert hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == (
+        "ai-dev-os hook import-codex-thread"
+    )
     assert (isolated_home / ".ai-dev-os" / "USER_PRINCIPLES.md").is_file()
     assert (isolated_home / ".ai-dev-os" / "projects.json").is_file()
     assert not (project / "USER_PRINCIPLES.md").exists()
@@ -374,10 +380,7 @@ def test_init_preserves_explicitly_disabled_auto_finish(tmp_path: Path) -> None:
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["automation"]["auto_finish_pushed_thread"] is False
-    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    stop_hook = hooks["hooks"]["Stop"][0]["hooks"][0]
-    assert stop_hook["async"] is True
-    assert stop_hook["timeout"] == 30
+    assert not (tmp_path / ".codex").exists()
 
 
 def test_global_upgrade_uses_configured_source(monkeypatch, capsys) -> None:
@@ -395,7 +398,7 @@ def test_global_upgrade_uses_configured_source(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert calls == ["D:/releases/ai-dev-os.whl"]
     assert "AI Dev OS 全局 CLI 已更新" in output
-    assert "更新完成后，后续 ai-dev-os、workspace 与项目 Hook 调用将使用新版本能力" in output
+    assert "显式启用的可选集成将使用新版本能力" in output
 
 
 def test_global_upgrade_reports_installer_failure(monkeypatch, capsys) -> None:
@@ -420,7 +423,7 @@ def test_migrate_requires_an_initialized_project(tmp_path: Path, capsys) -> None
 def test_migrate_updates_managed_content_and_preserves_user_configuration(
     tmp_path: Path, capsys
 ) -> None:
-    initialize_project(tmp_path)
+    project_init._apply_current_project_files(tmp_path)
     agents = tmp_path / "AGENTS.md"
     agents.write_text(
         agents.read_text(encoding="utf-8").replace(
@@ -454,8 +457,8 @@ def test_migrate_updates_managed_content_and_preserves_user_configuration(
     upgraded_config = json.loads(config_path.read_text(encoding="utf-8"))
     upgraded_hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
     assert "AI Dev OS 项目格式已迁移" in output
-    assert "已更新：AGENTS.md" in output
-    assert upgraded_agents.count(AGENTS_START) == 1
+    assert "AGENTS.md legacy managed block" in output
+    assert upgraded_agents.count(AGENTS_START) == 0
     assert "旧版托管说明" not in upgraded_agents
     assert "# 用户补充说明" in upgraded_agents
     assert upgraded_config["dispatcher_poll_seconds"] == 2.0
@@ -463,7 +466,13 @@ def test_migrate_updates_managed_content_and_preserves_user_configuration(
     assert upgraded_config["automation"]["auto_finish_pushed_thread"] is False
     assert upgraded_config["automation"]["custom_automation"] == "keep"
     assert upgraded_config["custom_option"] == {"keep": True}
-    assert upgraded_hooks["hooks"]["UserPromptSubmit"][1]["hooks"][0]["command"] == "user-hook"
+    assert upgraded_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "user-hook"
+    assert all(
+        "ai-dev-os" not in str(hook.get("command", ""))
+        for groups in upgraded_hooks["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+    )
 
     first = {
         str(path.relative_to(tmp_path)): path.read_text(encoding="utf-8")
@@ -509,7 +518,7 @@ def test_migrate_preflight_failure_leaves_all_targets_unchanged(
 def test_migrate_adds_missing_nested_defaults_without_replacing_unknown_fields(
     tmp_path: Path,
 ) -> None:
-    initialize_project(tmp_path)
+    project_init._apply_current_project_files(tmp_path)
     config_path = tmp_path / ".ai-dev-os.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["automation"] = {"custom_automation": "keep"}

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -17,6 +17,7 @@ from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.agent_runtime.contracts import AgentRunResult, RuntimeFailure
 from workspace_orchestrator.agent_runtime.ports import AgentExecutionPort
 from workspace_orchestrator.execution_ownership import ExecutionOwnership, ExecutionOwnershipError
+from workspace_orchestrator.executions import ExecutionStore
 from workspace_orchestrator.models import Task
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import (
@@ -164,18 +165,22 @@ def _execution_path(store: WorkspaceStore, task: Task, meta: dict[str, Any]) -> 
     return (path if path.is_absolute() else store.project_root / path).resolve()
 
 
-def _prompt(candidate: DispatchCandidate) -> str:
+def _prompt(candidate: DispatchCandidate, store: WorkspaceStore) -> str:
     comments = "\n".join(f"- {item}" for item in candidate.comments) or "无"
     description = candidate.task.description.strip() or "无补充描述"
+    snapshot = store.load(candidate.requirement_id)
+    execution_id = candidate.execution_id or "待分配"
     return (
-        "你由 AI Dev OS 本地 Dispatcher 自动启动。\n"
-        f"继续 {candidate.requirement_id}，处理 Task {candidate.task.id}："
-        f"{candidate.task.title}\n\n"
-        f"任务描述：\n{description}\n\n"
-        f"任务评论：\n{comments}\n\n"
-        "把这些内容视为本轮用户开发请求，遵守仓库 AGENTS.md、Workspace Context Snapshot "
-        "与 Requirement Intent。完成实现和验证后只调用一次 workspace finalize；"
-        "不要手工重复 Hook 已负责的绑定、Task 或 Session 步骤。"
+        f"你正在执行 AI Dev OS Execution {execution_id}。\n\n"
+        f"Requirement：{candidate.requirement_id}\n"
+        f"Task：{candidate.task.id} - {candidate.task.title}\n\n"
+        f"Goal / Task Description：\n{description}\n\n"
+        f"Requirement Intent（强制约束）：\n{snapshot['intent']}\n\n"
+        f"Acceptance / Requirement：\n{snapshot['requirement']}\n\n"
+        f"Task Comments：\n{comments}\n\n"
+        "仅处理此 Execution 的授权范围，保留用户现有修改；完成实现与针对性验证后，"
+        "返回结构化结果和证据。此 Prompt 只约束 AI Dev OS 启动的 Agent，"
+        "不依赖或接管原生 Codex/Claude/Cursor 生命周期。"
     )
 
 
@@ -409,9 +414,21 @@ class AutoDispatcher:
             ExecutionOwnership(self.store).require_v1(task)
         except ExecutionOwnershipError:
             return "blocked"
-        prompt = _prompt(candidate)
-        sandbox = _config(self.store).agent_sandbox or _config(self.store).codex_sandbox
-        model = _config(self.store).agent_model or _config(self.store).codex_model
+        config = _config(self.store)
+        sandbox = config.agent_sandbox or config.codex_sandbox
+        model = config.agent_model or config.codex_model
+        if candidate.execution_id is None:
+            execution = ExecutionStore(self.store).create(
+                candidate.requirement_id, task.id, role="implementation",
+                runtime_id=config.agent_runtime, provider=config.agent_runtime,
+                model=model, prompt="等待冻结 ExecutionSpec Prompt",
+                workspace_path=candidate.execution_path, source="legacy-dispatcher",
+                creation_key=(
+                    f"dispatcher:{candidate.requirement_id}:{_task_key(task)}:{task.version}"
+                ),
+            )
+            candidate = replace(candidate, execution_id=execution.id)
+        prompt = _prompt(candidate, self.store)
         bypass_hook_trust = _only_managed_hooks(candidate.execution_path)
         try:
             tracked = getattr(self.executor, "execute_tracked", None)

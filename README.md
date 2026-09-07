@@ -63,7 +63,7 @@ ai-dev-os --version
 本仓库，在任意现有项目目录直接运行 `ai-dev-os init`。仅在项目虚拟环境中执行
 `pip install -e` 不会让其他目录自动找到该命令。
 
-更新一次全局 CLI，即可让所有通过稳定 Hook 入口接入的项目使用最新运行时能力：
+更新一次全局 CLI，即可让 Workbench 与显式启用的可选集成使用最新运行时能力：
 
 ```bash
 ai-dev-os upgrade
@@ -93,13 +93,13 @@ cd existing-project
 ai-dev-os init
 ```
 
-该命令会幂等创建用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`，并只在项目中补充项目级接入文件；
+该命令会幂等创建用户级 `~/.ai-dev-os/USER_PRINCIPLES.md`，并注册独立 Workbench 项目；
 重复执行不会覆盖已有用户原则。旧项目根目录中的 `USER_PRINCIPLES.md` 会保留，并仅在用户级文件
 尚不存在时作为首次迁移来源，运行时此后只读取用户级文件。项目中会创建 `.ai-dev-os.json`，默认
-配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，但不会创建
-Requirement Workspace；同时启动本地 Dispatcher。接入完成后，再使用
-`workspace new` 创建首个 Requirement。接入内容包含 `.codex/hooks.json`，Hook 直接调用已安装的
-`ai-dev-os hook`，不要求目标项目包含 AI Dev OS 源码树或项目内 `.venv`。
+配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，并创建空的本地
+Requirement 存储目录。它不会写 `AGENTS.md`、不会创建 `.codex/hooks.json`、不会启动 Dispatcher，
+因此 Codex、Claude Code 与 Cursor 的原生生命周期保持不变。接入完成后，可使用
+`workspace new` 创建首个 Requirement，或从 Workbench 启动 Execution。
 
 用户级目录同时保存长期原则与最小项目索引：
 
@@ -136,8 +136,9 @@ ai-dev-os migrate
 ai-dev-os migrate path/to/existing-project
 ```
 
-`migrate` 会在写入前预检所有目标，然后幂等更新用户级原则、AGENTS 托管区块、Codex Hooks、
-项目配置和受控忽略规则。非托管用户内容、未知配置字段以及显式关闭项会保持不变；预检失败时返回可读错误，
+`migrate` 会在写入前预检所有目标，然后幂等移除旧 AGENTS 托管区块和 AI Dev OS lifecycle Hooks、
+补齐项目配置，并把旧 Session 无损映射为 `source=legacy-thread-binding` 的 Execution。Requirement、Intent、
+Task、Checkpoint、Handoff、Verification、Gate、Decision、Git state、非托管用户内容、未知配置字段及显式关闭项均保持不变；预检失败时返回可读错误，
 不会留下部分迁移状态。普通 CLI 功能更新不需要运行此命令；未接入项目仍应先使用
 `ai-dev-os init`。
 
@@ -196,7 +197,7 @@ workspace confirm REQ-001 --user-confirmed
 workspace request-changes REQ-001 --feedback "请补充失败场景测试"
 ```
 
-`bootstrap` 是新 Codex Thread 的首次执行入口。显式传入 Requirement ID 时接入该需求；
+`bootstrap` 是保留的 Legacy/Compatibility 入口，不再是 Workbench 主路径。显式传入 Requirement ID 时接入该需求；
 无参数时先复用当前 Thread 已有绑定，否则只自动选择唯一可执行 Requirement。
 用户请求以“新增需求”“新建需求”或“创建需求”开头时，Runtime 会用 Hook `turn_id` 幂等创建并接入，
 即使已有多个活动 Requirement 也不再二次确认；否定表达和普通修改仍保留原有歧义门禁。
@@ -215,10 +216,16 @@ Requirement 的 `sessions.json`，当前 Thread 再绑定新 Requirement 的 Tas
 每个未完成 Requirement 会幂等保持一张带 `requirement-space` 标签、且不绑定 Thread 的需求空间卡，以及至少一张带 `requirement-work` 标签的主面板工作卡。需求空间卡汇总状态、阶段、完成项、阻塞项和验证；用户把它移到 `done` 仅关闭该需求的面板可见性，不删除本地 Requirement 或历史任务。历史漏项与
 Provider 离线失败会在后续 bootstrap 补偿，并通过 Requirement 文件锁避免并发重复建卡。
 
-当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 安装的 `.codex/hooks.json` 在
-`SessionStart` 尝试恢复已有绑定，在 `UserPromptSubmit` 读取结构化 hook 事件中的用户 prompt 并自动
-执行完整 bootstrap，在 `SessionEnd` 自动 detach。Hook 运行时来自已安装 wheel。项目 Hook 第一次
-启用或内容变更后必须由用户在 Codex 中审查并信任；未受信任时 Skill 只作为一次 bootstrap 回退触发器。
+默认不安装 Codex lifecycle hooks。若需要把原生 Codex Thread 显式导入已有 Requirement，可选择启用
+只执行导入、不 bootstrap/finalize/detach 的兼容集成：
+
+```bash
+ai-dev-os integration enable codex-hooks
+ai-dev-os integration disable codex-hooks
+```
+
+启用后，prompt 必须明确包含 `REQ-ID` 才会创建 `source=optional-codex-hook` 的 Execution；它不写旧
+`sessions.json`，也不启动 Dispatcher或接管 Stop/SessionEnd。
 
 ## Automation First
 
@@ -237,16 +244,8 @@ Provider 离线失败会在后续 bootstrap 补偿，并通过 Requirement 文�
 
 AI 仍负责语义理解、Root Cause、架构与实现决策、代码修改和 Intent 判断。`finalize` 由 AI 在语义工作完成后触发一次；默认在已知验证、验收标准与 Intent 门禁全部通过后自动把 Requirement 与开发 Task 完成。只有 Requirement 明确记录人工测试/验收时才发布 Review Packet 并进入 `in_review`。验证失败时保留 Session 供修复后重试。
 
-当前 Codex 支持正式 lifecycle hooks。`ai-dev-os init` 会幂等安装项目的
-`.codex/hooks.json`：`SessionStart` 尝试恢复已有绑定，`UserPromptSubmit` 读取结构化 hook
-事件中的用户 prompt 并自动执行完整 bootstrap，`Stop` 检查已推送自动收尾，`SessionEnd`
-自动 detach。finalize 会先把 Session 记为 `pending_auto_finish` 并清除活动绑定；Stop 仍可按 Thread ID
-找到该持久记录。只有当前 Thread 启动后产生新提交、工作树干净、HEAD 与上游完全一致时，
-它才幂等完成关联 Task、归档 Thread并清除 pending，因此真实的“finalize → commit → push → Stop”顺序可收敛。
-将 `.ai-dev-os.json` 中的 `automation.auto_finish_pushed_thread` 设为 `false` 即可关闭。项目配置了
-dashi Task Provider 时，Hook 会先检测本地任务面板端口；未运行则通过本机
-`dashi-taskboard` 启动器在后台按需拉起，已运行则直接复用。项目 Hook 第一次启用或内容
-变更后必须由用户在 Codex 中审查并信任；未受信任时 Skill 只作为一次 bootstrap 回退触发器。
+旧 lifecycle Hook 实现仍保留为兼容代码，供迁移前项目完成在途操作；新接入和完成迁移的项目不会安装或依赖它。
+`ai-dev-os migrate` 会只移除 AI Dev OS 管理的 Hook，保留同一文件中的用户 Hook。
 
 ## Automation First
 
@@ -307,7 +306,7 @@ Requirement meta 与 Git worktree 绑定不会串线。V1 尚不自动创建、�
 ## V2 Git 集成入口（Phase 3）
 
 Git 能力直接复用原生 Git；外部方案与自研边界见 [V2 生态复用选型](V2生态复用选型.md)。
-现有 V1 Workspace、Task Provider、Review Packet 和 Hook 生命周期继续保留。
+现有 V1 Workspace、Task Provider 与 Review Packet 继续保留；Hook 生命周期已降级为兼容代码。
 
 Phase 3 的产品顺序是：为已有需求准备独立 Task 工作树 → 冻结计划 → 执行本批任务 →
 整批受控验证 → 集成候选验证 → Requirement Review → main CAS → post-merge 验证。
