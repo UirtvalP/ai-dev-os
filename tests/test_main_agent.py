@@ -76,6 +76,27 @@ def test_owner_emits_provider_neutral_execution_recommendation(tmp_path: Path) -
     assert recommendation.role == "reviewer" and recommendation.parallelism == 2
 
 
+def test_owner_binds_signals_and_fingerprint_to_one_supervisor_snapshot(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Owner atomic observation", goal="observe")
+    snapshots = [{
+        "schema_version": 1, "revision": 7, "fence": 3, "lease": None,
+        "last_observed_at": 0.0, "data": {"nodes": {}},
+    }]
+
+    def one_snapshot(_owner):
+        assert snapshots, "同一次 observe 不得重复读取 Supervisor"
+        return snapshots.pop()
+
+    monkeypatch.setattr(RequirementOwner, "_supervisor_snapshot", one_snapshot)
+    state = RequirementOwner(store, requirement_id).observe(expected_revision=0)
+    assert state.supervisor_signals == ("revision=7", "fence=3")
+    assert len(state.source_fingerprint) == 64
+    assert snapshots == []
+
+
 def test_owner_rejects_non_json_action_payload(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Owner demo", goal="ship")

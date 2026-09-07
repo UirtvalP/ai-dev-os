@@ -10,7 +10,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .executions import Execution, ExecutionStore
-from .orchestration.contracts import ExecutionRecommendation
+from .orchestration.contracts import ExecutionRecommendation, fingerprint
 from .orchestration.store import OrchestrationStore
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections, now_iso
 
@@ -87,6 +87,7 @@ class RequirementOwnerState:
     cycle: int = 1
     revision: int = 1
     actions: tuple[MainAgentAction, ...] = ()
+    source_fingerprint: str = ""
     updated_at: str = field(default_factory=now_iso)
     schema_version: int = 1
 
@@ -98,6 +99,11 @@ class RequirementOwnerState:
             or type(self.review_required) is not bool
         ):
             raise ValueError("Main Agent State 核心字段不合法")
+        if self.source_fingerprint and (
+            len(self.source_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in self.source_fingerprint)
+        ):
+            raise ValueError("Main Agent State source_fingerprint 不合法")
         for values in (
             self.active_tasks, self.active_executions, self.completed_tasks,
             self.blocked_tasks, self.recent_decisions, self.known_risks, self.next_actions,
@@ -145,6 +151,7 @@ class RequirementOwnerState:
                 supervisor_signals=tuple(value.get("supervisor_signals", ())),
                 loop_stage=value["loop_stage"],
                 cycle=value["cycle"], revision=value["revision"], actions=actions,
+                source_fingerprint=value.get("source_fingerprint", ""),
                 updated_at=value["updated_at"], schema_version=value["schema_version"],
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -171,6 +178,23 @@ class RequirementOwner:
             role, parallelism, reason,
         )
 
+    def source_revision(
+        self, snapshot: dict[str, Any] | None = None,
+        executions: tuple[Execution, ...] | None = None,
+        supervisor: dict[str, Any] | None = None,
+    ) -> str:
+        """摘要 Owner 应观察的全部稳定事实；用于只读检测投影是否过期。"""
+
+        workspace = snapshot if snapshot is not None else self.workspace.load(self.requirement_id)
+        execution_rows = executions if executions is not None else self.executions.list(self.requirement_id)
+        supervisor_facts = supervisor if supervisor is not None else self._supervisor_snapshot()
+        workspace_facts = {**workspace, "path": str(workspace.get("path", ""))}
+        return fingerprint({
+            "workspace": workspace_facts,
+            "executions": [item.to_dict() for item in execution_rows],
+            "supervisor": supervisor_facts,
+        })
+
     @property
     def path(self) -> Path:
         return self.workspace.path_for(self.requirement_id) / "main-agent.json"
@@ -192,6 +216,7 @@ class RequirementOwner:
                 f"Main Agent State revision 已变化：期望 {expected_revision}，实际 {actual_revision}"
             )
         executions = self.executions.list(self.requirement_id)
+        supervisor = self._supervisor_snapshot()
         latest = self._latest_by_task(executions)
         active_status = {"queued", "starting", "running", "waiting"}
         blocked_status = {"blocked", "failed"}
@@ -233,7 +258,7 @@ class RequirementOwner:
             acceptance_criteria=tuple(text for _checked, text in acceptance_lines),
             verification_summary=verification.get("Latest Check", "").strip(),
             git_state=copy.deepcopy(data["meta"].get("git", {})),
-            supervisor_signals=self._supervisor_signals(),
+            supervisor_signals=self._supervisor_signals(supervisor),
             loop_stage=(
                 "observe" if previous is None or previous.loop_stage == "replan"
                 else previous.loop_stage
@@ -243,6 +268,7 @@ class RequirementOwner:
             ),
             revision=previous.revision + 1 if previous else 1,
             actions=previous.actions if previous else (),
+            source_fingerprint=self.source_revision(data, executions, supervisor),
         )
         self.workspace.write_json(self.path, result.to_dict())
         return result
@@ -304,11 +330,13 @@ class RequirementOwner:
         current = self.load_optional()
         return current.revision if current else 0
 
-    def _supervisor_signals(self) -> tuple[str, ...]:
+    def _supervisor_snapshot(self) -> dict[str, Any]:
         root = self.workspace.path_for(self.requirement_id) / "orchestration" / "supervisor"
-        if not (root / "state.json").is_file():
+        return OrchestrationStore(root).snapshot()
+
+    def _supervisor_signals(self, snapshot: dict[str, Any]) -> tuple[str, ...]:
+        if snapshot.get("revision") == 0 and not snapshot.get("data"):
             return ()
-        snapshot = OrchestrationStore(root).snapshot()
         result = [f"revision={snapshot['revision']}", f"fence={snapshot['fence']}"]
         lease = snapshot.get("lease")
         if isinstance(lease, dict):

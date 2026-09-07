@@ -34,7 +34,9 @@ from workspace_orchestrator.deployment import (
     publish_completion_token,
 )
 from workspace_orchestrator.deployment_adapters import LocalGitMainStateProvider
+from workspace_orchestrator.executions import ExecutionStore
 from workspace_orchestrator.integration.contracts import MergeReceipt
+from workspace_orchestrator.main_agent import RequirementOwner
 from workspace_orchestrator.remote_control import (
     RemoteController,
     load_or_create_token,
@@ -160,6 +162,14 @@ def test_dashboard_browser_api_paths_support_reverse_proxy_prefix() -> None:
     assert 'aria-label="控制面导航"' in DASHBOARD_HTML
     assert 'aria-live="polite"' in DASHBOARD_HTML
     assert "api/commands/${id}/${action}" in DASHBOARD_HTML
+    assert "api/executions/${encodeURIComponent(executionId)}" in DASHBOARD_HTML
+    for label in (
+        "Intent / Acceptance / Progress", "Main Agent", "Active Agents / Executions",
+        "Task Graph", "Provider / Runtime", "Model / Reasoning", "Conversation",
+        "Tool calls", "Commands", "Files", "Diff", "Tests", "Errors", "Events",
+    ):
+        assert label in DASHBOARD_HTML
+    assert "projection||{},executions=(p.executions||[])" in DASHBOARD_HTML
 
 
 def test_dashboard_projects_phase_gate_and_workspace_agents(tmp_path: Path) -> None:
@@ -208,6 +218,123 @@ def test_dashboard_projects_phase_gate_and_workspace_agents(tmp_path: Path) -> N
     }
     assert projection["agents"][0]["session_id"] == "session-1"
     assert projection["agents"][0]["role"] == "Control"
+
+
+def test_dashboard_projects_requirement_space_main_agent_and_execution_details(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    store = WorkspaceStore(root, execution_root=root)
+    requirement_id = store.create(
+        "独立工作台", goal="从 Requirement 驱动执行", acceptance=["显示 Execution", "保留事件"],
+    )
+    owner = RequirementOwner(store, requirement_id)
+    owner.observe(expected_revision=0)
+    executions = ExecutionStore(store)
+    parent = executions.create(
+        requirement_id, "TASK-1", role="implementation", runtime_id="codex",
+        model="discovered", reasoning_effort="high", prompt="实现",
+    )
+    parent = executions.update(
+        parent.id, status="completed", session_id="session-1", started_at="2026-09-07T00:00:00+00:00",
+        completed_at="2026-09-07T00:01:30+00:00", summary="完成",
+    )
+    child = executions.create(
+        requirement_id, "TASK-2", role="reviewer", runtime_id="claude", prompt="审查",
+        parent_execution_id=parent.id,
+    )
+    events = RuntimeEventStore(store.root / "runtime-events")
+    events.append(AgentEvent(
+        "message-1", parent.id, "codex", "message", {"text": "完成实现"},
+        session_id="session-1", task_id="TASK-1", requirement_id=requirement_id,
+        execution_id=parent.id,
+    ))
+    events.append(AgentEvent(
+        "tool-1", parent.id, "codex", "tool", {"name": "pytest", "path": "tests/test_a.py"},
+        session_id="session-1", task_id="TASK-1", requirement_id=requirement_id,
+        execution_id=parent.id,
+    ))
+    queue = CommandQueue(store.path_for(requirement_id) / "dashboard" / "commands.json")
+    queue.enqueue(requirement_id, "session-1", "继续", command_id="cmd-1")
+
+    service = DashboardService(store, events, queue)
+    projection = service.requirement(requirement_id)["projection"]
+
+    assert projection["requirement_space"]["goal"] == "从 Requirement 驱动执行"
+    assert projection["requirement_space"]["progress"] == {
+        "executions_total": 2, "executions_terminal": 1,
+        "acceptance_total": 2, "acceptance_completed": 0,
+    }
+    assert projection["main_agent"]["requirement_id"] == requirement_id
+    assert projection["task_graph"] == {"nodes": [], "edges": [], "source": "supervisor"}
+    assert [node["execution_id"] for node in projection["execution_graph"]["nodes"]] == [
+        parent.id, child.id,
+    ]
+    assert projection["execution_graph"]["edges"] == [{
+        "from_execution": parent.id, "to_execution": child.id,
+    }]
+    summary = next(item for item in projection["executions"] if item["id"] == parent.id)
+    assert summary["provider"] == "codex" and summary["duration_seconds"] == 90
+    assert "details" not in summary and "prompt" not in summary
+    page = service.execution(requirement_id, parent.id)
+    assert page["details"]["conversation"][0]["payload"] == {"text": "完成实现"}
+    assert page["details"]["tool_calls"][0]["payload"]["name"] == "pytest"
+    assert page["details"]["files"][0]["event_id"] == "tool-1"
+    assert page["details"]["tests"][0]["event_id"] == "tool-1"
+    assert page["details"]["commands"][0]["command_id"] == "cmd-1"
+    assert page["command_scope"] == "session"
+    assert len(page["details"]["events"]) == 2 and page["has_more"] is False
+
+
+def test_dashboard_execution_details_are_paginated_and_validate_all_identities(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Execution page")
+    execution = ExecutionStore(store).create(
+        requirement_id, "TASK-1", role="worker", runtime_id="codex", prompt="run",
+    )
+    execution = ExecutionStore(store).update(
+        execution.id, status="running", session_id="session-1",
+    )
+    events = RuntimeEventStore(store.root / "runtime-events")
+    for index in range(3):
+        events.append(AgentEvent(
+            f"event-{index}", execution.id, "codex", "message", {"index": index},
+            session_id="session-1", task_id="TASK-1", requirement_id=requirement_id,
+            execution_id=execution.id,
+        ))
+    service = DashboardService(
+        store, events, CommandQueue(store.path_for(requirement_id) / "dashboard" / "commands.json"),
+    )
+    overview = service.requirement(requirement_id)["projection"]["executions"][0]
+    assert "details" not in overview
+    first = service.execution(requirement_id, execution.id, limit=2)
+    assert [item["event_id"] for item in first["details"]["events"]] == ["event-0", "event-1"]
+    assert first["has_more"] is True and first["next_cursor"] == 2
+    second = service.execution(requirement_id, execution.id, after=2, limit=2)
+    assert [item["event_id"] for item in second["details"]["events"]] == ["event-2"]
+    assert second["has_more"] is False
+
+    events.append(AgentEvent(
+        "cross-requirement", execution.id, "codex", "message", {"secret": "other"},
+        session_id="session-1", task_id="TASK-1", requirement_id="REQ-999",
+        execution_id=execution.id,
+    ))
+    with pytest.raises(WorkspaceError, match="身份不匹配"):
+        service.execution(requirement_id, execution.id, after=3)
+
+
+def test_dashboard_marks_main_agent_stale_when_non_phase_source_changes(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Owner freshness", goal="before")
+    owner = RequirementOwner(store, requirement_id)
+    owner.observe(expected_revision=0)
+    service = DashboardService(
+        store, RuntimeEventStore(store.root / "runtime-events"),
+        CommandQueue(store.path_for(requirement_id) / "dashboard" / "commands.json"),
+    )
+    assert service.requirement(requirement_id)["projection"]["main_agent"]["stale"] is False
+    store.touch_meta(requirement_id, title="Owner freshness changed")
+    assert service.requirement(requirement_id)["projection"]["main_agent"]["stale"] is True
 
 
 def test_dashboard_event_projection_rebuild_is_lossless_and_idempotent(tmp_path: Path) -> None:
@@ -267,6 +394,28 @@ def test_controller_rejects_session_from_another_requirement(tmp_path: Path) -> 
     bind_session(store, second, "session-other")
     with pytest.raises(WorkspaceError, match="不属于当前 Requirement"):
         RemoteController(store, first, "session-other", run_id="cross-requirement")
+
+
+def test_controller_execution_details_are_redacted_but_event_store_stays_raw(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Execution redaction")
+    execution = ExecutionStore(store).create(
+        requirement_id, "TASK-1", role="worker", runtime_id="codex", prompt="run",
+    )
+    execution = ExecutionStore(store).update(
+        execution.id, status="running", session_id="session-1",
+    )
+    events = RuntimeEventStore(store.root / "runtime-events")
+    events.append(AgentEvent(
+        "secret-event", execution.id, "codex", "message", {"token": "raw-secret"},
+        session_id="session-1", task_id="TASK-1", requirement_id=requirement_id,
+        execution_id=execution.id,
+    ))
+    controller = RemoteController(store, requirement_id, None, run_id="remote")
+    displayed = controller.execution_details(execution.id)
+    assert displayed["payload_view"] == "redacted"
+    assert displayed["details"]["events"][0]["payload"]["token"] == "[REDACTED]"
+    assert events.replay(execution.id)[0].payload["token"] == "raw-secret"
 
 
 def test_controller_restart_marks_delivered_command_failed(tmp_path: Path) -> None:
@@ -518,6 +667,32 @@ def test_dashboard_http_auth_origin_cursor_redaction_and_requirement_isolation(
     assert RuntimeEventStore(store.root / "runtime-events").replay("remote-http") == ()
 
 
+def test_dashboard_http_execution_details_are_bounded_and_redacted(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Execution HTTP")
+    execution = ExecutionStore(store).create(
+        requirement_id, "TASK-1", role="worker", runtime_id="codex", prompt="run",
+    )
+    execution = ExecutionStore(store).update(
+        execution.id, status="running", session_id="session-1",
+    )
+    events = RuntimeEventStore(store.root / "runtime-events")
+    for index in range(2):
+        events.append(AgentEvent(
+            f"http-event-{index}", execution.id, "codex", "message",
+            {"token": f"secret-{index}"}, session_id="session-1", task_id="TASK-1",
+            requirement_id=requirement_id, execution_id=execution.id,
+        ))
+    controller = RemoteController(store, requirement_id, None, run_id="remote-http-execution")
+    token = "e" * 48
+    with dashboard_server(controller, token) as base:
+        code, page = request_json(f"{base}/api/executions/{execution.id}?limit=1", token)
+        assert code == 200 and page["payload_view"] == "redacted"
+        assert page["has_more"] is True and page["next_cursor"] == 1
+        event_rows = page["details"]["events"]
+        assert isinstance(event_rows, list) and event_rows[0]["payload"]["token"] == "[REDACTED]"
+        code, error = request_json(f"{base}/api/executions/{execution.id}?limit=201", token)
+        assert code == 400 and "limit" in str(error["error"])
 def test_dashboard_http_failed_retry_endpoint_is_idempotent(tmp_path: Path) -> None:
     root = tmp_path / "project"
     store = WorkspaceStore(root, execution_root=root)

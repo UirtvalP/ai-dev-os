@@ -13,7 +13,10 @@ from uuid import uuid4
 
 from .adapters.git import GitError, LocalGitProvider
 from .agent_runtime.events import RuntimeEventStore
-from .workspace import WorkspaceError, WorkspaceStore, _file_lock
+from .executions import Execution, ExecutionStore
+from .main_agent import RequirementOwner
+from .orchestration.store import OrchestrationStore
+from .workspace import WorkspaceError, WorkspaceStore, _file_lock, markdown_sections
 
 CommandStatus = Literal["queued", "delivered", "completed", "failed", "cancelled"]
 
@@ -211,6 +214,17 @@ class DashboardService:
     def requirement(self, requirement_id: str, *, run_id: str | None = None,
                     after: int = 0, limit: int = 200) -> dict[str, Any]:
         snapshot = self.workspace.load(requirement_id)
+        executions = ExecutionStore(self.workspace).list(requirement_id)
+        owner = RequirementOwner(self.workspace, requirement_id).load_optional()
+        requirement_space = self._requirement_space(snapshot, executions)
+        main_agent = owner.to_dict() if owner else None
+        if owner is not None and main_agent is not None:
+            main_agent["stale"] = (
+                not owner.source_fingerprint
+                or owner.source_fingerprint != RequirementOwner(
+                    self.workspace, requirement_id,
+                ).source_revision(snapshot, executions)
+            )
         event_rows = () if run_id is None else self.events.replay(run_id, after=after, limit=limit)
         return {
             "requirement_id": requirement_id,
@@ -218,6 +232,11 @@ class DashboardService:
             "projection": {
                 "phases": self._phases(requirement_id),
                 "agents": self._agents(snapshot),
+                "executions": [self._execution_summary(item) for item in reversed(executions)],
+                "task_graph": self._task_graph(requirement_id),
+                "execution_graph": self._execution_graph(executions),
+                "main_agent": main_agent,
+                "requirement_space": requirement_space,
                 "verification": self._verification(requirement_id),
                 "git": self._git(),
                 "blockers": _markdown_list(snapshot["state"], "已阻塞"),
@@ -225,6 +244,117 @@ class DashboardService:
             },
             "events": [event.to_dict() for event in event_rows],
             "next_cursor": event_rows[-1].sequence if event_rows else after,
+        }
+
+    def execution(
+        self, requirement_id: str, execution_id: str, *, after: int = 0, limit: int = 100,
+    ) -> dict[str, Any]:
+        """按需返回一页 Execution 详情；事件身份不一致时失败关闭。"""
+
+        self.workspace.load(requirement_id)
+        execution = ExecutionStore(self.workspace).get(execution_id)
+        if execution.requirement_id != requirement_id.upper():
+            raise WorkspaceError("Execution 不属于当前 Requirement")
+        page = self.events.query(execution_id=execution.id, after=after, limit=limit + 1)
+        has_more = len(page) > limit
+        events = page[:limit]
+        for event in events:
+            expected = (
+                event.requirement_id == execution.requirement_id
+                and event.task_id == execution.task_id
+                and event.execution_id == execution.id
+                and event.runtime_id == execution.runtime_id
+                and event.session_id == execution.session_id
+            )
+            if not expected:
+                raise WorkspaceError(f"Execution Event 身份不匹配：{event.event_id}")
+        raw_events = tuple(event.to_dict() for event in events)
+        session_commands = tuple(
+            asdict(command) for command in self.commands.history(
+                requirement_id=requirement_id, session_id=execution.session_id,
+            )
+        ) if execution.session_id else ()
+        return {
+            "execution": self._execution_summary(execution),
+            "details": _execution_details(raw_events, session_commands),
+            "command_scope": "session" if execution.session_id else "none",
+            "after": after,
+            "next_cursor": after + len(events),
+            "has_more": has_more,
+            "payload_view": "raw",
+        }
+
+    def _execution_summary(self, execution: Execution) -> dict[str, Any]:
+        return {
+            name: getattr(execution, name) for name in (
+                "id", "requirement_id", "task_id", "role", "runtime_id", "provider",
+                "model", "reasoning_effort", "status", "session_id", "turn_id",
+                "started_at", "completed_at", "parent_execution_id", "summary",
+            )
+        } | {"duration_seconds": _duration_seconds(execution)}
+
+    def _task_graph(self, requirement_id: str) -> dict[str, Any]:
+        snapshot = OrchestrationStore(
+            self.workspace.path_for(requirement_id) / "orchestration" / "supervisor",
+        ).snapshot()
+        data = snapshot.get("data", {})
+        plan = data.get("plan") if isinstance(data, dict) else None
+        nodes_by_id = data.get("nodes") if isinstance(data, dict) else None
+        if not isinstance(plan, dict) or not isinstance(nodes_by_id, dict):
+            return {"nodes": [], "edges": [], "source": "supervisor"}
+        plan_nodes = plan.get("nodes")
+        if not isinstance(plan_nodes, list):
+            raise WorkspaceError("Supervisor Task Graph 损坏")
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, str]] = []
+        for specification in plan_nodes:
+            if not isinstance(specification, dict) or not isinstance(specification.get("task_id"), str):
+                raise WorkspaceError("Supervisor Task Graph 节点损坏")
+            task_id = specification["task_id"]
+            state = nodes_by_id.get(task_id)
+            if not isinstance(state, dict) or not isinstance(state.get("status"), str):
+                raise WorkspaceError("Supervisor Task 状态损坏")
+            nodes.append({"task_id": task_id, "status": state["status"]})
+            dependencies = specification.get("depends_on", [])
+            if not isinstance(dependencies, list):
+                raise WorkspaceError("Supervisor Task 依赖损坏")
+            edges.extend({"from_task": dependency, "to_task": task_id} for dependency in dependencies)
+        return {"nodes": nodes, "edges": edges, "source": "supervisor"}
+
+    def _execution_graph(self, executions: tuple[Execution, ...]) -> dict[str, Any]:
+        return {
+            "nodes": [
+                {"execution_id": item.id, "task_id": item.task_id, "status": item.status}
+                for item in executions
+            ],
+            "edges": [
+                {"from_execution": item.parent_execution_id, "to_execution": item.id}
+                for item in executions if item.parent_execution_id
+            ],
+            "source": "execution-store",
+        }
+
+    def _requirement_space(
+        self, snapshot: dict[str, Any], executions: tuple[Execution, ...],
+    ) -> dict[str, Any]:
+        requirement = markdown_sections(snapshot["requirement"])
+        intent = markdown_sections(snapshot["intent"])
+        state = markdown_sections(snapshot["state"])
+        acceptance = _checkbox_items(snapshot["requirement"])
+        terminal = sum(item.status in {"completed", "failed", "cancelled"} for item in executions)
+        return {
+            "title": snapshot["meta"].get("title"),
+            "status": snapshot["meta"].get("status"),
+            "phase": state.get("Phase", "未记录").strip(),
+            "goal": requirement.get("Goal", "").strip(),
+            "intent": {heading: body.strip() for heading, body in intent.items()},
+            "acceptance": acceptance,
+            "progress": {
+                "executions_total": len(executions),
+                "executions_terminal": terminal,
+                "acceptance_total": len(acceptance),
+                "acceptance_completed": sum(item["completed"] for item in acceptance),
+            },
         }
 
     def _phases(self, requirement_id: str) -> list[dict[str, Any]]:
@@ -361,3 +491,51 @@ def _markdown_list(markdown: str, heading: str) -> list[str]:
         return [] if all(item.startswith("无") for item in items) else items
     text = match.group(1).strip()
     return [] if not text or text == "无" else [text]
+
+
+def _checkbox_items(markdown: str) -> list[dict[str, Any]]:
+    return [
+        {"completed": match.group(1).lower() == "x", "text": match.group(2).strip()}
+        for line in markdown.splitlines()
+        if (match := re.match(r"^\s*-\s*\[([ xX])\]\s+(.+)$", line))
+    ]
+
+
+def _duration_seconds(execution: Execution) -> int | None:
+    if execution.started_at is None:
+        return None
+    try:
+        started = datetime.fromisoformat(execution.started_at)
+        ended = datetime.fromisoformat(
+            execution.completed_at or execution.last_progress_at or execution.updated_at
+        )
+    except ValueError:
+        return None
+    return max(0, int((ended - started).total_seconds()))
+
+
+def _execution_details(
+    events: tuple[dict[str, Any], ...], commands: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """保留完整原始 Event，只额外建立可丢弃的 UI 分类索引。"""
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "conversation": [], "tool_calls": [], "files": [], "diff": [],
+        "tests": [], "errors": [],
+    }
+    for event in events:
+        kind = str(event.get("kind") or "")
+        searchable = json.dumps(event.get("payload", {}), ensure_ascii=False).lower()
+        if kind in {"message", "turn"}:
+            buckets["conversation"].append(event)
+        if kind == "tool":
+            buckets["tool_calls"].append(event)
+        if any(marker in searchable for marker in ('"path"', "file_change", "filechange")):
+            buckets["files"].append(event)
+        if "diff" in searchable or "patch" in searchable:
+            buckets["diff"].append(event)
+        if any(marker in searchable for marker in ("pytest", "verification", '"test"')):
+            buckets["tests"].append(event)
+        if kind == "error" or any(marker in searchable for marker in ('"error"', '"failed"')):
+            buckets["errors"].append(event)
+    return {**buckets, "commands": list(commands), "events": list(events)}
