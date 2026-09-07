@@ -80,6 +80,12 @@ class ExecutionService:
     def map_legacy_sessions(self, requirement_id: str) -> tuple[Execution, ...]:
         """把旧 Session 幂等映射为 Execution，不修改原 sessions.json。"""
 
+        # 同一 Session 的多个 Task 必须作为一个幂等批次观察；否则并发调用可能在
+        # create() 与 queued -> 最终状态 update() 之间读到中间态，并返回不同快照。
+        with self.executions.workspace.locked():
+            return self._map_legacy_sessions_locked(requirement_id)
+
+    def _map_legacy_sessions_locked(self, requirement_id: str) -> tuple[Execution, ...]:
         data = self.executions.workspace.load(requirement_id)
         mapped: list[Execution] = []
         for session in data["sessions"]:
