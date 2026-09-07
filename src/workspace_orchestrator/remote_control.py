@@ -19,9 +19,10 @@ from urllib.parse import parse_qs, urlsplit
 from .agent_runtime.contracts import AgentRunRequest, RuntimeOperationResult, RuntimeSessionRef
 from .agent_runtime.events import RuntimeEventStore
 from .agent_runtime.ports import AgentRuntimePort
-from .composition import create_runtime
+from .composition import create_runtime, create_standard_runtime
 from .dashboard import CommandQueue, DashboardCommand, DashboardService
 from .dashboard_ui import DASHBOARD_HTML
+from .workbench import RuntimeFactory, WorkbenchExecutionService
 from .workspace import WorkspaceError, WorkspaceStore
 
 MAX_BODY_BYTES = 65_536
@@ -57,6 +58,7 @@ class RemoteController:
         *,
         run_id: str,
         runtime_factory: Callable[..., AgentRuntimePort] = create_runtime,
+        workbench_runtime_factory: RuntimeFactory | None = None,
         wait_seconds: float = 300,
     ) -> None:
         snapshot = workspace.load(requirement_id)
@@ -81,6 +83,12 @@ class RemoteController:
         )
         self.dashboard = DashboardService(workspace, self.events, self.commands)
         self._runtime_factory = runtime_factory
+        self.workbench = WorkbenchExecutionService(
+            workspace,
+            workbench_runtime_factory or (
+                lambda name, events: create_standard_runtime(name, events=events)
+            ),
+        )
         self._runtime: AgentRuntimePort | None = None
         self._session: RuntimeSessionRef | None = None
         self._active_command_id: str | None = None
@@ -123,10 +131,37 @@ class RemoteController:
             result = self.dashboard.execution(
                 self.requirement_id, execution_id, after=after, limit=limit,
             )
+            result["reply"] = self.workbench.reply_capability(
+                self.requirement_id, execution_id,
+            )
             redacted = _redact(result)
             assert isinstance(redacted, dict)
             redacted["payload_view"] = "redacted"
             return redacted
+
+    def execution_message(
+        self, execution_id: str, text: str, *, command_id: str,
+    ) -> dict[str, Any]:
+        """向 Execution 已绑定的原 Session 投递；绝不回退为新建 Agent。"""
+
+        message = _validate_message(text)
+        with self._lock:
+            operation = self.workbench.reply(
+                self.requirement_id, execution_id.upper(), message, command_id=command_id,
+            )
+        result: dict[str, Any] = {
+            **operation.data,
+            "status": operation.status,
+            "execution_id": execution_id.upper(),
+            "session_id": operation.session.session_id if operation.session else None,
+            "turn_id": operation.turn_id,
+            "command_id": command_id,
+        }
+        if operation.error:
+            result["error"] = operation.error.to_dict()
+        redacted = _redact(result)
+        assert isinstance(redacted, dict)
+        return redacted
 
     def message(
         self,
@@ -303,10 +338,23 @@ class RemoteController:
 
     def close(self) -> None:
         with self._lock:
-            if self._runtime is not None:
-                self._runtime.close()
+            legacy_error: Exception | None = None
+            try:
+                if self._runtime is not None:
+                    self._runtime.close()
+            except Exception as exc:  # noqa: BLE001 -- 仍须继续清理 Workbench Runtime。
+                legacy_error = exc
+            else:
                 self._runtime = None
                 self._session = None
+            try:
+                self.workbench.close()
+            except Exception as exc:
+                if legacy_error:
+                    raise WorkspaceError(f"Runtime 清理失败：{legacy_error}；{exc}") from exc
+                raise
+            if legacy_error:
+                raise legacy_error
 
 
 def _validate_message(value: Any) -> str:
@@ -485,6 +533,28 @@ def serve_remote_control(
                 self._json(HTTPStatus.FORBIDDEN, {"error": "请求来源与 Dashboard 不一致"})
                 return
             try:
+                execution_match = re.fullmatch(
+                    r"/api/executions/(EXE-\d{6,})/message", self.path, re.IGNORECASE,
+                )
+                if execution_match is not None:
+                    payload = self._payload({"message", "command_id"}, required=True)
+                    message, command_id = payload.get("message"), payload.get("command_id")
+                    if not isinstance(message, str):
+                        raise WorkspaceError("message 必须是字符串")
+                    if not isinstance(command_id, str):
+                        raise WorkspaceError("command_id 必须是字符串")
+                    result = controller.execution_message(
+                        execution_match.group(1).upper(), message, command_id=command_id,
+                    )
+                    status = {
+                        "ok": HTTPStatus.ACCEPTED,
+                        "unsupported": HTTPStatus.CONFLICT,
+                        "unavailable": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "failed": HTTPStatus.BAD_GATEWAY,
+                        "timeout": HTTPStatus.GATEWAY_TIMEOUT,
+                    }.get(str(result.get("status")), HTTPStatus.BAD_GATEWAY)
+                    self._json(status, result)
+                    return
                 if self.path == "/api/message":
                     payload = self._payload(
                         {"message", "command_id", "session_id", "delivery"}, required=True,
