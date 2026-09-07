@@ -19,6 +19,8 @@ from .agent_runtime.events import RuntimeEventStore
 from .composition import configured_workbench
 from .dashboard import CommandQueue, DashboardService
 from .models import WorkflowComplexity
+from .project_config import load_project_config
+from .project_init import register_project
 from .project_registry import GlobalProjectRegistry, RegisteredProject
 from .remote_control import MAX_BODY_BYTES, MIN_TOKEN_BYTES, _redact
 from .workbench import WorkbenchExecutionService, WorkbenchStart
@@ -92,6 +94,46 @@ class WorkbenchHub:
             "project_id": project.id,
             "requirement_id": requirement_id,
             "requirement": self.requirement(project.id, requirement_id),
+        }
+
+    def add_project(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """创建或接入一个项目目录，并绑定到全局 Workbench。"""
+
+        raw_path = _required_text(payload, "path", maximum=4_096)
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            raise WorkspaceError("项目路径必须是绝对路径")
+        path = path.resolve()
+        mode = _optional_text(payload.get("mode"), maximum=16) or "add"
+        if mode not in {"add", "create"}:
+            raise WorkspaceError("mode 必须是 add 或 create")
+        if mode == "create":
+            if path.exists():
+                raise WorkspaceError(f"新项目目录已存在：{path}")
+            path.mkdir(parents=True)
+        elif not path.is_dir():
+            raise WorkspaceError(f"要添加的项目目录不存在：{path}")
+
+        result = register_project(path)
+        config = load_project_config(result.root)
+        if config is None:
+            raise WorkspaceError(f"项目初始化后仍缺少配置：{result.root}")
+        project = self.registry.register(result.root, config)
+        return {
+            "project": self._project_summary(project),
+            "created": result.created,
+            "updated": result.updated,
+            "preserved": result.preserved,
+        }
+
+    def remove_project(self, project_id: str) -> dict[str, Any]:
+        """只解除 Workbench 绑定，不删除项目或 Requirement 文件。"""
+
+        project = self.registry.unregister(unquote(project_id))
+        return {
+            "project_id": project.id,
+            "status": "unregistered",
+            "preserved": ["项目目录", ".workspace", "Git", "Task"],
         }
 
     def message(
@@ -249,6 +291,10 @@ def serve_workbench(
             if not self._guard():
                 return
             try:
+                if path == "/api/projects":
+                    payload = self._payload({"path", "mode"})
+                    self._json(HTTPStatus.CREATED, hub.add_project(payload))
+                    return
                 create_match = re.fullmatch(r"/api/projects/([^/]+)/requirements", path)
                 if create_match:
                     payload = self._payload({"title", "goal", "acceptance", "complexity"})
@@ -273,6 +319,19 @@ def serve_workbench(
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
             except (json.JSONDecodeError, OSError, WorkspaceError, ValueError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+        def do_DELETE(self) -> None:
+            path = urlsplit(self.path).path
+            if not self._guard():
+                return
+            try:
+                match = re.fullmatch(r"/api/projects/([^/]+)", path)
+                if match:
+                    self._json(HTTPStatus.OK, hub.remove_project(match.group(1)))
+                    return
+                self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
+            except (OSError, WorkspaceError, ValueError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         def _guard(self) -> bool:

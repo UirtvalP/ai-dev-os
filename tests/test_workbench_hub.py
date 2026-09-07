@@ -9,12 +9,14 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import pytest
+
 from workspace_orchestrator import workbench_hub
 from workspace_orchestrator.project_config import ProjectConfig
 from workspace_orchestrator.project_registry import GlobalProjectRegistry
 from workspace_orchestrator.workbench_hub import WorkbenchHub, serve_workbench
 from workspace_orchestrator.workbench_hub_ui import WORKBENCH_HUB_HTML
-from workspace_orchestrator.workspace import WorkspaceStore
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
 def _hub(tmp_path: Path) -> tuple[WorkbenchHub, str, Path]:
@@ -66,6 +68,40 @@ def test_hub_creates_requirement_and_opens_full_space(tmp_path: Path) -> None:
     assert detail["workspace"]["meta"]["title"] == "从 Workbench 创建"
     assert "创建成功" in detail["workspace"]["requirement"]
     assert hub.catalog()["counts"]["requirements"] == 2
+
+
+def test_hub_adds_existing_and_creates_new_project_then_unbinds(tmp_path: Path) -> None:
+    hub, _, _ = _hub(tmp_path)
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    marker = existing / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    created = tmp_path / "new-project"
+
+    added = hub.add_project({"path": str(existing), "mode": "add"})
+    new = hub.add_project({"path": str(created), "mode": "create"})
+
+    assert added["project"]["path"] == str(existing.resolve())
+    assert new["project"]["path"] == str(created.resolve())
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert (existing / ".ai-dev-os.json").is_file()
+    assert (created / "PROJECT_INTENT.md").is_file()
+    assert hub.catalog()["counts"]["projects"] == 3
+
+    removed = hub.remove_project(added["project"]["id"])
+
+    assert removed["status"] == "unregistered"
+    assert existing.is_dir() and marker.is_file()
+    assert hub.catalog()["counts"]["projects"] == 2
+
+
+def test_hub_rejects_relative_or_existing_create_path(tmp_path: Path) -> None:
+    hub, _, _ = _hub(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="绝对路径"):
+        hub.add_project({"path": "relative/project", "mode": "add"})
+    with pytest.raises(WorkspaceError, match="已存在"):
+        hub.add_project({"path": str(tmp_path), "mode": "create"})
 
 
 def test_requirement_detail_redacts_sensitive_workspace_text(tmp_path: Path) -> None:
@@ -184,9 +220,29 @@ def test_workbench_http_loopback_mode_needs_no_token(tmp_path: Path) -> None:
     assert catalog["counts"]["requirements"] == 1
 
 
+def test_workbench_http_can_bind_another_project(tmp_path: Path) -> None:
+    hub, _, _ = _hub(tmp_path)
+    another = tmp_path / "another"
+    another.mkdir()
+    with _server(hub) as base:
+        status, result = _json(
+            f"{base}/api/projects", None,
+            {"path": str(another), "mode": "add"},
+        )
+        catalog_status, catalog = _json(f"{base}/api/workbench", None)
+
+    assert status == 201
+    assert result["project"]["path"] == str(another.resolve())
+    assert catalog_status == 200 and catalog["counts"]["projects"] == 2
+
+
 def test_workbench_ui_exposes_core_requirement_space_actions() -> None:
     for label in (
-        "＋ 新需求",
+        "＋ 项目",
+        "＋ 需求",
+        "添加现有项目",
+        "创建新项目",
+        "解除绑定",
         "开始 / 继续执行",
         "Intent",
         "Acceptance",

@@ -1,7 +1,8 @@
 # P6 Requirement Space 迁移说明
 
 - 新的正式入口为 `ai-dev-os workbench serve`：无需 REQ-ID，自动打开项目与 Requirement Space 首页。
-- 在已接入项目目录启动时会幂等补登记当前项目；页面支持新建 Requirement、进入详情并开始/继续真实执行。
+- 页面可添加现有项目、创建新项目、同时绑定多个项目并无损解除绑定；也支持新建 Requirement、进入详情并开始/继续真实执行。
+- 在已接入项目目录启动时会幂等补登记当前项目。
 - 默认本机回环入口免 Token，打开 `http://127.0.0.1:8765/` 即进入需求空间。
 - 局域网、公网、反向代理或隧道入口必须使用 `--remote-access`；该模式从
   `~/.ai-dev-os/secrets/workbench.token` 加载 Token，浏览器通过 fragment 自动接收并立即清除。

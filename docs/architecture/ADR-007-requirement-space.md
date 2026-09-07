@@ -14,6 +14,10 @@ Token；局域网、公网、反向代理或隧道入口必须显式使用 `--re
 Workbench 才在所选项目根内启动 `workspace-write` Runtime，审批仍为拒绝。原 `dashboard serve REQ-ID`
 继续作为固定 Requirement 的只读远程兼容入口。
 
+首页的项目管理支持两条显式路径：添加现有目录时无损补齐项目接入文件；创建新项目时要求目标目录
+不存在。两者都登记到同一 Global Project Registry，允许一个 Workbench 绑定多个项目。解除绑定只
+删除全局索引，不删除项目目录、Requirement、Git 或 Task。
+
 主页面展示 Intent、Acceptance、Progress、Main Agent、Active Execution、Task Graph 和交付证据。
 Execution Details 展示 Provider、Runtime、Model、Reasoning、Task、Status、Duration，并把 Conversation、
 Tool calls、Commands、Files、Diff、Tests、Errors 和 Events 分区呈现。详情通过独立分页接口按需读取，

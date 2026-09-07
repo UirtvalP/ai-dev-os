@@ -59,8 +59,8 @@ ai-dev-os workbench serve
 ```
 
 Workbench 会在本机回环地址启动并自动打开浏览器，本地访问不要求 Token。首页从 Global Project
-Registry 自动列出全部项目及其 Requirement
-Space；在已接入项目目录启动时会幂等补登记当前项目。用户可以在页面中新建 Requirement、进入任一
+Registry 自动列出全部项目及其 Requirement Space；“＋项目”可以添加现有目录或创建新项目，一个
+Workbench 可绑定多个项目，并能在不删除文件的前提下解除绑定。在已接入项目目录启动时也会幂等补登记当前项目。用户可以在页面中新建 Requirement、进入任一
 Requirement Space，查看 Intent、Acceptance、Progress、Task、Execution、Agent、Verification 与 Git，
 并通过“开始 / 继续执行”明确启动项目内 `workspace-write` Runtime。默认服务只监听 loopback，审批保持拒绝；
 启用局域网、公网或隧道访问时必须显式增加 `--remote-access` 并使用 Token。
