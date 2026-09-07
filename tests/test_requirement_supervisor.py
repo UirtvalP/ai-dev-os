@@ -315,6 +315,31 @@ def test_parallel_ready_nodes_respect_global_slot_bound(harness: Harness) -> Non
     assert node(supervisor, waiting)["status"] == "pending"
 
 
+def test_parallel_readonly_tasks_may_share_explicit_workspace(harness: Harness) -> None:
+    first = harness.task("READ-A")
+    second = replace(harness.task("READ-B"), worktree=first.worktree)
+    supervisor = harness.supervisor(max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(first, second))
+    supervisor.tick()
+    supervisor.tick()
+    assert {item[2].task_id for item in harness.workers.dispatches} == {"READ-A", "READ-B"}
+
+
+def test_overlapping_workspace_stays_exclusive_when_either_task_writes(harness: Harness) -> None:
+    reader = harness.task("READ")
+    writer = replace(
+        harness.task("WRITE", write_required=True, branch="feat/write"),
+        worktree=reader.worktree,
+    )
+    supervisor = harness.supervisor(max_workers=2)
+    supervisor.acquire()
+    supervisor.initialize(request(reader, writer))
+    supervisor.tick()
+    supervisor.tick()
+    assert len(harness.workers.dispatches) == 1
+
+
 @pytest.mark.parametrize("change", [
     {"available": False}, {"models": ()},
     {"capabilities": ("start", "events", "profile:read-only")},

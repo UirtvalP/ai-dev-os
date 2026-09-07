@@ -12,6 +12,7 @@ from .automation.task_attach import configured_task_provider
 from .composition import create_runtime, runtime_descriptors
 from .delivery_guard import mark_v2_delivery
 from .execution_ownership import ExecutionOwnership
+from .multi_agent import ExecutionTrackedWorkerPort
 from .orchestration.contracts import ExecutionPlan, PlanningRequest
 from .orchestration.isolation import WindowsAppContainerIsolation
 from .orchestration.projection import TaskProjection, TaskProjectionPump
@@ -58,12 +59,16 @@ def configured_supervisor(
         if executable:
             tools.append(Path(executable).resolve().parent)
     launcher = WindowsAppContainerIsolation(controller_roots=(Path(__file__).resolve().parent,))
-    workers = RuntimeWorkerPort(
+    runtime_workers = RuntimeWorkerPort(
         worker_root, requirement_id=requirement_id, runtime_factory=create_runtime,
         launcher=launcher, protected_roots=protected, readonly_tools=tuple(dict.fromkeys(tools)),
         allow_network=allow_network,
         authority_guard=lambda fence: store.guard_epoch(owner, fence),
         candidate_reader=git_workspaces.capture_candidate if git_workspaces else None,
+    )
+    workers = ExecutionTrackedWorkerPort(
+        workspace, requirement_id, runtime_workers,
+        source_events=getattr(runtime_workers, "events", None),
     )
 
     def claim(request: PlanningRequest, plan: ExecutionPlan) -> None:

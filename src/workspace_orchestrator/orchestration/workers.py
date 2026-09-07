@@ -181,7 +181,19 @@ class RuntimeWorkerPort:
                     unconfirmed = holder is not None and holder.result_unconfirmed.is_set()
                     if value["observation"]["state"] not in _TERMINAL or unconfirmed:
                         other = Path(value["task"]["worktree"]).resolve()
-                        if root == other or root in other.parents or other in root.parents:
+                        overlaps = root == other or root in other.parents or other in root.parents
+                        other_task = TaskSpec.from_dict(value["task"])
+                        # live 且已确认身份的双只读 attempt 可以共享；重启遗留的
+                        # 非终态记录与任何持久化/清理未确认结果都必须继续独占目录。
+                        unknown_owner = (
+                            value["observation"]["state"] == "unknown" or unconfirmed or (
+                            value["observation"]["state"] not in _TERMINAL
+                            and holder is None
+                            )
+                        )
+                        if overlaps and (
+                            unknown_owner or task.write_required or other_task.write_required
+                        ):
                             raise PolicyError("worktree_busy", "Task worktree 仍被未终止尝试占用")
                 attempts[attempt_id] = {
                     "fingerprint": identity, "fence": fence, "task": task.to_dict(),

@@ -332,20 +332,55 @@ def run(args: argparse.Namespace) -> str:
         service = configured_integration(workspace, args.requirement_id)
         if args.integration_command == "status":
             integration_result = service.status(args.requirement_id, args.request_id)
-        elif args.integration_command == "reconcile":
-            integration_result = service.reconcile(args.requirement_id, args.request_id).to_dict()
-        elif args.integration_command == "recover-post-merge":
-            integration_result = service.recover_post_merge(
-                args.requirement_id, args.request_id, args.recovery_id,
-            ).to_dict()
         else:
+            from .multi_agent import IntegrationExecutionService
+            from .orchestration.store import OrchestrationStore
+
+            supervisor_snapshot = OrchestrationStore(
+                workspace.path_for(args.requirement_id) / "orchestration" / "supervisor",
+            ).snapshot()
+            nodes = supervisor_snapshot.get("data", {}).get("nodes", {})
+            task_ids = tuple(nodes) if isinstance(nodes, dict) else ()
+            tracked_integration = IntegrationExecutionService(workspace)
+            if args.integration_command == "reconcile":
+                receipt = service.reconcile(args.requirement_id, args.request_id).to_dict()
+                tracked_integration.record(
+                    args.requirement_id, task_ids, command_id=args.request_id,
+                    supervisor_snapshot=supervisor_snapshot, receipt=receipt,
+                )
+                integration_result = receipt
+                return json.dumps(integration_result, ensure_ascii=False, indent=2)
+            if args.integration_command == "recover-post-merge":
+                receipt = service.recover_post_merge(
+                    args.requirement_id, args.request_id, args.recovery_id,
+                ).to_dict()
+                tracked_integration.record(
+                    args.requirement_id, task_ids, command_id=args.request_id,
+                    supervisor_snapshot=supervisor_snapshot, receipt=receipt,
+                )
+                integration_result = receipt
+                return json.dumps(integration_result, ensure_ascii=False, indent=2)
             from .integration_composition import configured_verification
 
-            integration_result = service.integrate(
-                args.requirement_id, args.request_id, args.expected_main,
-                load_verification_commands(workspace, args.commands_file),
-                configured_verification(workspace).environment,
-            ).to_dict()
+            execution = tracked_integration.run(
+                args.requirement_id, task_ids, command_id=args.request_id,
+                supervisor_snapshot=supervisor_snapshot,
+                integrate=lambda: service.integrate(
+                    args.requirement_id, args.request_id, args.expected_main,
+                    load_verification_commands(workspace, args.commands_file),
+                    configured_verification(workspace).environment,
+                ).to_dict(),
+            )
+            if "receipt" not in execution.result:
+                raise WorkspaceError(
+                    execution.summary or "Integration Execution 结果未知；请先 reconcile",
+                )
+            integration_result = {
+                **execution.result.get("receipt", {}),
+                "completion_token": None,
+                "execution_id": execution.id,
+                "execution_status": execution.status,
+            }
         return json.dumps(integration_result, ensure_ascii=False, indent=2)
     if args.command == "orchestration":
         from .orchestration.contracts import PolicyError
