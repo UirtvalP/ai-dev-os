@@ -310,9 +310,12 @@ def run(args: argparse.Namespace) -> str:
         return json.dumps(orchestration_result, ensure_ascii=False, indent=2)
     if args.command == "runtime":
         if args.runtime_command == "list":
-            return json.dumps(
-                [asdict(item) for item in runtime_descriptors()], ensure_ascii=False, indent=2
-            )
+            descriptions = []
+            for item in runtime_descriptors():
+                document = asdict(item)
+                document["canonical_capabilities"] = item.canonical_capabilities
+                descriptions.append(document)
+            return json.dumps(descriptions, ensure_ascii=False, indent=2)
         execution_root = args.root.expanduser().resolve()
         store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
         events = RuntimeEventStore(store.root / "runtime-events").replay(

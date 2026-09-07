@@ -15,6 +15,39 @@ STANDARD_EVENT_KINDS = frozenset({
     "session", "turn", "message", "tool", "approval", "error", "completion", "unknown",
 })
 
+CANONICAL_RUNTIME_CAPABILITIES = (
+    "start",
+    "resume",
+    "interactive_message",
+    "event_stream",
+    "cancel",
+    "status",
+    "archive",
+    "model_selection",
+    "reasoning_selection",
+    "approval",
+    "tool_events",
+    "diff_events",
+)
+
+_CAPABILITY_ALIASES: dict[str, frozenset[str]] = {
+    "interactive_message": frozenset(("interactive_message", "message")),
+    "event_stream": frozenset(("event_stream", "events")),
+    "cancel": frozenset(("cancel", "interrupt")),
+    "status": frozenset(("status", "read")),
+    "model_selection": frozenset(("model_selection", "models")),
+    "approval": frozenset(("approval", "approval_response")),
+    "tool_events": frozenset(("tool_events", "events")),
+}
+_CAPABILITY_CANONICAL_BY_ALIAS = {
+    "message": "interactive_message",
+    "events": "event_stream",
+    "interrupt": "cancel",
+    "read": "status",
+    "models": "model_selection",
+    "approval_response": "approval",
+}
+
 
 def standard_event_kind(detail: str) -> str:
     """Adapter 对外只发布统一类别；结束事件不代表成功或需求完成。"""
@@ -63,7 +96,22 @@ class RuntimeDescriptor:
     schema_version: int = SCHEMA_VERSION
 
     def supports(self, capability: str) -> bool:
-        return self.available and capability in self.capabilities
+        if not self.available:
+            return False
+        canonical = _CAPABILITY_CANONICAL_BY_ALIAS.get(capability, capability)
+        if canonical == "reasoning_selection":
+            return any(model.reasoning_efforts for model in self.models)
+        aliases = _CAPABILITY_ALIASES.get(canonical, frozenset((canonical,)))
+        return not aliases.isdisjoint(self.capabilities)
+
+    @property
+    def canonical_capabilities(self) -> tuple[str, ...]:
+        """返回稳定契约词汇，同时保留 Adapter 的旧能力名用于兼容。"""
+
+        return tuple(
+            capability for capability in CANONICAL_RUNTIME_CAPABILITIES
+            if self.supports(capability)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +122,11 @@ class RuntimeSessionRef:
     workspace_path: str = ""
     schema_version: int = SCHEMA_VERSION
     execution_id: str | None = None
+    sandbox: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    requirement_id: str | None = None
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +144,44 @@ class AgentRunRequest:
     schema_version: int = SCHEMA_VERSION
     reasoning_effort: str | None = None
     execution_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSpec:
+    """Workbench 启动 Runtime 的 Provider 无关输入。"""
+
+    run_id: str
+    workspace_path: Path
+    message: str
+    execution_id: str
+    sandbox: str = "workspace-write"
+    model: str | None = None
+    reasoning_effort: str | None = None
+    requirement_id: str | None = None
+    task_id: str | None = None
+    bypass_hook_trust: bool = False
+    timeout_seconds: float = 7200
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip() or not self.execution_id.strip():
+            raise ValueError("ExecutionSpec run_id 与 execution_id 必须是非空字符串")
+
+    def to_request(self, *, resume_session_id: str | None = None) -> AgentRunRequest:
+        return AgentRunRequest(
+            run_id=self.run_id,
+            workspace_path=self.workspace_path,
+            prompt=self.message,
+            sandbox=self.sandbox,
+            model=self.model,
+            resume_session_id=resume_session_id,
+            bypass_hook_trust=self.bypass_hook_trust,
+            timeout_seconds=self.timeout_seconds,
+            requirement_id=self.requirement_id,
+            task_id=self.task_id,
+            reasoning_effort=self.reasoning_effort,
+            execution_id=self.execution_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)

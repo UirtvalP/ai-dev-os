@@ -165,6 +165,9 @@ class CursorAcpRuntime:
                 extra={"detail_kind": kind},
                 session_id=self._session.session_id if self._session else None,
                 turn_id=turn_id,
+                requirement_id=self._request.requirement_id,
+                task_id=self._request.task_id,
+                execution_id=self._request.execution_id,
             ))
 
     def _connect(self, workspace_path: Path) -> RuntimeOperationResult | None:
@@ -240,7 +243,10 @@ class CursorAcpRuntime:
                 params["sessionId"] = request.resume_session_id
                 self._session = RuntimeSessionRef(
                     self.runtime_id, str(request.resume_session_id), request.run_id,
-                    str(request.workspace_path),
+                    str(request.workspace_path), execution_id=request.execution_id,
+                    sandbox=request.sandbox, model=request.model,
+                    reasoning_effort=request.reasoning_effort,
+                    requirement_id=request.requirement_id, task_id=request.task_id,
                 )
             result = client.request("session/load" if resumed else "session/new", params,
                                           timeout=self.timeout_seconds)
@@ -249,6 +255,9 @@ class CursorAcpRuntime:
                 raise RpcTransportError("protocol_error", "Cursor 未返回有效 sessionId")
             self._session = RuntimeSessionRef(
                 self.runtime_id, session_id, request.run_id, str(request.workspace_path),
+                execution_id=request.execution_id, sandbox=request.sandbox, model=request.model,
+                reasoning_effort=request.reasoning_effort,
+                requirement_id=request.requirement_id, task_id=request.task_id,
             )
             self._update_models(result)
             if request.sandbox == "read-only":

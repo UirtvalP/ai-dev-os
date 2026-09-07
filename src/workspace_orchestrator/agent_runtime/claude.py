@@ -146,6 +146,9 @@ class ClaudeCliRuntime:
                 extra={"detail_kind": kind},
                 session_id=self._session.session_id if self._session else None,
                 turn_id=turn_id,
+                requirement_id=self._request.requirement_id,
+                task_id=self._request.task_id,
+                execution_id=self._request.execution_id,
             ))
 
     def _on_error(self, error: RpcTransportError) -> None:
@@ -308,6 +311,9 @@ class ClaudeCliRuntime:
                     raise ValueError("Claude 未确认所请求的实际模型 ID")
                 self._session = RuntimeSessionRef(
                     self.runtime_id, session_id, self._request.run_id, str(self._request.workspace_path),
+                    execution_id=self._request.execution_id, sandbox=self._request.sandbox,
+                    model=self._request.model, reasoning_effort=self._request.reasoning_effort,
+                    requirement_id=self._request.requirement_id, task_id=self._request.task_id,
                 )
                 self._version = str(message.get("claude_code_version", "未报告"))
                 self._emit("session.resumed" if self._request.resume_session_id else "session.started",

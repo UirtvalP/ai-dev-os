@@ -143,6 +143,9 @@ class CodexRuntime:
                 run_id=self._request.run_id if self._request else self._discovery_id,
                 runtime_id="codex", kind=kind, payload=message,
                 session_id=session_id, turn_id=turn_id,
+                requirement_id=self._request.requirement_id if self._request else None,
+                task_id=self._request.task_id if self._request else None,
+                execution_id=self._request.execution_id if self._request else None,
             ))
 
     def _on_notification(self, message: JsonObject) -> None:
@@ -311,7 +314,10 @@ class CodexRuntime:
             if resumed and session_id != request.resume_session_id:
                 raise RpcTransportError("protocol_error", "resume 响应 Thread ID 不匹配")
             self._session = RuntimeSessionRef(
-                "codex", session_id, request.run_id, str(request.workspace_path.resolve())
+                "codex", session_id, request.run_id, str(request.workspace_path.resolve()),
+                execution_id=request.execution_id, sandbox=request.sandbox, model=request.model,
+                reasoning_effort=request.reasoning_effort,
+                requirement_id=request.requirement_id, task_id=request.task_id,
             )
             self._resumed = resumed
             return self.send_message(self._session, request.prompt)
