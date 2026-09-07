@@ -159,7 +159,7 @@ def test_registry_failure_does_not_roll_back_successful_project_init(
     assert main(["init", str(path)]) == 0
 
     output = capsys.readouterr().out
-    assert "项目接入成功，但全局注册失败" in output
+    assert "项目注册成功，但全局注册失败" in output
     assert "再次运行同一命令可重试" in output
     assert (path / ".ai-dev-os.json").is_file()
     assert (path / "PROJECT_INTENT.md").is_file()
