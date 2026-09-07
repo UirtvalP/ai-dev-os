@@ -8,6 +8,8 @@ from typing import Protocol
 from ..agent_runtime.contracts import RuntimeDescriptor
 from .contracts import (
     ExecutionPlan,
+    ExecutionPolicyResult,
+    ExecutionRecommendation,
     ModelRoute,
     PlanningRequest,
     PolicyDecision,
@@ -30,6 +32,13 @@ class ModelRouterProvider(Protocol):
     def route(
         self, task: TaskSpec, runtimes: tuple[RuntimeDescriptor, ...]
     ) -> tuple[ModelRoute, PolicyDecision]: ...
+
+
+class ExecutionRoutingPolicyProvider(Protocol):
+    def decide(
+        self, task: TaskSpec, runtimes: tuple[RuntimeDescriptor, ...],
+        recommendation: ExecutionRecommendation, *, max_parallelism: int = 1,
+    ) -> tuple[ExecutionPolicyResult, PolicyDecision]: ...
 
 
 class VerificationPlannerProvider(Protocol):

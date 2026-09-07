@@ -10,6 +10,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .executions import Execution, ExecutionStore
+from .orchestration.contracts import ExecutionRecommendation
 from .orchestration.store import OrchestrationStore
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections, now_iso
 
@@ -157,6 +158,18 @@ class RequirementOwner:
         self.workspace = workspace
         self.requirement_id = requirement_id.upper()
         self.executions = ExecutionStore(workspace)
+
+    def recommend_execution(
+        self, *, role: str, parallelism: int = 1, runtime_id: str | None = None,
+        model: str | None = None, effort: str | None = None, reason: str = "",
+    ) -> ExecutionRecommendation:
+        """形成 Provider 无关软建议；是否可执行必须再交给 Routing Policy 裁决。"""
+
+        self.workspace.load(self.requirement_id)
+        return ExecutionRecommendation(
+            f"main-agent:{self.requirement_id}", runtime_id, model, effort,
+            role, parallelism, reason,
+        )
 
     @property
     def path(self) -> Path:
