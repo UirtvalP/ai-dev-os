@@ -6,9 +6,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .adapters.agent import CodexAgentProvider
+from .agent_runtime.events import RuntimeEventStore
 from .automation.delegation import delegate_task, request_cancel, worker_status
 from .automation.requirement_attach import AutomationAmbiguity, discover_project_root
 from .automation.runtime import AutomationRuntime
@@ -16,7 +18,7 @@ from .automation.session_runtime import require_session_id
 from .automation.task_attach import configured_task_provider
 from .console import configure_standard_streams
 from .context import bootstrap_session, build_snapshot, checkpoint, handoff
-from .integration_composition import configured_phase_verification
+from .executions import ExecutionService, ExecutionStore
 from .models import WorkflowComplexity
 from .phase_gate import (
     GateStore,
@@ -24,6 +26,14 @@ from .phase_gate import (
 )
 from .workflow import route_workflow
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections
+
+
+def configured_phase_verification(store: WorkspaceStore, *, phase: int) -> Any:
+    """延迟加载可选签名依赖，同时保留既有可 monkeypatch 的 CLI seam。"""
+
+    from .integration_composition import configured_phase_verification as configured
+
+    return configured(store, phase=phase)
 
 
 def _display_state(value: str) -> str:
@@ -148,6 +158,31 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("worker-status", help="查询后台 Worker 与 queued Task")
     cancel = commands.add_parser("cancel", help="取消尚未启动的 queued Dispatcher Task")
     cancel.add_argument("task_id")
+
+    execution = commands.add_parser("execution", help="创建、查看与演示 Execution")
+    execution_commands = execution.add_subparsers(dest="execution_command", required=True)
+    execution_create = execution_commands.add_parser("create", help="创建 queued Execution")
+    execution_create.add_argument("requirement_id")
+    execution_create.add_argument("--task", required=True)
+    execution_create.add_argument("--runtime", required=True)
+    execution_create.add_argument("--role", default="implementation")
+    execution_create.add_argument("--provider")
+    execution_create.add_argument("--model")
+    execution_create.add_argument("--reasoning")
+    execution_create.add_argument("--prompt", required=True)
+    execution_list = execution_commands.add_parser("list", help="列出 Requirement 的 Execution")
+    execution_list.add_argument("requirement_id")
+    execution_show = execution_commands.add_parser("show", help="显示一个 Execution")
+    execution_show.add_argument("execution_id")
+    execution_events = execution_commands.add_parser("events", help="显示 Execution 的事件")
+    execution_events.add_argument("execution_id")
+    execution_demo = execution_commands.add_parser("demo", help="运行确定性 fake runtime demo")
+    execution_demo.add_argument("requirement_id")
+    execution_demo.add_argument("--task", default="TASK-DEMO")
+    execution_migrate = execution_commands.add_parser(
+        "migrate-legacy", help="幂等映射旧 Session 为 legacy Execution"
+    )
+    execution_migrate.add_argument("requirement_id")
 
     phase = commands.add_parser("phase", help="签发阶段证据并执行 fail-closed 过渡")
     phase_commands = phase.add_subparsers(dest="phase_command", required=True)
@@ -325,6 +360,46 @@ def run(args: argparse.Namespace) -> str:
         return json.dumps(worker_status(store), ensure_ascii=False, indent=2)
     if args.command == "cancel":
         return json.dumps(request_cancel(store, args.task_id), ensure_ascii=False, indent=2)
+    if args.command == "execution":
+        executions = ExecutionStore(store)
+        if args.execution_command == "create":
+            created = executions.create(
+                args.requirement_id, args.task, role=args.role, runtime_id=args.runtime,
+                provider=args.provider, model=args.model, reasoning_effort=args.reasoning,
+                prompt=args.prompt,
+            )
+            return json.dumps(created.to_dict(), ensure_ascii=False, indent=2)
+        if args.execution_command == "list":
+            return json.dumps(
+                [item.to_dict() for item in executions.list(args.requirement_id)],
+                ensure_ascii=False, indent=2,
+            )
+        if args.execution_command == "show":
+            return json.dumps(executions.get(args.execution_id).to_dict(), ensure_ascii=False, indent=2)
+        if args.execution_command == "events":
+            events = RuntimeEventStore(store.root / "runtime-events").query(
+                execution_id=args.execution_id
+            )
+            return json.dumps(
+                [event.to_dict() for event in events], ensure_ascii=False, indent=2
+            )
+        if args.execution_command == "demo":
+            service = ExecutionService(
+                executions, RuntimeEventStore(store.root / "runtime-events")
+            )
+            return json.dumps(
+                service.demo(args.requirement_id, task_id=args.task).to_dict(),
+                ensure_ascii=False, indent=2,
+            )
+        if args.execution_command == "migrate-legacy":
+            service = ExecutionService(
+                executions, RuntimeEventStore(store.root / "runtime-events")
+            )
+            return json.dumps(
+                [item.to_dict() for item in service.map_legacy_sessions(args.requirement_id)],
+                ensure_ascii=False, indent=2,
+            )
+        raise AssertionError(f"未处理的 execution 命令：{args.execution_command}")
     if args.command == "phase":
         if args.phase_command == "reopen":
             gates = configured_phase_verification(store, phase=args.phase).gates

@@ -25,6 +25,7 @@ from workspace_orchestrator.automation.dispatcher import (
     stop_dispatcher,
 )
 from workspace_orchestrator.automation.session_runtime import attach_session
+from workspace_orchestrator.executions import ExecutionStore
 from workspace_orchestrator.models import Task, WorkflowComplexity
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
@@ -138,6 +139,26 @@ def test_dispatcher_executes_unbound_in_progress_task_once(tmp_path: Path, monke
     assert "AID-1" in str(call["prompt"])
     assert "请覆盖失败场景" in str(call["prompt"])
     assert tasks.task.status == "in_review"
+
+
+def test_dispatcher_contains_tracked_start_exception(tmp_path: Path, monkeypatch) -> None:
+    store, _ = _store(tmp_path)
+    tasks = FakeTasks(Task(id="AID-ERR", title="异常", status="in_progress", version=1))
+
+    class RaisingTracked(FakeExecutor):
+        def execute_tracked(self, *args, **kwargs):
+            raise WorkspaceError("terminal execution cannot start")
+
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.dispatcher.configured_task_provider",
+        lambda meta, root: tasks,
+    )
+
+    result = AutoDispatcher(store, RaisingTracked(tasks)).run_once()  # type: ignore[arg-type]
+
+    assert result == "blocked"
+    assert tasks.task.status == "blocked"
+    assert "terminal execution cannot start" in tasks.added_comments[-1]
 
 
 def test_dispatcher_blocks_phase_task_without_activation_before_executor_starts(
@@ -434,6 +455,7 @@ def test_main_delegate_only_persists_and_starts_dispatcher(tmp_path: Path, monke
         created_for.append(req)
         value = replace(task, id="AID-2", raw_id="opaque-2", version=1)
         created.append(value)
+        tasks.task = value
         return value
 
     tasks.create_task = create_task  # type: ignore[attr-defined]
@@ -452,11 +474,61 @@ def test_main_delegate_only_persists_and_starts_dispatcher(tmp_path: Path, monke
         title="多文件实现",
         description="执行实现与测试",
     )
+    retried = delegate_task(
+        store, requirement_id.lower(), title="多文件实现", description="执行实现与测试"
+    )
 
     assert result["status"] == "queued"
     assert result["task_id"] == "AID-2"
     assert created_for == [requirement_id]
-    assert created[0].status == "in_progress"
+    assert created[0].status == "todo"
+    assert tasks.task.status == "in_progress"
+    assert result["execution_id"].startswith("EXE-")
+    assert retried["execution_id"] == result["execution_id"]
+    assert created_for == [requirement_id]
+    persisted = ExecutionStore(store).get(result["execution_id"])
+    assert persisted.task_id == "AID-2"
+    assert persisted.status == "queued"
+
+    ExecutionStore(store).update(persisted.id, status="completed")
+    tasks.task = replace(tasks.task, status="done")
+    fresh = delegate_task(
+        store, requirement_id.lower(), title="多文件实现", description="执行实现与测试"
+    )
+    assert fresh["execution_id"] != persisted.id
+    assert len(created_for) == 2
+
+
+def test_delegate_reconciles_lost_publish_reply(tmp_path: Path, monkeypatch) -> None:
+    store, requirement_id = _store(tmp_path)
+    tasks = FakeTasks(Task(id="unused", title="unused"))
+
+    def create_task(req: str, task: Task) -> Task:
+        tasks.task = replace(task, id="AID-LOST", raw_id="opaque-lost", version=1)
+        return tasks.task
+
+    def update_then_lose(task_id: str, status: str) -> Task:
+        tasks.task = replace(tasks.task, status=status, version=2)
+        raise TaskProviderError("reply lost")
+
+    tasks.create_task = create_task  # type: ignore[attr-defined]
+    tasks.update_status = update_then_lose  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.delegation.configured_task_provider",
+        lambda meta, root: tasks,
+    )
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.delegation.start_dispatcher",
+        lambda store, *, explicit: {"status": "running", "running": True},
+    )
+
+    result = delegate_task(
+        store, requirement_id, title="Publish", description="Reconcile"
+    )
+
+    assert result["task_id"] == "AID-LOST"
+    assert tasks.task.status == "in_progress"
+    assert ExecutionStore(store).get(result["execution_id"]).status == "queued"
 
 
 def test_gated_delegate_fails_before_creating_or_starting_anything(

@@ -16,6 +16,8 @@ from workspace_orchestrator.agent_runtime.contracts import (
 )
 from workspace_orchestrator.agent_runtime.events import RuntimeEventStore
 from workspace_orchestrator.agent_runtime.execution import RuntimeExecutor
+from workspace_orchestrator.executions import ExecutionStore
+from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
 class FakeRuntime:
@@ -182,3 +184,100 @@ def test_event_scope_mismatch_fails_operation(tmp_path):
     assert result.returncode != 0
     assert not store.replay("other-run")
     assert runtime.closed
+
+
+def test_tracked_execution_exists_before_runtime_and_enriches_events(tmp_path):
+    workspace = WorkspaceStore(tmp_path)
+    requirement_id = workspace.create("Tracked", task_provider=None)
+    runtime = FakeRuntime()
+    event_store = RuntimeEventStore(workspace.root / "runtime-events")
+
+    def factory(sink):
+        runtime.sink = sink
+        return runtime
+
+    bridge = RuntimeExecutor(
+        factory, event_store, execution_store=ExecutionStore(workspace), runtime_id="fake"
+    )
+    result = bridge.execute_tracked(
+        requirement_id, "TASK-001", tmp_path, "任务", reasoning_effort="medium"
+    )
+
+    assert result.returncode == 0
+    execution = ExecutionStore(workspace).get(result.run_id)
+    assert execution.status == "completed"
+    assert execution.session_id == "session"
+    assert execution.turn_id == "turn"
+    request = runtime.requests[0][1]
+    assert request.execution_id == execution.id == request.run_id
+    assert request.requirement_id == requirement_id
+    assert request.task_id == "TASK-001"
+    event = event_store.replay(execution.id)[0]
+    assert (event.requirement_id, event.task_id, event.execution_id) == (
+        requirement_id, "TASK-001", execution.id,
+    )
+
+
+def test_tracked_execution_reuses_precreated_queued_record(tmp_path):
+    workspace = WorkspaceStore(tmp_path)
+    requirement_id = workspace.create("Queued", task_provider=None)
+    store = ExecutionStore(workspace)
+    queued = store.create(
+        requirement_id, "TASK-001", role="implementation", runtime_id="fake", prompt="任务"
+    )
+    runtime = FakeRuntime()
+
+    def factory(sink):
+        runtime.sink = sink
+        return runtime
+
+    bridge = RuntimeExecutor(
+        factory, RuntimeEventStore(workspace.root / "runtime-events"),
+        execution_store=store, runtime_id="fake",
+    )
+    result = bridge.execute_tracked(
+        requirement_id, "TASK-001", tmp_path, "最终完整 prompt", model="model-final",
+        reasoning_effort="high", execution_id=queued.id
+    )
+
+    assert result.run_id == queued.id
+    assert len(store.list(requirement_id)) == 1
+    persisted = store.get(queued.id)
+    assert persisted.status == "completed"
+    assert persisted.prompt == "最终完整 prompt"
+    assert persisted.model == "model-final"
+    assert persisted.reasoning_effort == "high"
+    assert persisted.runtime_id == "fake"
+
+
+def test_session_identity_survives_execution_progress_write_failure(tmp_path, monkeypatch):
+    workspace = WorkspaceStore(tmp_path)
+    requirement_id = workspace.create("Recovery", task_provider=None)
+    store = ExecutionStore(workspace)
+    runtime = FakeRuntime()
+    event_store = RuntimeEventStore(workspace.root / "runtime-events")
+
+    def factory(sink):
+        runtime.sink = sink
+        return runtime
+
+    original = store.update
+    failed_once = False
+
+    def flaky_update(execution_id, *, status, **changes):
+        nonlocal failed_once
+        if status == "running" and changes.get("session_id") and not failed_once:
+            failed_once = True
+            raise WorkspaceError("disk busy")
+        return original(execution_id, status=status, **changes)
+
+    monkeypatch.setattr(store, "update", flaky_update)
+    bridge = RuntimeExecutor(
+        factory, event_store, execution_store=store, runtime_id="fake"
+    )
+    result = bridge.execute_tracked(requirement_id, "TASK-1", tmp_path, "任务")
+
+    assert result.returncode != 0
+    assert result.session_id == "session"
+    assert result.run_id
+    assert store.get(result.run_id).session_id == "session"

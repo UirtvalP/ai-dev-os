@@ -79,6 +79,58 @@ class RuntimeEventStore:
             events = self._read_locked(log_path, run_id)
             return tuple(events[after : after + limit])
 
+    def query(
+        self, *, requirement_id: str | None = None, task_id: str | None = None,
+        execution_id: str | None = None, runtime_id: str | None = None,
+        session_id: str | None = None,
+        after: int = 0, limit: int = 1000,
+    ) -> tuple[AgentEvent, ...]:
+        """按任意领域身份查询事件；after 是过滤结果的排他位置游标。"""
+
+        filters = {
+            "requirement_id": requirement_id,
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "runtime_id": runtime_id,
+            "session_id": session_id,
+        }
+        if not any(filters.values()):
+            raise RuntimeEventStoreError("事件查询至少需要一个身份条件")
+        if type(after) is not int or after < 0:
+            raise RuntimeEventStoreError("事件查询 after 游标必须是非负整数")
+        if type(limit) is not int or limit <= 0:
+            raise RuntimeEventStoreError("事件查询 limit 必须是正整数")
+        if execution_id:
+            all_events: list[AgentEvent] = []
+            cursor = 0
+            while True:
+                page = self.replay(execution_id, after=cursor, limit=1000)
+                all_events.extend(page)
+                if len(page) < 1000:
+                    break
+                cursor += len(page)
+            candidates = tuple(all_events)
+        else:
+            candidates_list: list[AgentEvent] = []
+            if not self.root.exists():
+                return ()
+            for log_path in sorted(self.root.glob("*.jsonl")):
+                lock_path = log_path.with_suffix(".lock")
+                with _file_lock(lock_path):
+                    self._check_path(log_path)
+                    raw = log_path.read_bytes().splitlines()
+                    if not raw:
+                        continue
+                    first = _decode_event(raw[0])
+                    candidates_list.extend(self._read_locked(log_path, first.run_id))
+            candidates = tuple(candidates_list)
+        filtered = tuple(
+            event for event in candidates
+            if all(expected is None or getattr(event, name) == expected
+                   for name, expected in filters.items())
+        )
+        return filtered[after : after + limit]
+
     def _paths(self, run_id: str) -> tuple[Path, Path]:
         if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
             raise RuntimeEventStoreError("run_id 必须是 1 至 128 位安全标识符，不能包含路径")
