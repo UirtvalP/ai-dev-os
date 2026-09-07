@@ -196,13 +196,13 @@ def _fixture_runtime(name, event_sink):
 
 
 @pytest.mark.parametrize("name", ["cursor", "claude"])
-def test_managed_hooks_configured_dispatcher_runs_non_codex_fixture_without_completion(
+def test_hook_free_configured_dispatcher_runs_non_codex_fixture_without_completion(
     tmp_path, monkeypatch, name,
 ):
     initialized = initialize_project(tmp_path)
-    assert ".codex/hooks.json" in initialized.created
-    assert dispatcher._only_managed_hooks(tmp_path)
-    hooks_before = (tmp_path / ".codex" / "hooks.json").read_bytes()
+    assert ".codex/hooks.json" not in initialized.created
+    assert not (tmp_path / ".codex").exists()
+    assert not dispatcher._only_managed_hooks(tmp_path)
     _config(tmp_path, agent_runtime=name, agent_model="model-b", agent_sandbox="read-only")
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create(
@@ -248,7 +248,7 @@ def test_managed_hooks_configured_dispatcher_runs_non_codex_fixture_without_comp
     assert tasks.task.status == "blocked"
     assert any("Task 未进入 review" in message for message in tasks.added_comments)
     assert store.load(requirement_id)["meta"]["status"] == "in_progress"
-    assert (tmp_path / ".codex" / "hooks.json").read_bytes() == hooks_before
+    assert not (tmp_path / ".codex").exists()
 
 
 def _consume_by_standard_kind(events):
