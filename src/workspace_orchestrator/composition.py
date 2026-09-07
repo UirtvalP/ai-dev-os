@@ -12,6 +12,7 @@ from .agent_runtime.service import AgentRuntime
 from .agent_runtime.stdio import JsonRpcStdioClient
 from .executions import ExecutionStore
 from .project_config import default_project_config, load_project_config
+from .workbench import WorkbenchExecutionService
 from .workspace import WorkspaceError, WorkspaceStore
 
 
@@ -78,4 +79,12 @@ def create_standard_runtime(
 
     return AgentRuntime(
         create_runtime(name, event_sink=persist, client_factory=client_factory), events,
+    )
+
+
+def configured_workbench(store: WorkspaceStore) -> WorkbenchExecutionService:
+    """组装真实 Workbench 主路径；CLI Demo 可独立注入非权威 Runtime。"""
+
+    return WorkbenchExecutionService(
+        store, lambda name, events: create_standard_runtime(name, events=events),
     )

@@ -17,7 +17,22 @@ from workspace_orchestrator.project_init import (
     AGENTS_START,
     GITIGNORE_START,
     initialize_project,
+    register_project,
 )
+
+
+def test_project_add_registers_workbench_without_native_agent_lifecycle_files(
+    tmp_path: Path, capsys,
+) -> None:
+    assert main(["project", "add", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "Workbench 项目已注册" in output
+    assert (tmp_path / ".ai-dev-os.json").is_file()
+    assert (tmp_path / ".workspace").is_dir()
+    assert (tmp_path / "PROJECT_INTENT.md").is_file()
+    assert not (tmp_path / "AGENTS.md").exists()
+    assert not (tmp_path / ".codex").exists()
+    assert register_project(tmp_path).created == ()
 
 
 @pytest.mark.parametrize(
