@@ -116,6 +116,18 @@ class RemoteController:
             assert isinstance(redacted, dict)
             return redacted
 
+    def execution_details(
+        self, execution_id: str, *, after: int = 0, limit: int = 100,
+    ) -> dict[str, Any]:
+        with self._lock:
+            result = self.dashboard.execution(
+                self.requirement_id, execution_id, after=after, limit=limit,
+            )
+            redacted = _redact(result)
+            assert isinstance(redacted, dict)
+            redacted["payload_view"] = "redacted"
+            return redacted
+
     def message(
         self,
         text: str,
@@ -446,6 +458,22 @@ def serve_remote_control(
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 self._json(HTTPStatus.OK, controller.status(after=after, limit=limit))
+                return
+            matched = re.fullmatch(r"/api/executions/(EXE-\d{6,})", path, re.IGNORECASE)
+            if matched is not None:
+                try:
+                    values = parse_qs(query, strict_parsing=True) if query else {}
+                    if not set(values) <= {"after", "limit"}:
+                        raise WorkspaceError("Execution 查询只允许 after 和 limit")
+                    after = _bounded_integer(values, "after", default=0, minimum=0, maximum=10**9)
+                    limit = _bounded_integer(values, "limit", default=100, minimum=1, maximum=200)
+                    result = controller.execution_details(
+                        matched.group(1).upper(), after=after, limit=limit,
+                    )
+                except (WorkspaceError, ValueError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, result)
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "未找到"})
 
