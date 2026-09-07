@@ -251,3 +251,10 @@ def test_workbench_ui_exposes_core_requirement_space_actions() -> None:
         assert label in WORKBENCH_HUB_HTML
     assert "#token=" not in WORKBENCH_HUB_HTML
     assert "REQ-020" not in WORKBENCH_HUB_HTML
+
+
+def test_workbench_ui_keeps_reverse_proxy_subpath_for_api_requests() -> None:
+    assert "location.pathname.endsWith('/')" in WORKBENCH_HUB_HTML
+    assert "function apiUrl(path)" in WORKBENCH_HUB_HTML
+    assert "fetch(apiUrl(path)" in WORKBENCH_HUB_HTML
+    assert "fetch(path" not in WORKBENCH_HUB_HTML

@@ -22,8 +22,10 @@ if ($listener) {
     } catch {
         throw "$localPort 端口已被 PID $($listener.OwningProcess) 占用，且不是可识别的 Workbench"
     }
-    if ($existing.Headers['Server'] -notlike 'AI-Dev-OS-Workbench/*' -or
-        $existing.Headers['X-AI-Dev-OS-Auth'] -ne 'bearer') {
+    $existingServer = [string]$existing.Headers['Server']
+    $existingAuth = [string]$existing.Headers['X-AI-Dev-OS-Auth']
+    if ($existingServer -notlike 'AI-Dev-OS-Workbench/*' -or
+        $existingAuth -ne 'bearer') {
         throw "$localPort 端口已被 PID $($listener.OwningProcess) 占用，但不是启用远程认证的 Workbench"
     }
 }
@@ -55,8 +57,10 @@ if (-not $listener) {
         throw "Dashboard 未能在 127.0.0.1:$localPort 启动"
     }
     $started = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$localPort/" -TimeoutSec 3
-    if ($started.Headers['Server'] -notlike 'AI-Dev-OS-Workbench/*' -or
-        $started.Headers['X-AI-Dev-OS-Auth'] -ne 'bearer') {
+    $startedServer = [string]$started.Headers['Server']
+    $startedAuth = [string]$started.Headers['X-AI-Dev-OS-Auth']
+    if ($startedServer -notlike 'AI-Dev-OS-Workbench/*' -or
+        $startedAuth -ne 'bearer') {
         throw '新启动的 Workbench 未启用远程认证，拒绝建立公网隧道'
     }
 }
