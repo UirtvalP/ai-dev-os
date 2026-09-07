@@ -73,6 +73,7 @@ class RuntimeSessionRef:
     run_id: str = ""
     workspace_path: str = ""
     schema_version: int = SCHEMA_VERSION
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +90,7 @@ class AgentRunRequest:
     task_id: str | None = None
     schema_version: int = SCHEMA_VERSION
     reasoning_effort: str | None = None
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,9 @@ class AgentEvent:
     sequence: int = 0
     schema_version: int = SCHEMA_VERSION
     extra: dict[str, Any] = field(default_factory=dict)
+    requirement_id: str | None = None
+    task_id: str | None = None
+    execution_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = copy.deepcopy(self.extra)
@@ -153,6 +158,9 @@ class AgentEvent:
             timestamp=self.timestamp,
             sequence=self.sequence,
             schema_version=self.schema_version,
+            requirement_id=self.requirement_id,
+            task_id=self.task_id,
+            execution_id=self.execution_id,
         )
         return result
 
@@ -164,7 +172,7 @@ class AgentEvent:
         for name in required:
             if not isinstance(payload.get(name), str) or not payload[name].strip():
                 raise ValueError(f"AgentEvent {name} 必须是非空字符串")
-        for name in ("session_id", "turn_id"):
+        for name in ("session_id", "turn_id", "requirement_id", "task_id", "execution_id"):
             value = payload.get(name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"AgentEvent {name} 必须是非空字符串或 null")
@@ -185,6 +193,7 @@ class AgentEvent:
         known = {
             *required,
             "payload", "session_id", "turn_id", "sequence", "schema_version",
+            "requirement_id", "task_id", "execution_id",
         }
         return cls(
             event_id=payload["event_id"],
@@ -197,6 +206,9 @@ class AgentEvent:
             timestamp=payload["timestamp"],
             sequence=sequence,
             schema_version=payload["schema_version"],
+            requirement_id=payload.get("requirement_id"),
+            task_id=payload.get("task_id"),
+            execution_id=payload.get("execution_id"),
             extra=copy.deepcopy({key: value for key, value in payload.items() if key not in known}),
         )
 

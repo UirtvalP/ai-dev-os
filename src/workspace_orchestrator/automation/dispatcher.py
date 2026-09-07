@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, TypeGuard
 
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
-from workspace_orchestrator.agent_runtime.contracts import AgentRunResult
+from workspace_orchestrator.agent_runtime.contracts import AgentRunResult, RuntimeFailure
 from workspace_orchestrator.agent_runtime.ports import AgentExecutionPort
 from workspace_orchestrator.execution_ownership import ExecutionOwnership, ExecutionOwnershipError
 from workspace_orchestrator.models import Task
@@ -45,6 +45,7 @@ class DispatchCandidate:
     execution_path: Path
     resume_session_id: str | None
     comments: tuple[str, ...]
+    execution_id: str | None = None
 
 
 def _state_path(store: WorkspaceStore) -> Path:
@@ -340,6 +341,11 @@ class AutoDispatcher:
                         else None
                     ),
                     comments=comments,
+                    execution_id=(
+                        str(previous.get("execution_id"))
+                        if previous and previous.get("execution_id")
+                        else None
+                    ),
                 )
         return None
 
@@ -403,14 +409,33 @@ class AutoDispatcher:
             ExecutionOwnership(self.store).require_v1(task)
         except ExecutionOwnershipError:
             return "blocked"
-        result = self.executor.execute(
-            candidate.execution_path,
-            _prompt(candidate),
-            sandbox=_config(self.store).agent_sandbox or _config(self.store).codex_sandbox,
-            model=_config(self.store).agent_model or _config(self.store).codex_model,
-            resume_session_id=candidate.resume_session_id,
-            bypass_hook_trust=_only_managed_hooks(candidate.execution_path),
-        )
+        prompt = _prompt(candidate)
+        sandbox = _config(self.store).agent_sandbox or _config(self.store).codex_sandbox
+        model = _config(self.store).agent_model or _config(self.store).codex_model
+        bypass_hook_trust = _only_managed_hooks(candidate.execution_path)
+        try:
+            tracked = getattr(self.executor, "execute_tracked", None)
+            if callable(tracked):
+                result = tracked(
+                    candidate.requirement_id, task.id, candidate.execution_path, prompt,
+                    source="legacy-dispatcher", execution_id=candidate.execution_id,
+                    sandbox=sandbox, model=model,
+                    resume_session_id=candidate.resume_session_id,
+                    bypass_hook_trust=bypass_hook_trust,
+                )
+            else:
+                # 兼容 V1 测试替身与外部旧 AgentExecutionPort；正式组装始终提供 tracked。
+                result = self.executor.execute(
+                    candidate.execution_path, prompt, sandbox=sandbox, model=model,
+                    resume_session_id=candidate.resume_session_id,
+                    bypass_hook_trust=bypass_hook_trust,
+                )
+        except Exception as exc:  # noqa: BLE001 -- 外部执行端口不得终止 Dispatcher 循环。
+            result = AgentRunResult(
+                1, None, "", str(exc), runtime_id="unknown",
+                run_id=candidate.execution_id, summary=str(exc),
+                error=RuntimeFailure("execution_start_failed", str(exc)),
+            )
         log_path = self._record_log(candidate, result)
         try:
             refreshed = candidate.task_provider.get_task(task.id)

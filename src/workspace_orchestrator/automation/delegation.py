@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
 from workspace_orchestrator.adapters.base import TaskProviderError
+from workspace_orchestrator.executions import ExecutionStore
 from workspace_orchestrator.models import Task, WorkflowComplexity
 from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
+from workspace_orchestrator.project_config import default_project_config, load_project_config
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 from .dispatcher import (
@@ -69,6 +72,34 @@ def delegate_task(
     if not start.get("running") or start.get("status") not in {"starting", "running"}:
         status = str(start.get("status") or "unknown")
         raise WorkspaceError(f"Dispatcher 未运行（{status}），未创建委派 Task")
+    delegation_key = hashlib.sha256(
+        "\0".join((requirement_id, title.strip(), description.strip(), priority or "")).encode()
+    ).hexdigest()
+    with store.locked():
+        prior = dict((_read_state(store).get("delegations") or {}).get(delegation_key) or {})
+    if prior:
+        try:
+            task = provider.get_task(str(prior["task_id"]))
+            execution = ExecutionStore(store).get(str(prior["execution_id"]))
+            reusable = (
+                task.status in {"todo", "in_progress"}
+                and execution.status in {"queued", "starting", "running", "waiting"}
+            )
+            if reusable and task.status != "in_progress":
+                task = provider.update_status(task.id, "in_progress")
+        except (KeyError, TaskProviderError, WorkspaceError) as exc:
+            raise WorkspaceError(
+                f"已有委派 {prior.get('execution_id', 'unknown')} 状态暂不明确；"
+                "请先查询 worker-status，不要重复创建"
+            ) from exc
+        if reusable:
+            return {
+                "status": "queued", "requirement_id": requirement_id,
+                "task_id": task.id, "title": task.title,
+                "dispatcher": start.get("status"),
+                "execution_id": execution.id,
+                "message": f"已复用委派 {task.id}：{task.title}。Worker 将独立执行。",
+            }
     try:
         task = provider.create_task(
             requirement_id,
@@ -76,18 +107,85 @@ def delegate_task(
                 id="new",
                 title=title.strip(),
                 description=description.strip(),
-                status="in_progress",
+                # 先保持不可调度，Execution 和本地关联落盘后再发布 in_progress。
+                status="todo",
                 priority=priority,
             ),
         )
     except TaskProviderError as exc:
         raise WorkspaceError(f"委派 Task 创建失败：{exc}") from exc
+    config = (
+        load_project_config(store.working_root)
+        or load_project_config(store.project_root)
+        or default_project_config(store.project_root)
+    )
+    try:
+        execution = ExecutionStore(store).create(
+            requirement_id, task.id, role="implementation",
+            runtime_id=config.agent_runtime, provider=config.agent_runtime,
+            model=config.agent_model or config.codex_model,
+            prompt=description.strip(), workspace_path=store.working_root,
+            source="legacy-delegate",
+        )
+    except WorkspaceError as exc:
+        try:
+            provider.add_comment(task.id, f"Execution 创建失败，任务未进入执行：{exc}")
+            provider.update_status(task.id, "blocked")
+        except TaskProviderError:
+            pass
+        raise WorkspaceError(f"委派 Task 已创建但 Execution 创建失败：{exc}") from exc
+    with store.locked():
+        state = _read_state(store)
+        task_states = dict(state.get("tasks") or {})
+        task_states[_task_key(task)] = {
+            **dict(task_states.get(_task_key(task)) or {}),
+            "task_id": task.id,
+            "raw_id": task.raw_id,
+            "version": task.version,
+            "result": "dispatching",
+            "requirement_id": requirement_id,
+            "execution_id": execution.id,
+            "updated_at": now_iso(),
+        }
+        state["tasks"] = task_states
+        delegations = dict(state.get("delegations") or {})
+        delegations[delegation_key] = {
+            "requirement_id": requirement_id,
+            "task_id": task.id,
+            "execution_id": execution.id,
+            "status": "publishing",
+            "updated_at": now_iso(),
+        }
+        state["delegations"] = delegations
+        _write_state(store, state)
+    try:
+        task = provider.update_status(task.id, "in_progress")
+    except TaskProviderError as exc:
+        try:
+            observed = provider.get_task(task.id)
+        except TaskProviderError:
+            observed = None
+        if observed is None or observed.status != "in_progress":
+            raise WorkspaceError(
+                f"Execution {execution.id} 已创建，但 Task 发布结果未知；"
+                "请查询 worker-status，不要重复创建"
+            ) from exc
+        task = observed
+    with store.locked():
+        state = _read_state(store)
+        delegations = dict(state.get("delegations") or {})
+        record = dict(delegations.get(delegation_key) or {})
+        record.update(status="queued", updated_at=now_iso())
+        delegations[delegation_key] = record
+        state["delegations"] = delegations
+        _write_state(store, state)
     return {
         "status": "queued",
         "requirement_id": requirement_id,
         "task_id": task.id,
         "title": task.title,
         "dispatcher": start.get("status"),
+        "execution_id": execution.id,
         "message": f"已委派 {task.id}：{task.title}。Worker 将独立执行，Main 可继续处理消息。",
     }
 

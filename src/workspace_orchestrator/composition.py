@@ -9,6 +9,7 @@ from .agent_runtime.events import RuntimeEventStore
 from .agent_runtime.execution import RuntimeExecutor
 from .agent_runtime.ports import AgentExecutionPort, AgentRuntimePort
 from .agent_runtime.stdio import JsonRpcStdioClient
+from .executions import ExecutionStore
 from .project_config import default_project_config, load_project_config
 from .workspace import WorkspaceError, WorkspaceStore
 
@@ -47,6 +48,7 @@ def configured_executor(store: WorkspaceStore) -> AgentExecutionPort:
     return RuntimeExecutor(
         factory, RuntimeEventStore(store.root / "runtime-events"),
         allow_managed_hook_trust=config.agent_runtime == "codex",
+        execution_store=ExecutionStore(store), runtime_id=config.agent_runtime,
     )
 
 
