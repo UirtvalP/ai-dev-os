@@ -25,6 +25,9 @@ class ProjectConfig:
     codex_sandbox: str = "workspace-write"
     codex_model: str | None = None
     auto_finish_pushed_thread: bool = True
+    agent_runtime: str = "codex"
+    agent_model: str | None = None
+    agent_sandbox: str | None = None
 
 
 def _pyproject_name(root: Path) -> str | None:
@@ -96,6 +99,9 @@ def load_project_config(root: Path) -> ProjectConfig | None:
     poll_seconds = payload.get("dispatcher_poll_seconds", 2.0)
     codex_sandbox = payload.get("codex_sandbox", "workspace-write")
     codex_model = payload.get("codex_model")
+    agent_runtime = payload.get("agent_runtime", "codex")
+    agent_model = payload.get("agent_model")
+    agent_sandbox = payload.get("agent_sandbox")
     automation = payload.get("automation", {})
     if provider is not None and (not isinstance(provider, str) or not provider.strip()):
         raise WorkspaceError(f"项目配置 task_provider 必须是非空字符串或 null：{path}")
@@ -129,6 +135,17 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         raise WorkspaceError(f"项目配置 codex_model 必须是非空字符串或 null：{path}")
     if not isinstance(automation, dict):
         raise WorkspaceError(f"项目配置 automation 必须是 JSON 对象：{path}")
+    if not isinstance(agent_runtime, str) or agent_runtime not in {"codex", "cursor", "claude"}:
+        raise WorkspaceError(f"项目配置 agent_runtime 必须是 codex、cursor 或 claude：{path}")
+    if agent_model is not None and (
+        not isinstance(agent_model, str) or not agent_model.strip()
+    ):
+        raise WorkspaceError(f"项目配置 agent_model 必须是非空字符串或 null：{path}")
+    if agent_sandbox is not None and (
+        not isinstance(agent_sandbox, str)
+        or agent_sandbox not in {"read-only", "workspace-write"}
+    ):
+        raise WorkspaceError(f"项目配置 agent_sandbox 仅支持 read-only 或 workspace-write：{path}")
     auto_finish = automation.get(AUTO_FINISH_OPTION, True)
     if not isinstance(auto_finish, bool):
         raise WorkspaceError(
@@ -143,6 +160,9 @@ def load_project_config(root: Path) -> ProjectConfig | None:
         codex_sandbox=codex_sandbox,
         codex_model=codex_model,
         auto_finish_pushed_thread=auto_finish,
+        agent_runtime=agent_runtime,
+        agent_model=agent_model,
+        agent_sandbox=agent_sandbox,
     )
 
 

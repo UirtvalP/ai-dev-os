@@ -7,6 +7,7 @@ from typing import Any
 
 from workspace_orchestrator.adapters.base import TaskProviderError
 from workspace_orchestrator.models import Task, WorkflowComplexity
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 from .dispatcher import (
@@ -53,6 +54,11 @@ def delegate_task(
 
     requirement_id = requirement_id.upper()
     data = store.load(requirement_id)
+    if GateStore(store).is_required(requirement_id):
+        raise PhaseGateError(
+            "启用阶段门禁的 Requirement 禁止使用 legacy delegate 创建任意 Task；"
+            "请由后续 Orchestration/Policy 创建并激活已声明任务"
+        )
     provider = configured_task_provider(data["meta"], store.project_root)
     if provider is None:
         raise WorkspaceError("非阻塞委派需要已配置的 Task Provider")
@@ -156,13 +162,13 @@ def request_cancel(store: WorkspaceStore, task_id: str) -> dict[str, Any]:
 
     with store.locked():
         state = _read_state(store)
-        tasks = dict(state.get("tasks") or {})
-        runtime = dict(tasks.get(key) or {})
+        task_states = dict(state.get("tasks") or {})
+        runtime = dict(task_states.get(key) or {})
         if runtime.get("result") in {"dispatching", "running"} or task.binding_session_id:
             raise WorkspaceError(
                 f"Task {task.id} 的 Worker 已运行；V1 只能取消尚未启动的 queued Task"
             )
-        tasks[key] = {
+        task_states[key] = {
             **runtime,
             "task_id": task.id,
             "raw_id": task.raw_id,
@@ -170,6 +176,6 @@ def request_cancel(store: WorkspaceStore, task_id: str) -> dict[str, Any]:
             "result": "cancel_requested",
             "cancel_requested_at": now_iso(),
         }
-        state["tasks"] = tasks
+        state["tasks"] = task_states
         _write_state(store, state)
     return {"status": "cancel_requested", "task_id": task.id}

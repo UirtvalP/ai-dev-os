@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider
-from workspace_orchestrator.adapters.task import TaskProviderError
+from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore, now_iso
 
 
@@ -180,6 +179,96 @@ def attach_session(
                 item["pending_unlink_task_ids"] = sorted(current_unlinks)
             else:
                 item.pop("pending_unlink_task_ids", None)
+        store.write_json(path, sessions)
+
+
+def rebind_session_task(
+    store: WorkspaceStore,
+    requirement_id: str,
+    *,
+    session_id: str,
+    previous_task_id: str,
+    next_task_id: str,
+    task_provider: TaskProvider | None = None,
+) -> None:
+    """幂等地把活跃 Session 从已完成阶段切换到下一阶段。"""
+
+    path = store.path_for(requirement_id) / "sessions.json"
+    with store.locked(requirement_id):
+        sessions = store.read_json(path)
+        existing = next(
+            (
+                item
+                for item in sessions
+                if item.get("id") == session_id and item.get("result") == "in_progress"
+            ),
+            None,
+        )
+        if existing is None:
+            raise WorkspaceError(
+                f"当前 Session {session_id} 未活跃绑定 {requirement_id.upper()}"
+            )
+        previous = list(dict.fromkeys(existing.get("task_ids", ())))
+        if previous_task_id not in previous and next_task_id not in previous:
+            raise WorkspaceError(
+                f"Session {session_id} 未绑定待完成 Task {previous_task_id}"
+            )
+        replacement = [task_id for task_id in previous if task_id != previous_task_id]
+        if next_task_id not in replacement:
+            replacement.append(next_task_id)
+        links_to_attempt = set(existing.get("pending_link_task_ids", ()))
+        links_to_attempt.discard(previous_task_id)
+        if next_task_id not in previous:
+            links_to_attempt.add(next_task_id)
+        unlinks_to_attempt = set(existing.get("pending_unlink_task_ids", ()))
+        unlinks_to_attempt.discard(next_task_id)
+        if previous_task_id in previous:
+            unlinks_to_attempt.add(previous_task_id)
+        existing["task_ids"] = replacement
+        if links_to_attempt:
+            existing["pending_link_task_ids"] = sorted(links_to_attempt)
+        else:
+            existing.pop("pending_link_task_ids", None)
+        if unlinks_to_attempt:
+            existing["pending_unlink_task_ids"] = sorted(unlinks_to_attempt)
+        else:
+            existing.pop("pending_unlink_task_ids", None)
+        store.write_json(path, sessions)
+    if task_provider is None:
+        return
+
+    failed_links: set[str] = set()
+    for task_id in sorted(links_to_attempt):
+        try:
+            task_provider.link_session(task_id, session_id)
+        except TaskProviderError:
+            failed_links.add(task_id)
+    failed_unlinks: set[str] = set()
+    for task_id in sorted(unlinks_to_attempt):
+        try:
+            task_provider.unlink_session(task_id, session_id)
+        except TaskProviderError:
+            failed_unlinks.add(task_id)
+
+    with store.locked(requirement_id):
+        sessions = store.read_json(path)
+        existing = next((item for item in sessions if item.get("id") == session_id), None)
+        if existing is None or existing.get("result") != "in_progress":
+            return
+        current_links = set(existing.get("pending_link_task_ids", ()))
+        current_links.difference_update(links_to_attempt)
+        current_links.update(failed_links)
+        current_unlinks = set(existing.get("pending_unlink_task_ids", ()))
+        current_unlinks.difference_update(unlinks_to_attempt)
+        current_unlinks.update(failed_unlinks)
+        if current_links:
+            existing["pending_link_task_ids"] = sorted(current_links)
+        else:
+            existing.pop("pending_link_task_ids", None)
+        if current_unlinks:
+            existing["pending_unlink_task_ids"] = sorted(current_unlinks)
+        else:
+            existing.pop("pending_unlink_task_ids", None)
         store.write_json(path, sessions)
 
 

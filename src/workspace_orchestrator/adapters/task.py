@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -78,7 +79,7 @@ def ensure_taskboard_service() -> None:
     environment = os.environ.copy()
     environment["CODEX_TASKBOARD_HOST"] = "127.0.0.1"
     environment["CODEX_TASKBOARD_PORT"] = str(port)
-    if os.name == "nt":
+    if sys.platform == "win32":
         command = (os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher))
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
@@ -265,29 +266,41 @@ class DashiTaskProvider:
         return f"requirement:{requirement_id}"
 
     def create_task(self, requirement_id: str, task: Task) -> Task:
-        args = [
-            "issue",
-            "create",
-            "--project",
-            self.project_id,
-            "--title",
-            task.title,
-            "--description",
-            task.description,
-            "--status",
-            task.status,
-            "--labels",
-            ",".join(dict.fromkeys((*task.labels, self._requirement_label(requirement_id)))),
-        ]
-        if task.priority:
-            args.extend(("--priority", task.priority))
-        if task.worktree:
-            if not task.branch:
-                raise TaskProviderError("工作树任务必须指定分支")
-            args.extend(("--worktree-path", task.worktree, "--worktree-branch", task.branch))
-        elif task.branch:
-            args.extend(("--git-branch", task.branch))
-        return _task(self._json(*args)["task"])
+        if task.worktree and not task.branch:
+            raise TaskProviderError("工作树任务必须指定分支")
+        descriptor, name = tempfile.mkstemp(suffix=".md")
+        description_path = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(task.description)
+            args = [
+                "issue",
+                "create",
+                "--project",
+                self.project_id,
+                "--title",
+                task.title,
+                "--description-file",
+                str(description_path),
+                "--status",
+                task.status,
+                "--labels",
+                ",".join(
+                    dict.fromkeys((*task.labels, self._requirement_label(requirement_id)))
+                ),
+            ]
+            if task.priority:
+                args.extend(("--priority", task.priority))
+            if task.worktree:
+                args.extend(
+                    ("--worktree-path", task.worktree, "--worktree-branch", str(task.branch))
+                )
+            elif task.branch:
+                args.extend(("--git-branch", task.branch))
+            created = _task(self._json(*args)["task"])
+        finally:
+            description_path.unlink(missing_ok=True)
+        return self.reconcile_task(requirement_id, created.id, task)
 
     def get_task(self, task_id: str) -> Task:
         return _task(self._json("issue", "get", task_id)["task"])
@@ -299,12 +312,110 @@ class DashiTaskProvider:
             _task(item) for item in payload["tasks"] if required_label in item.get("labels", ())
         )
 
+    def find_tasks_by_exact_title(self, title: str) -> tuple[Task, ...]:
+        """Provider migration recovery: find legacy cards whose labels were lost."""
+
+        payload = self._json("issue", "list", "--project", self.project_id)
+        return tuple(_task(item) for item in payload["tasks"] if item.get("title") == title)
+
+    def reconcile_task(self, requirement_id: str, task_id: str, desired: Task) -> Task:
+        """CAS-repair one existing projection; never creates a replacement card."""
+
+        required_labels = tuple(
+            dict.fromkeys((*desired.labels, self._requirement_label(requirement_id)))
+        )
+        for _ in range(2):
+            current = self.get_task(task_id)
+            if current.project_id and current.project_id != self.project_id:
+                raise TaskProviderError(f"Task {task_id} 属于另一个 dashi 项目")
+            if current.title != desired.title:
+                raise TaskProviderError(f"Task {task_id} 标题与目标投影不一致")
+            labels = tuple(dict.fromkeys((*current.labels, *required_labels)))
+            if (
+                current.description == desired.description
+                and current.status == desired.status
+                and all(label in current.labels for label in required_labels)
+            ):
+                return current
+            if current.version is None:
+                raise TaskProviderError(f"Task {task_id} 缺少 version，不能安全修复投影")
+            descriptor, name = tempfile.mkstemp(suffix=".md")
+            path = Path(name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                    stream.write(desired.description)
+                args = [
+                    "issue",
+                    "update",
+                    task_id,
+                    "--description-file",
+                    str(path),
+                    "--status",
+                    desired.status,
+                    "--labels",
+                    ",".join(labels),
+                    "--if-version",
+                    str(current.version),
+                ]
+                try:
+                    updated = _task(self._json(*args)["task"])
+                except TaskProviderError:
+                    refreshed = self.get_task(task_id)
+                    if refreshed.version == current.version:
+                        raise
+                    continue
+            finally:
+                path.unlink(missing_ok=True)
+            if (
+                updated.description == desired.description
+                and updated.status == desired.status
+                and all(label in updated.labels for label in required_labels)
+            ):
+                return updated
+        raise TaskProviderError(f"Task {task_id} 投影修复未收敛")
+
     def update_status(self, task_id: str, status: str) -> Task:
         current = self.get_task(task_id)
         args = ["issue", "move", task_id, "--status", status]
         if current.version is not None:
             args.extend(("--if-version", str(current.version)))
         return _task(self._json(*args)["task"])
+
+    def compare_and_set_status(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        expected_status: str,
+        status: str,
+    ) -> Task:
+        """仅在调用方观察到的 Task 状态仍未变化时更新状态。"""
+
+        current = self.get_task(task_id)
+        if current.version != expected_version:
+            raise TaskProviderError(
+                f"Task {task_id} version 冲突：期望 {expected_version}，当前 {current.version}"
+            )
+        if current.status != expected_status:
+            raise TaskProviderError(
+                f"Task {task_id} status 冲突：期望 {expected_status}，当前 {current.status}"
+            )
+        updated = _task(
+            self._json(
+                "issue",
+                "move",
+                task_id,
+                "--status",
+                status,
+                "--if-version",
+                str(expected_version),
+            )["task"]
+        )
+        if updated.status != status:
+            raise TaskProviderError(
+                f"Task {task_id} 状态更新未生效：期望 {status}，实际 {updated.status}"
+            )
+        return updated
 
     def publish_review(self, task_id: str, content: str) -> Task:
         """用卡片正文幂等投影 Review Packet，并通过 version 做 CAS。"""

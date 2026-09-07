@@ -123,9 +123,20 @@ Hook、finalize blockers、验证超时与无效配置均有自动回归测试�
 
 ## 后续规划
 
+V2 已由 `REQ-020` 正式启动，完整依赖、门禁和验收标准见 `V2实施主计划.md`。固定执行顺序如下，任何阶段的 exact-SHA Gate 未通过时不得进入下一阶段：
+
+1. Agent Runtime V2
+2. Orchestration / Policy Plane
+3. Git Integration / Merge Gate
+4. Verification Provider
+5. Dashboard / Event Plane
+6. main-only Deployment Gate
+
+原“后续规划”中与这些阶段重叠的条目由 V2 主计划接管；其余候选仍需基于真实需求单独立项。
+
 - 基于用户明确选择批量接入现有项目，以及安全清理失效 Registry/dashi 项目记录
-- Global Dispatcher（仅在多个 Project-local Dispatcher 的实际维护成本得到证实时评估）
-- Multica、多 Agent 调度与自动并行 Agent（待 Task Graph 与完整 Worktree 隔离成熟）
+- 托管式多租户控制面（仅在 local-first V2 的真实使用证明需要集中服务时评估）
+- 远程分布式 Runtime 集群与跨主机调度（本地多 Agent、Task Graph 与完整 Worktree 隔离已由 V2 接管）
 - 跨项目知识库与 Obsidian / Markdown Knowledge Provider（待知识候选审核模型成熟）
 - GitHub Issues / Linear Task Provider
-- Remote Runtime、Web UI、自动 PR 与 CI feedback loop
+- 额外第三方 Runtime / Task / Git / Verification / Deployment Provider 资格认证

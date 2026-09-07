@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from workspace_orchestrator.adapters.base import TaskProvider
-from workspace_orchestrator.adapters.task import TaskProviderError
+from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
 from workspace_orchestrator.intent import requirement_intent_summary, summarize_document
+from workspace_orchestrator.models import Task
 from workspace_orchestrator.user_config import user_principles_path
 from workspace_orchestrator.workspace import (
     SECTION_LABELS,
@@ -55,7 +55,7 @@ def collect_snapshot(
     store: WorkspaceStore,
     requirement_id: str,
     *,
-    tasks: Sequence[object] = (),
+    tasks: Sequence[Task] = (),
     task_error: str | None = None,
     git: dict[str, Any] | None = None,
 ) -> str:
@@ -399,7 +399,7 @@ def persist_verification_results(
 
 def list_tasks_safely(
     task_provider: TaskProvider | None, requirement_id: str
-) -> tuple[tuple[object, ...], str | None]:
+) -> tuple[tuple[Task, ...], str | None]:
     if task_provider is None:
         return (), None
     try:

@@ -10,20 +10,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..agent_runtime.codex import codex_command, initialize_codex
+from ..agent_runtime.contracts import AgentRunResult
+from ..agent_runtime.stdio import JsonRpcStdioClient, RpcResponseError, RpcTransportError
+
 CodexRunner = Callable[
     [Sequence[str], Path, Mapping[str, str], float], subprocess.CompletedProcess[str]
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class CodexExecutionResult:
-    """一次非交互 Codex 执行的结构化结果。"""
-
-    returncode: int
-    session_id: str | None
-    stdout: str
-    stderr: str
-    resumed: bool = False
+CodexExecutionResult = AgentRunResult
 
 
 def _default_codex_runner(
@@ -83,54 +79,34 @@ ArchiveRunner = Callable[[str], None]
 
 
 def _archive_via_app_server(session_id: str) -> None:
-    executable = shutil.which("codex")
-    if not executable:
-        raise AgentProviderError("未找到 codex CLI，无法归档 Thread")
-    messages = (
-        {
-            "method": "initialize",
-            "id": 0,
-            "params": {
-                "clientInfo": {
-                    "name": "ai_dev_os",
-                    "title": "AI Dev OS",
-                    "version": "0.1.0",
-                }
-            },
-        },
-        {"method": "initialized", "params": {}},
-        {"method": "thread/archive", "id": 1, "params": {"threadId": session_id}},
-    )
-    request = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in messages)
     try:
-        completed = subprocess.run(
-            [executable, "app-server", "--listen", "stdio://"],
-            input=request,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with JsonRpcStdioClient((*codex_command(), "app-server", "--listen", "stdio://")) as client:
+            initialize_codex(client, timeout=15)
+            client.request("thread/archive", {"threadId": session_id}, timeout=15)
+    except (RpcTransportError, RpcResponseError) as exc:
         raise AgentProviderError(f"Codex App Server 不可用：{exc}") from exc
-    response = None
-    for line in completed.stdout.splitlines():
+
+
+def _exec_summary(stdout: str, stderr: str) -> str:
+    """将 V1 exec JSONL 转换为 Provider 无关摘要，不改变原始输出。"""
+    messages: list[str] = []
+    for line in stdout.splitlines():
         try:
-            message = json.loads(line)
+            payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if message.get("id") == 1:
-            response = message
-            break
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or "未知错误"
-        raise AgentProviderError(f"Codex App Server 归档失败：{detail}")
-    if response is None:
-        raise AgentProviderError("Codex App Server 未返回 Thread 归档结果")
-    if response.get("error"):
-        raise AgentProviderError(f"Codex App Server 归档失败：{response['error']}")
+        if not isinstance(payload, dict):
+            continue
+        item = payload.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "agent_message" and item.get("text"):
+            messages.append(str(item["text"]))
+        elif payload.get("type") == "error" and payload.get("message"):
+            messages.append(str(payload["message"]))
+        elif payload.get("type") == "turn.failed":
+            error = payload.get("error") or {}
+            if isinstance(error, dict) and error.get("message"):
+                messages.append(str(error["message"]))
+    return ((messages[-1] if messages else stderr.strip()) or "Codex 未返回可读结果")[-1800:]
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +154,8 @@ class CodexExecProvider:
             stdout=result.stdout,
             stderr=result.stderr,
             resumed=resumed,
+            runtime_id="codex-exec",
+            summary=_exec_summary(result.stdout, result.stderr),
         )
 
     def execute(

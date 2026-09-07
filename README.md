@@ -43,6 +43,7 @@ templates/workspace/          人类可读的 Workspace 文件模板
 skills/workspace-orchestrator Codex 工作流 Skill
 tests/                        核心生命周期测试
 V1架构.md                     完整 V1 架构与验收标准
+V2实施主计划.md               V2 多 Agent 软件交付操作系统的阶段门禁与实施计划
 参考项目边界.md               可借鉴抽象与禁止复制的边界
 ROADMAP.md                    第一版实施路线图
 ```
@@ -79,6 +80,11 @@ pytest
 ai-dev-os --help
 workspace --help
 ```
+
+开发测试默认使用 pytest-xdist 固定四个进程分发全部用例，不使用 `auto` 或按全部 CPU 自动扩张。`--dist=loadgroup`
+将复用 worker 只读 LPAC runtime seed 的慢例分为两个稳定组，避免每个 worker 重复冷启动；未标记用例仍细粒度调度，默认 cold-path 用例保持独立。需要串行排查时用
+`pytest -n 0`，查看慢用例用 `pytest --durations=20`。真实在线 Codex smoke 单独以
+`-n 0` 执行。并行配置不减少测试，也不替代阶段出口的 CI、独立审查与 exact-SHA 门禁。
 
 将一个现有项目接入 AI Dev OS：
 
@@ -297,6 +303,92 @@ Review 卡正文发布失败、关键证据缺失，或卡片 marker 与当前 r
 在**已经分配好的各自 Git worktree** 中并发执行；它们共享主工作树 `.workspace`，但 Session、
 Requirement meta 与 Git worktree 绑定不会串线。V1 尚不自动创建、分配或回收每个 Requirement
 的 branch/worktree；需要用户或上层工具先完成隔离。自动并行 Agent 与完整 Worktree 生命周期仍是后续能力。
+
+## V2 Git 集成入口（Phase 3）
+
+Git 能力直接复用原生 Git；外部方案与自研边界见 [V2 生态复用选型](V2生态复用选型.md)。
+现有 V1 Workspace、Task Provider、Review Packet 和 Hook 生命周期继续保留。
+
+Phase 3 的产品顺序是：为已有需求准备独立 Task 工作树 → 冻结计划 → 执行本批任务 →
+整批受控验证 → 集成候选验证 → Requirement Review → main CAS → post-merge 验证。
+命令示例中的 `REQ-ID`、`SHA`、路径和 request ID 都需替换成操作者明确选定的实际值；
+不要在尚未交付的 REQ-020 本身运行合并示例。
+
+```text
+ai-dev-os orchestration prepare REQ-ID --root PROJECT --file request.json --expected-main SHA
+ai-dev-os orchestration plan REQ-ID --root PROJECT --owner controller --file prepared.json
+ai-dev-os orchestration run REQ-ID --root PROJECT --owner controller --timeout 300
+ai-dev-os orchestration verify REQ-ID --root PROJECT --owner controller
+ai-dev-os integration merge REQ-ID --root PROJECT --request-id stable-request-id --expected-main SHA
+ai-dev-os integration status REQ-ID --root PROJECT --request-id stable-request-id
+ai-dev-os integration reconcile REQ-ID --root PROJECT --request-id stable-request-id
+ai-dev-os integration recover-post-merge REQ-ID --root PROJECT --request-id stable-request-id --recovery-id explicit-recovery-id
+```
+
+`prepare` 输出可保存为 `prepared.json` 的 PlanningRequest；它只为原始任务分配或恢复
+本系统持久租约，不接管未知分支/目录。工作树默认在项目同级的 `项目名.tasks` 下，
+控制状态存于共享 Git 元数据目录；Worker 不获得共享 Git 或 canonical Workspace 的写权。
+失败目录保留；`release` 释放租约但不递归删除用户文件。
+
+`verify` 复用项目 `pyproject.toml` 的既有验证命令，也可通过 `--commands-file` 提供
+VerificationCommand 数组。非空命令全部返回实际结果，收据绑定提交、tree、命令指纹、
+环境与输出摘要；没有配置的工具或隔离后端不能被视为 PASS。当前默认进程隔离后端为
+Windows LPAC；Linux 尚未接入同等后端时报告不可用，不降级为当前用户权限执行候选代码。
+`--refresh` 明确重验同一已 accepted 候选并保留原收据历史，不重新运行编码 Worker。
+
+集成只接受所有 Task 的新鲜验收证据；默认有效期为一小时。证据过期先显式刷新，
+旧合并请求若已因快照变化被拒绝，需使用新 request ID；不得修改历史回执时间。
+人工验收沿用现有 Review 卡和可靠用户活动，不新增“命令行声明 PASS”的批准入口。
+等待人工批准可用原 request ID 重试；相同 ID 不得换参数，也不会重复已确认的合并。
+人工退回留言继续由原 Hook 写回 Workspace 并补偿任务状态；它使旧审批失效，但不会
+直接篡改 Supervisor 的冻结计划或把旧候选重新视为已验收。
+
+## V2 Dashboard / Event Plane
+
+Dashboard 只监听本机回环地址。当前正式入口复用已有云服务器、HTTPS 域名和 SSH 反向转发：
+`https://game.homebox2026.online/ai-dev-os/` → 云端 Nginx `127.0.0.1:18765` → 本机
+`127.0.0.1:8765`。不使用 Quick Tunnel，也不把 Dashboard 直接绑定公网地址。
+
+首次启动会在 `--token-file` 指定位置生成至少 32 字节的随机 token；浏览器页面本身不包含 token，
+所有状态与指令 API 都要求 `Authorization: Bearer <token>`。服务端校验同源、请求大小、字段、游标、
+Session 的 Requirement 归属，并在 HTTP 投影边界脱敏；远程 Runtime 固定使用 `read-only` sandbox
+且拒绝审批。页面可查看 Requirement/Task DAG、Agent/Session/Turn、Git、Verification Receipt 与
+append-only Event 增量，并支持空闲新 Turn、运行中 steer、持久排队、取消/中断和失败显式重试。
+每个 command 都保存 ID、目标 Session、状态、投递/完成时间、结果、尝试次数与重试来源；相同 ID
+的网络重放不会重复投递。Dashboard 缓存可丢弃，重启后从 Workspace、JSONL Event Store 和命令队列
+重建，不成为第二套事实来源。
+
+```powershell
+.\scripts\start_remote_dashboard.ps1
+.\scripts\stop_remote_dashboard.ps1
+```
+
+启动脚本会优先使用 Codex 桌面应用内置的最新 CLI，幂等启动本机 Dashboard 和专用 SSH 反向转发；
+停止脚本只终止 REQ-020 Dashboard 与它的 `18765 → 8765` 转发，不影响游戏 relay 或现有
+`codex-cursor` Named Tunnel。
+
+## V2 main-only Deployment Gate
+
+部署服务使用环境注册表选择 `DeploymentProvider`，幂等键绑定 project、environment、commit 与
+provider version。实际 Provider 调用前会再次实时解析本地 `main`、远端 `main`、工作树与 HEAD；
+feature、integration、detached、脏工作树、旧提交或远端漂移全部失败关闭。部署还必须同时绑定
+当前 `MergeReceipt`、post-merge `VerificationReceipt` 与 `DeploymentAuthorization`，且不预先要求
+尚未签发的 `CompletionToken`。
+
+每次尝试先保存 `in_progress` journal，再保存成功或失败 `DeploymentReceipt`，包含发起者、环境、
+main 证明、验证证据、开始/结束时间、结果和回滚指引。崩溃留下的不确定 journal 不会自动重放副作用。
+项目提供无外部副作用的 `DryRunDeploymentProvider` 和实时 Git main 适配器用于本地 E2E。最终只有与
+Phase 6 exact-SHA Gate 一致并持久化到 Requirement Workspace 的 `CompletionToken` 能解除 V2 完成门禁；
+无需部署与 deployment-required 两条路径使用同一确定性完成入口。
+
+合并前后保留 `MergeReceipt`，但 Phase 3 不签发 RequirementCompletionToken，也不会部署。
+`recovery_required` 表示尚未交付；main 已变更而 post-merge 失败时保留现场，不回滚或掩盖用户文件。
+ref 前崩溃且原子发布记录证明尚未发布时，`reconcile` 重新检查当前证据和 Review；
+旧事实已失效则以可识别拒绝结果收敛，修正后使用新 request ID。已经发布但尚未开始验证、
+或验证已确认返回失败时，操作者可显式调用 `recover-post-merge`；它保留历史收据和每次
+恢复尝试，相同 recovery ID 幂等，不接受新 SHA、命令或环境替换原意图。未知执行/清理
+状态仍拒绝重放，不能通过删除 journal、回滚 main 或修改收据时间释放队列。
+V2 的旧 `finalize`、`confirm` 和 Stop 自动收尾入口不能绕过最终交付门禁。
 
 ## 设计原则
 

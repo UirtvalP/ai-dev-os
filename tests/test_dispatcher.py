@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import time
 from dataclasses import replace
@@ -25,6 +26,7 @@ from workspace_orchestrator.automation.dispatcher import (
 )
 from workspace_orchestrator.automation.session_runtime import attach_session
 from workspace_orchestrator.models import Task, WorkflowComplexity
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.workspace import WorkspaceError, WorkspaceStore
 
 
@@ -136,6 +138,29 @@ def test_dispatcher_executes_unbound_in_progress_task_once(tmp_path: Path, monke
     assert "AID-1" in str(call["prompt"])
     assert "请覆盖失败场景" in str(call["prompt"])
     assert tasks.task.status == "in_review"
+
+
+def test_dispatcher_blocks_phase_task_without_activation_before_executor_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id = _store(tmp_path)
+    tasks = FakeTasks(Task(id="AID-170", title="Phase 1", status="in_progress", version=1))
+    executor = FakeExecutor(tasks)
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.dispatcher.configured_task_provider",
+        lambda meta, root: tasks,
+    )
+
+    def reject(*_: object) -> str:
+        raise PhaseGateError("missing activation")
+
+    monkeypatch.setattr(GateStore, "require_task_active", reject)
+
+    assert AutoDispatcher(store, executor).run_once() == "blocked"  # type: ignore[arg-type]
+    assert tasks.task.status == "blocked"
+    assert executor.calls == []
+    assert "阶段门禁拒绝" in tasks.added_comments[0]
+    assert requirement_id in store.requirement_ids()
 
 
 def test_dispatcher_resumes_its_previous_controlled_task_session(
@@ -274,6 +299,22 @@ def test_dispatcher_background_process_starts_reports_status_and_stops(
         stopped = stop_dispatcher(store)
     assert stopped["running"] is False
     assert stopped["status"] == "stopped"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid semantics")
+def test_pid_alive_reaps_an_exited_direct_child(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.dispatcher.os.waitpid",
+        lambda pid, options: (pid, 0),
+    )
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.dispatcher.os.kill",
+        lambda pid, sig: pytest.fail("reaped child must not reach os.kill"),
+    )
+
+    from workspace_orchestrator.automation.dispatcher import _pid_alive
+
+    assert _pid_alive(321) is False
 
 
 def test_dispatcher_refuses_stop_while_worker_is_active(tmp_path: Path, monkeypatch) -> None:
@@ -416,6 +457,49 @@ def test_main_delegate_only_persists_and_starts_dispatcher(tmp_path: Path, monke
     assert result["task_id"] == "AID-2"
     assert created_for == [requirement_id]
     assert created[0].status == "in_progress"
+
+
+def test_gated_delegate_fails_before_creating_or_starting_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, requirement_id = _store(tmp_path)
+    store.touch_meta(
+        requirement_id,
+        phase_gate_required=True,
+        requirement_task_id="AID-1",
+    )
+    provider_requested = False
+    dispatcher_started = False
+
+    def provider(*_: object) -> FakeTasks:
+        nonlocal provider_requested
+        provider_requested = True
+        return FakeTasks(Task(id="unused", title="unused"))
+
+    def start(*_: object, **__: object) -> dict[str, object]:
+        nonlocal dispatcher_started
+        dispatcher_started = True
+        return {"status": "running", "running": True}
+
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.delegation.configured_task_provider",
+        provider,
+    )
+    monkeypatch.setattr(
+        "workspace_orchestrator.automation.delegation.start_dispatcher",
+        start,
+    )
+
+    with pytest.raises(PhaseGateError, match="禁止使用 legacy delegate"):
+        delegate_task(
+            store,
+            requirement_id,
+            title="未声明任务",
+            description="不得进入 Task Provider",
+        )
+
+    assert provider_requested is False
+    assert dispatcher_started is False
 
 
 @pytest.mark.parametrize(

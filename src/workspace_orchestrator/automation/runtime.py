@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import hashlib
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from workspace_orchestrator.adapters.agent import AgentProviderError
 from workspace_orchestrator.adapters.base import AgentProvider, TaskProvider, TaskProviderError
+from workspace_orchestrator.delivery_guard import (
+    delivery_completion_guard,
+    require_delivery_completion,
+)
+from workspace_orchestrator.models import Task
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import load_project_config
 from workspace_orchestrator.review import (
+    ReviewResult,
     confirm_requirement_done,
     request_requirement_changes,
     review_requirement,
@@ -75,10 +85,57 @@ class AutomationRuntime:
         store: WorkspaceStore,
         agent_provider: AgentProvider,
         task_provider: TaskProvider | None = None,
+        phase_gates: GateStore | None = None,
     ) -> None:
         self.store = store
         self.agent_provider = agent_provider
         self._task_provider = task_provider
+        self._phase_gates = phase_gates
+
+    def _phase_review_evidence(
+        self, requirement_id: str,
+    ) -> tuple[int | None, tuple[dict[str, Any], ...] | None]:
+        gates = self._phase_gates or GateStore(self.store)
+        if not gates.is_required(requirement_id):
+            return None, None
+        meta = self.store.load(requirement_id)["meta"]
+        current_task = meta.get("requirement_task_id")
+        definition = next(
+            (item for item in gates.definitions(requirement_id) if item.task_id == current_task),
+            None,
+        )
+        if definition is None or definition.phase < 4:
+            return definition.phase if definition is not None else None, None
+        receipt_dir = self.store.path_for(requirement_id) / "verification-receipts"
+        receipts = []
+        for path in sorted(receipt_dir.glob("*.json")) if receipt_dir.is_dir() else ():
+            receipt = gates.read_verification_receipt(requirement_id, path.stem)
+            if receipt.commit_sha != gates.git.head_sha():
+                continue
+            try:
+                from workspace_orchestrator.phase_verification import PhaseVerificationRunner
+
+                suite = PhaseVerificationRunner(gates).validate_stored_receipt(
+                    requirement_id, phase=definition.phase, receipt=receipt,
+                )
+            except PhaseGateError:
+                continue
+            if suite.suite_id in {item.suite_id for item in definition.verification_suites}:
+                assert receipt.structured_receipt is not None
+                receipts.append(dict(receipt.structured_receipt))
+        observed: set[str] = set()
+        for structured in receipts:
+            raw_results = structured.get("results")
+            if isinstance(raw_results, list):
+                observed.update(
+                    str(result.get("suite_id", "")).split("::", 1)[0]
+                    for result in raw_results
+                    if isinstance(result, dict)
+                )
+        expected = {item.suite_id for item in definition.verification_suites}
+        if observed != expected:
+            raise WorkspaceError("Phase 4+ Review 缺少完整、已验签的结构化 Receipt")
+        return definition.phase, tuple(receipts)
 
     def _provider(self, requirement_id: str) -> TaskProvider | None:
         if self._task_provider is not None:
@@ -86,6 +143,32 @@ class AutomationRuntime:
         return configured_task_provider(
             self.store.load(requirement_id)["meta"], self.store.project_root
         )
+
+    def _require_task_activation(
+        self,
+        requirement_id: str,
+        provider: TaskProvider | None,
+        task: Task,
+    ) -> None:
+        """所有交互式绑定路径共用同一阶段激活校验。"""
+
+        try:
+            activation = GateStore(self.store).require_task_active(
+                requirement_id, task.id
+            )
+        except PhaseGateError as exc:
+            if provider is not None and task.status == "in_progress":
+                try:
+                    provider.update_status(task.id, "blocked")
+                except TaskProviderError as provider_exc:
+                    raise WorkspaceError(
+                        f"阶段门禁失败且 Task 无法收敛为 blocked：{provider_exc}"
+                    ) from exc
+            raise
+        if activation == "activated" and task.status != "in_progress":
+            raise PhaseGateError(
+                f"Phase Task {task.id} 尚未由 workspace phase advance 完成激活"
+            )
 
     def _current_packet_fingerprint(
         self, requirement_id: str, provider: TaskProvider | None
@@ -101,7 +184,11 @@ class AutomationRuntime:
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
         )
-        return build_review_packet(self.store, requirement_id, tasks=tasks, git=git).fingerprint
+        phase, receipts = self._phase_review_evidence(requirement_id)
+        return build_review_packet(
+            self.store, requirement_id, tasks=tasks, git=git,
+            phase=phase, structured_receipts=receipts,
+        ).fingerprint
 
     def sync_reviews(self, requirement_id: str | None = None) -> tuple[str, ...]:
         """同步所有待审查结果和离线待补偿状态，不创建或完成 Review 卡。"""
@@ -216,13 +303,38 @@ class AutomationRuntime:
             if attached_id == selected_id
             else ()
         )
+        gates = GateStore(self.store)
+        phase_gated = gates.is_required(selected_id)
+        if phase_gated and provider is None:
+            raise PhaseGateError(
+                "阶段门禁启用时必须配置可用的 Task Provider，拒绝本地旁路绑定"
+            )
+        effective_task_ids = tuple(task_ids)
+        if phase_gated and not bound_ids and not effective_task_ids:
+            current_task_id = self.store.load(selected_id)["meta"].get(
+                "requirement_task_id"
+            )
+            if not isinstance(current_task_id, str) or not current_task_id.strip():
+                raise PhaseGateError(
+                    "阶段门禁启用时必须先声明并激活 Requirement 当前 Phase Task"
+                )
+            effective_task_ids = (current_task_id,)
         selection = select_tasks(
             selected_id,
             provider,
-            explicit_task_ids=task_ids,
+            explicit_task_ids=effective_task_ids,
             bound_task_ids=bound_ids,
-            development_request=development_request,
+            # Gated requirements can only select the committed Phase Task chain;
+            # a user prompt must never create an undeclared work card first.
+            development_request=None if phase_gated else development_request,
+            task_activation_guard=lambda task: self._require_task_activation(
+                selected_id, provider, task
+            ),
         )
+        if selection.task_error and selection.task_ids and phase_gated:
+            raise PhaseGateError(
+                "阶段门禁启用时不能在 Task Provider 离线状态下绑定阶段 Task"
+            )
         # 目标选择和校验全部成功后才允许切断旧 Requirement。
         if attached_id and attached_id != selected_id:
             end_session(
@@ -305,6 +417,24 @@ class AutomationRuntime:
                             "请使用 --task 明确指定：" + ", ".join(task.id for task in active)
                         )
                     selected = tuple(task.id for task in active)
+                if selected:
+                    if task_error:
+                        if GateStore(self.store).is_required(requirement_id):
+                            raise PhaseGateError(
+                                "阶段门禁启用时不能在 Task Provider 离线状态下恢复 Task"
+                            )
+                    else:
+                        by_id = {task.id: task for task in tasks}
+                        unknown = [task_id for task_id in selected if task_id not in by_id]
+                        if unknown:
+                            raise WorkspaceError(
+                                f"Task 不属于需求 {requirement_id}："
+                                + ", ".join(unknown)
+                            )
+                        for task_id in selected:
+                            self._require_task_activation(
+                                requirement_id, provider, by_id[task_id]
+                            )
                 attach_session(
                     self.store,
                     requirement_id,
@@ -332,6 +462,10 @@ class AutomationRuntime:
         ) or self.store.attached_requirement_id(session_id)
         if not requirement_id:
             return AutoFinishResult(False, "当前 Thread 未绑定 Requirement")
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return AutoFinishResult(False, str(exc), requirement_id)
         data = self.store.load(requirement_id)
         session = next(
             (
@@ -369,21 +503,122 @@ class AutomationRuntime:
             return AutoFinishResult(False, "当前分支没有上游", requirement_id, task_ids)
         if not git.get("pushed"):
             return AutoFinishResult(False, "当前提交尚未与上游完全同步", requirement_id, task_ids)
+        gates = GateStore(self.store)
+        if gates.is_required(requirement_id):
+            try:
+                gates.require_requirement_completion_ready(requirement_id)
+            except PhaseGateError as exc:
+                return AutoFinishResult(
+                    False,
+                    f"最终 Phase Gate 未就绪：{exc}",
+                    requirement_id,
+                    task_ids,
+                )
         provider = self._provider(requirement_id)
-        complete_tasks(provider, task_ids)
-        try:
-            self.agent_provider.archive_session(session_id)
-        except AgentProviderError as exc:
-            raise WorkspaceError(f"Thread 自动归档失败：{exc}") from exc
-        end_session(
-            self.store,
-            requirement_id,
-            session_id,
-            result="completed",
-            task_provider=provider,
-            allowed_results=("in_progress", "pending_auto_finish"),
+        recovery_blocker = self._recover_pending_auto_completion(
+            requirement_id, session_id, task_ids, provider
         )
+        if recovery_blocker:
+            return AutoFinishResult(False, recovery_blocker, requirement_id, task_ids)
+        with self.store.locked(requirement_id):
+            try:
+                require_delivery_completion(self.store, requirement_id)
+            except WorkspaceError as exc:
+                return AutoFinishResult(False, str(exc), requirement_id, task_ids)
+            complete_tasks(provider, task_ids)
+            try:
+                self.agent_provider.archive_session(session_id)
+            except AgentProviderError as exc:
+                raise WorkspaceError(f"Thread 自动归档失败：{exc}") from exc
+            end_session(
+                self.store,
+                requirement_id,
+                session_id,
+                result="completed",
+                task_provider=provider,
+                allowed_results=("in_progress", "pending_auto_finish"),
+            )
         return AutoFinishResult(True, "关联 Task 已完成且 Thread 已归档", requirement_id, task_ids)
+
+    def _completion_evidence_fingerprint(self, requirement_id: str) -> str:
+        """绑定已审查的需求、意图和验证，防止旧完成意图批准新内容。"""
+
+        data = self.store.load(requirement_id)
+        payload = {
+            name: data[name] for name in ("requirement", "intent", "verification")
+        }
+        payload["policy"] = {
+            name: data["meta"].get(name)
+            for name in (
+                "manual_test_required", "phase_gate_required", "requirement_task_id", "delivery_profile"
+            )
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _recover_pending_auto_completion(
+        self,
+        requirement_id: str,
+        session_id: str,
+        task_ids: tuple[str, ...],
+        provider: TaskProvider | None,
+    ) -> str | None:
+        """补偿 finalize 的外部 Task 写入与本地终态之间的崩溃窗口。"""
+
+        with self.store.finalize_locked(requirement_id):
+            try:
+                require_delivery_completion(self.store, requirement_id)
+            except WorkspaceError as exc:
+                return str(exc)
+            meta = self.store.load(requirement_id)["meta"]
+            pending = meta.get("pending_auto_completion")
+            if pending is None or meta.get("status") == "done":
+                return None
+            expected = {
+                "schema_version": 1,
+                "session_id": session_id,
+                "task_ids": list(task_ids),
+                "evidence_fingerprint": self._completion_evidence_fingerprint(requirement_id),
+            }
+            if (
+                pending != expected
+                or meta.get("status") != "in_progress"
+                or meta.get("manual_test_required")
+            ):
+                return "待恢复的 finalize 授权与当前 Session、Task 或验收证据不一致"
+            try:
+                # 推送可能发生在首次 finalize 之后，恢复时重新验证当前代码。
+                results = run_known_verifications(self.store.working_root)
+                if not results or not all(item.passed for item in results):
+                    return "finalize 恢复验证未通过，请修复后重新 finalize"
+                review = review_requirement(
+                    self.store, requirement_id, task_provider=provider, transition=False
+                )
+                if not review.passed:
+                    return "finalize 恢复审查未通过：" + "；".join(review.blockers)
+                with self.store.locked(requirement_id):
+                    require_delivery_completion(self.store, requirement_id)
+                    fresh = self.store.load(requirement_id)["meta"]
+                    if (
+                        fresh.get("pending_auto_completion") != pending
+                        or fresh.get("status") != "in_progress"
+                        or self._completion_evidence_fingerprint(requirement_id)
+                        != expected["evidence_fingerprint"]
+                    ):
+                        return "finalize 恢复期间验收证据已变化，请重新 finalize"
+                    gates = GateStore(self.store)
+                    if gates.is_required(requirement_id):
+                        gates.require_requirement_completion_ready(requirement_id)
+                    complete_tasks(provider, task_ids)
+                    self.store.touch_meta(
+                        requirement_id,
+                        status="done",
+                        completion_mode="auto_after_verification",
+                        pending_auto_completion=None,
+                    )
+            except WorkspaceError as exc:
+                return f"finalize 恢复尚未完成：{exc}"
+        return None
 
     def checkpoint(
         self,
@@ -443,7 +678,7 @@ class AutomationRuntime:
             current_packet_fingerprint=fingerprint,
         )
 
-    def review(self, requirement_id: str):
+    def review(self, requirement_id: str) -> ReviewResult:
         """在组合层注入 Provider 后执行 Core review gate。"""
 
         before = self.store.load(requirement_id)["meta"].get("status")
@@ -465,7 +700,8 @@ class AutomationRuntime:
         return result
 
     def _publish_review_packet(
-        self, requirement_id: str, provider: TaskProvider | None
+        self, requirement_id: str, provider: TaskProvider | None, *,
+        git_context: Callable[[], dict[str, Any]] | None = None,
     ) -> tuple[tuple[str, ...], object | None]:
         """发布完整 Packet；成功后才把本地与 Review 卡推进到 in_review。"""
 
@@ -476,12 +712,16 @@ class AutomationRuntime:
         if task_error:
             return (f"Review Packet 发布失败：{task_error}",), None
         data = self.store.load(requirement_id)
-        git = collect_git_context(
+        git = git_context() if git_context is not None else collect_git_context(
             self.store.project_root,
             dict(data["meta"].get("git") or {}),
             execution_root=self.store.working_root,
         )
-        packet = build_review_packet(self.store, requirement_id, tasks=tasks, git=git)
+        phase, receipts = self._phase_review_evidence(requirement_id)
+        packet = build_review_packet(
+            self.store, requirement_id, tasks=tasks, git=git,
+            phase=phase, structured_receipts=receipts,
+        )
         blockers = validate_review_packet(packet, git_error=git.get("error"))
         if blockers:
             return blockers, None
@@ -515,13 +755,15 @@ class AutomationRuntime:
                 comments = tuple(provider.list_comments(review_task.id))
                 # 发布后重建事实；期间若证据变化，不能提交 review-ready。
                 refreshed_tasks, refreshed_error = list_tasks_safely(provider, requirement_id)
-                refreshed_git = collect_git_context(
+                refreshed_git = git_context() if git_context is not None else collect_git_context(
                     self.store.project_root,
                     dict(self.store.load(requirement_id)["meta"].get("git") or {}),
                     execution_root=self.store.working_root,
                 )
+                refreshed_phase, refreshed_receipts = self._phase_review_evidence(requirement_id)
                 refreshed = build_review_packet(
-                    self.store, requirement_id, tasks=refreshed_tasks, git=refreshed_git
+                    self.store, requirement_id, tasks=refreshed_tasks, git=refreshed_git,
+                    phase=refreshed_phase, structured_receipts=refreshed_receipts,
                 )
                 if refreshed_error or refreshed.fingerprint != packet.fingerprint:
                     return ("Review Packet 发布期间审查证据发生变化，请重试",), None
@@ -644,6 +886,22 @@ class AutomationRuntime:
     ) -> FinalizeResult:
         """一次触发执行验证、checkpoint、Task review、handoff 与 detach。"""
 
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return FinalizeResult(False, "状态：FAIL", (), blockers=(str(exc),))
+        gates = GateStore(self.store)
+        phase_gate_required = gates.is_required(requirement_id)
+        if phase_gate_required:
+            try:
+                gates.require_requirement_completion_ready(requirement_id)
+            except PhaseGateError as exc:
+                return FinalizeResult(
+                    False,
+                    "状态：FAIL",
+                    (),
+                    blockers=(f"最终 Phase Gate 未就绪：{exc}",),
+                )
         self.sync_reviews(requirement_id)
         initial_meta = self.store.load(requirement_id)["meta"]
         initial_status = initial_meta.get("status")
@@ -676,6 +934,11 @@ class AutomationRuntime:
             return FinalizeResult(False, summary, task_ids, blockers=(str(exc),))
         summary = verification_summary(results)
         passed = bool(results) and all(item.passed for item in results)
+        # 长验证期间允许新的 V2 请求接入；旧结果不能写成新交付的验收事实。
+        try:
+            require_delivery_completion(self.store, requirement_id)
+        except WorkspaceError as exc:
+            return FinalizeResult(False, summary, task_ids, blockers=(str(exc),))
         persist_verification_results(self.store, requirement_id, results)
         self.checkpoint(
             requirement_id,
@@ -686,15 +949,21 @@ class AutomationRuntime:
             task_ids=task_ids,
         )
         if not passed:
-            blockers = tuple(
+            verification_blockers = tuple(
                 item.output or f"验证命令失败：{' '.join(item.command)}"
                 for item in results
                 if not item.passed
             ) or ("未配置已知验证命令",)
-            return FinalizeResult(False, summary, task_ids, blockers=blockers)
+            return FinalizeResult(False, summary, task_ids, blockers=verification_blockers)
         provider = self._provider(requirement_id)
-        review_candidates = list(task_ids)
-        if provider is not None:
+        if phase_gate_required:
+            current_task_id = initial_meta.get("requirement_task_id")
+            review_candidates = [
+                task_id for task_id in task_ids if task_id == current_task_id
+            ]
+        else:
+            review_candidates = list(task_ids)
+        if provider is not None and not phase_gate_required:
             related_tasks, task_error = list_tasks_safely(provider, requirement_id)
             if task_error is None:
                 review_candidates.extend(
@@ -705,7 +974,8 @@ class AutomationRuntime:
                     and task.status not in {"in_review", "done"}
                 )
         try:
-            move_tasks_to_review(provider, tuple(dict.fromkeys(review_candidates)))
+            with delivery_completion_guard(self.store, requirement_id):
+                move_tasks_to_review(provider, tuple(dict.fromkeys(review_candidates)))
         except WorkspaceError as exc:
             self.checkpoint(
                 requirement_id,
@@ -776,10 +1046,10 @@ class AutomationRuntime:
             next_action=final_next_action,
         )
         if manual_test_required:
-            blockers, review_task = self._publish_review_packet(requirement_id, provider)
-            if blockers:
+            packet_blockers, review_task = self._publish_review_packet(requirement_id, provider)
+            if packet_blockers:
                 self.store.touch_meta(requirement_id, status="in_progress")
-                return FinalizeResult(False, summary, final_task_ids, blockers=blockers)
+                return FinalizeResult(False, summary, final_task_ids, blockers=packet_blockers)
             self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
             return FinalizeResult(
                 True,
@@ -788,17 +1058,40 @@ class AutomationRuntime:
                 requirement_in_review=True,
                 review_task_id=getattr(review_task, "id", None),
             )
+        if phase_gate_required:
+            try:
+                gates.require_requirement_completion_ready(requirement_id)
+            except PhaseGateError as exc:
+                return FinalizeResult(
+                    False,
+                    summary,
+                    final_task_ids,
+                    blockers=(f"最终 Phase Gate 在完成前失效：{exc}",),
+                )
+        # 复用 Requirement 短锁，与 V2 接入串行；不在此锁内执行长验证。
         try:
-            if provider is not None:
-                complete_tasks(provider, final_task_ids)
+            with delivery_completion_guard(self.store, requirement_id):
+                # 在外部 Task 首次变为 done 之前持久化授权；Stop 只能恢复该事务。
+                self.store.touch_meta(
+                    requirement_id,
+                    pending_auto_completion={
+                        "schema_version": 1,
+                        "session_id": session_id,
+                        "task_ids": list(final_task_ids),
+                        "evidence_fingerprint": self._completion_evidence_fingerprint(requirement_id),
+                    },
+                )
+                if provider is not None:
+                    complete_tasks(provider, final_task_ids)
+                self.store.touch_meta(
+                    requirement_id,
+                    status="done",
+                    completion_mode="auto_after_verification",
+                    pending_auto_completion=None,
+                )
         except WorkspaceError as exc:
             self.store.touch_meta(requirement_id, status="in_progress")
             return FinalizeResult(False, summary, final_task_ids, blockers=(str(exc),))
-        self.store.touch_meta(
-            requirement_id,
-            status="done",
-            completion_mode="auto_after_verification",
-        )
         self._finish_or_defer_session(requirement_id, session_id, final_task_ids, provider)
         return FinalizeResult(
             True,

@@ -1,4 +1,4 @@
-"""从 dashi `in_progress` 状态反向触发 Codex 的本地单任务 Dispatcher。"""
+"""从 Task `in_progress` 状态触发执行端口的本地单任务 Dispatcher。"""
 
 from __future__ import annotations
 
@@ -11,11 +11,14 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
-from workspace_orchestrator.adapters.agent import CodexExecProvider, CodexExecutionResult
 from workspace_orchestrator.adapters.base import TaskProvider, TaskProviderError
+from workspace_orchestrator.agent_runtime.contracts import AgentRunResult
+from workspace_orchestrator.agent_runtime.ports import AgentExecutionPort
+from workspace_orchestrator.execution_ownership import ExecutionOwnership, ExecutionOwnershipError
 from workspace_orchestrator.models import Task
+from workspace_orchestrator.phase_gate import GateStore, PhaseGateError
 from workspace_orchestrator.project_config import (
     ProjectConfig,
     default_project_config,
@@ -75,10 +78,10 @@ def _write_state(store: WorkspaceStore, state: dict[str, Any]) -> None:
     store.write_json(_state_path(store), state)
 
 
-def _pid_alive(pid: object) -> bool:
+def _pid_alive(pid: object) -> TypeGuard[int]:
     if not isinstance(pid, int) or pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32":
         # Windows 的 os.kill(pid, 0) 在已退出进程上仍可能成功；直接读取
         # process exit code，避免把 stopping/stale PID 永久误判为存活。
         import ctypes
@@ -101,11 +104,24 @@ def _pid_alive(pid: object) -> bool:
             return bool(get_exit_code(handle, ctypes.byref(exit_code))) and exit_code.value == 259
         finally:
             close_handle(handle)
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    else:
+        # start_dispatcher 与 stop_dispatcher 在同一进程内运行时（例如集成
+        # 测试），已退出的子进程会先进入 zombie 状态。os.kill(pid, 0)
+        # 仍会把 zombie 视为存活，因此先以 WNOHANG 回收直接子进程。
+        # 独立 CLI 调用并非该 PID 的父进程，os.waitpid 会抛
+        # ChildProcessError，随后仍使用通用的存活探测。
+        try:
+            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except (AttributeError, ChildProcessError, OSError):
+            pass
+        else:
+            if waited_pid == pid:
+                return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
 
 
 def _config(store: WorkspaceStore) -> ProjectConfig:
@@ -190,24 +206,9 @@ def _only_managed_hooks(workspace_path: Path) -> bool:
     return bool(commands) and all(command == "ai-dev-os hook" for command in commands)
 
 
-def _result_summary(result: CodexExecutionResult) -> str:
-    messages: list[str] = []
-    for line in result.stdout.splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = payload.get("item") or {}
-        if item.get("type") == "agent_message" and item.get("text"):
-            messages.append(str(item["text"]))
-        elif payload.get("type") == "error" and payload.get("message"):
-            messages.append(str(payload["message"]))
-        elif payload.get("type") == "turn.failed":
-            error = payload.get("error") or {}
-            if error.get("message"):
-                messages.append(str(error["message"]))
-    detail = messages[-1] if messages else result.stderr.strip()
-    return (detail or "Codex 未返回可读结果")[-1800:]
+def _result_summary(result: AgentRunResult) -> str:
+    return (result.summary or result.stderr.strip() or result.stdout.strip()
+            or "Agent 未返回可读结果")[-1800:]
 
 
 def _block_task(provider: TaskProvider, task: Task, message: str) -> Task:
@@ -231,7 +232,7 @@ class AutoDispatcher:
     """单进程、单任务认领；不调度多个 Agent，也不抢占已有绑定。"""
 
     store: WorkspaceStore
-    executor: CodexExecProvider
+    executor: AgentExecutionPort
 
     def _task_state(self, task: Task) -> dict[str, Any] | None:
         state = _read_state(self.store)
@@ -258,7 +259,9 @@ class AutoDispatcher:
     def _claim(self, task: Task, requirement_id: str) -> bool:
         """与 queued cancel 共用同一文件锁，保证启动边界只有一方获胜。"""
 
+        GateStore(self.store).require_task_active(requirement_id, task.id)
         with self.store.locked():
+            ExecutionOwnership(self.store).require_v1(task)
             state = _read_state(self.store)
             tasks = dict(state.get("tasks") or {})
             current = dict(tasks.get(_task_key(task)) or {})
@@ -294,6 +297,10 @@ class AutoDispatcher:
             except TaskProviderError:
                 continue
             for task in tasks:
+                try:
+                    ExecutionOwnership(self.store).require_v1(task)
+                except ExecutionOwnershipError:
+                    continue
                 if (
                     task.status != "in_progress"
                     or is_requirement_review_task(task)
@@ -305,6 +312,16 @@ class AutoDispatcher:
                 previous = self._task_state(task)
                 if not _task_state_allows_dispatch(task, previous):
                     continue
+                try:
+                    GateStore(self.store).require_task_active(requirement_id, task.id)
+                except PhaseGateError as exc:
+                    refreshed = _block_task(
+                        provider,
+                        task,
+                        f"阶段门禁拒绝 Dispatcher 启动：{exc}",
+                    )
+                    self._remember(refreshed, result="blocked", error=str(exc))
+                    raise
                 path = _execution_path(self.store, task, data["meta"])
                 try:
                     comments = tuple(provider.list_comments(task.id))
@@ -327,7 +344,7 @@ class AutoDispatcher:
         return None
 
     def _record_log(
-        self, candidate: DispatchCandidate, result: CodexExecutionResult
+        self, candidate: DispatchCandidate, result: AgentRunResult
     ) -> str:
         directory = self.store.root / LOG_DIRECTORY
         directory.mkdir(parents=True, exist_ok=True)
@@ -342,6 +359,9 @@ class AutoDispatcher:
                 "resumed": result.resumed,
                 "session_id": result.session_id,
                 "returncode": result.returncode,
+                "runtime_id": result.runtime_id,
+                "run_id": result.run_id,
+                "summary": result.summary,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "finished_at": now_iso(),
@@ -350,11 +370,26 @@ class AutoDispatcher:
         return str(path.relative_to(self.store.project_root))
 
     def run_once(self) -> str:
-        candidate = self._candidate()
+        try:
+            candidate = self._candidate()
+        except (PhaseGateError, ExecutionOwnershipError):
+            return "blocked"
         if candidate is None:
             return "idle"
         task = candidate.task
-        if not self._claim(task, candidate.requirement_id):
+        try:
+            claimed = self._claim(task, candidate.requirement_id)
+        except ExecutionOwnershipError:
+            return "blocked"
+        except PhaseGateError as exc:
+            refreshed = _block_task(
+                candidate.task_provider,
+                task,
+                f"阶段门禁在认领前失效：{exc}",
+            )
+            self._remember(refreshed, result="blocked", error=str(exc))
+            return "blocked"
+        if not claimed:
             refreshed = _block_task(candidate.task_provider, task, "任务已按 Main 请求取消，未启动 Worker。")
             self._remember(refreshed, result="cancelled")
             return "cancelled"
@@ -364,11 +399,15 @@ class AutoDispatcher:
             self._remember(refreshed, result="blocked", error=message)
             return "blocked"
 
+        try:
+            ExecutionOwnership(self.store).require_v1(task)
+        except ExecutionOwnershipError:
+            return "blocked"
         result = self.executor.execute(
             candidate.execution_path,
             _prompt(candidate),
-            sandbox=_config(self.store).codex_sandbox,
-            model=_config(self.store).codex_model,
+            sandbox=_config(self.store).agent_sandbox or _config(self.store).codex_sandbox,
+            model=_config(self.store).agent_model or _config(self.store).codex_model,
             resume_session_id=candidate.resume_session_id,
             bypass_hook_trust=_only_managed_hooks(candidate.execution_path),
         )
@@ -394,7 +433,7 @@ class AutoDispatcher:
                     task_provider=candidate.task_provider,
                 )
             message = (
-                f"自动 Codex 执行失败（退出码 {result.returncode}）。\n\n"
+                f"自动 Agent 执行失败（退出码 {result.returncode}）。\n\n"
                 f"{_result_summary(result)}\n\n本地日志：{log_path}"
             )
             refreshed = _block_task(candidate.task_provider, refreshed, message)
@@ -409,7 +448,7 @@ class AutoDispatcher:
 
         if refreshed.status == "in_progress":
             message = (
-                "Codex 自动执行进程已经结束，但 Task 未进入 review；为避免看似仍在处理，"
+                "Agent 自动执行进程已经结束，但 Task 未进入 review；为避免看似仍在处理，"
                 f"已转为 blocked。\n\n{_result_summary(result)}\n\n本地日志：{log_path}"
             )
             refreshed = _block_task(candidate.task_provider, refreshed, message)
@@ -457,7 +496,7 @@ def start_dispatcher(store: WorkspaceStore, *, explicit: bool = False) -> dict[s
     )
     creationflags = 0
     popen_options: dict[str, Any] = {"start_new_session": True}
-    if os.name == "nt":
+    if sys.platform == "win32":
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.DETACHED_PROCESS
@@ -505,11 +544,13 @@ def stop_dispatcher(store: WorkspaceStore) -> dict[str, Any]:
             state.update(pid=None, status="stopped", stopped_at=now_iso())
             _write_state(store, state)
             return dispatcher_status(store)
+        if not isinstance(pid, int):
+            raise WorkspaceError("Dispatcher PID 状态无效；已拒绝发送停止信号")
         state.update(status="stopping", stop_requested_at=now_iso())
         _write_state(store, state)
 
     try:
-        os.kill(int(pid), signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
     deadline = time.monotonic() + 5.0
@@ -525,7 +566,12 @@ def stop_dispatcher(store: WorkspaceStore) -> dict[str, Any]:
     return dispatcher_status(store)
 
 
-def serve_dispatcher(store: WorkspaceStore) -> int:
+def serve_dispatcher(store: WorkspaceStore, executor: AgentExecutionPort | None = None) -> int:
+    # 保留旧 Python 入口的单参数调用；CLI 在其 composition root 显式注入。
+    if executor is None:
+        from workspace_orchestrator.composition import configured_executor
+
+        executor = configured_executor(store)
     stop_event = threading.Event()
 
     def request_stop(*_: object) -> None:
@@ -538,7 +584,7 @@ def serve_dispatcher(store: WorkspaceStore) -> int:
         state = _read_state(store)
         state.update(pid=os.getpid(), status="running", started_at=now_iso())
         _write_state(store, state)
-    dispatcher = AutoDispatcher(store, CodexExecProvider())
+    dispatcher = AutoDispatcher(store, executor)
     try:
         while not stop_event.is_set():
             dispatcher.run_once()

@@ -45,6 +45,77 @@ class LocalGitProvider:
     def current_branch(self) -> str | None:
         return self._run("branch", "--show-current") or None
 
+    def head_sha(self) -> str:
+        """返回当前工作树 exact HEAD。"""
+
+        return self._run("rev-parse", "HEAD")
+
+    def is_clean(self) -> bool:
+        """仅在已跟踪与未跟踪变更均为空时返回 True。"""
+
+        return not bool(self._run("status", "--porcelain"))
+
+    def read_file_at(self, revision: str, relative_path: str) -> str:
+        """读取某次提交中的文件，不受工作树未提交内容影响。"""
+
+        normalized = relative_path.replace("\\", "/")
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            raise GitError(f"Git 文件路径必须位于仓库内：{relative_path}")
+        try:
+            result = subprocess.run(
+                ["git", "show", f"{revision}:{normalized}"],
+                cwd=self.project_root,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise GitError(f"Git 不可用：{exc}") from exc
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "未知的 Git 错误"
+            raise GitError(message)
+        return result.stdout
+
+    def list_files_at(self, revision: str, prefix: str) -> tuple[str, ...]:
+        """枚举某次提交中前缀下的文件，不读取未提交工作树。"""
+
+        normalized = prefix.replace("\\", "/").strip("/")
+        if not normalized or ".." in normalized.split("/"):
+            raise GitError(f"Git 文件前缀必须位于仓库内：{prefix}")
+        output = self._run(
+            "ls-tree",
+            "-r",
+            "--name-only",
+            revision,
+            "--",
+            normalized,
+        )
+        return tuple(line for line in output.splitlines() if line)
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        """确定 ancestor_sha 是否可从 descendant_sha 到达。"""
+
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+                cwd=self.project_root,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise GitError(f"Git 不可用：{exc}") from exc
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        message = result.stderr.strip() or result.stdout.strip() or "未知的 Git 错误"
+        raise GitError(message)
+
     def push_status(self) -> dict[str, object]:
         """返回判断当前提交是否完整推送所需的确定性事实。"""
 

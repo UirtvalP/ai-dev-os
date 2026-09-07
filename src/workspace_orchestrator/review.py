@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .adapters.base import TaskProvider, TaskProviderError
+from .delivery_guard import is_v2_delivery, require_delivery_completion
 from .intent import INTENT_CHECK_LABELS, IntentStatus, review_intent
+from .models import Task
+from .phase_gate import GateStore
 from .workspace import WorkspaceError, WorkspaceStore, bullets, markdown_sections, replace_section
 
 
@@ -17,7 +20,7 @@ def require_current_review_packet(
     requirement_id: str,
     task_provider: TaskProvider | None,
     current_packet_fingerprint: str | None,
-):
+) -> Task | None:
     """对配置 Provider 的 Requirement 强制核对已发布 Packet 与当前事实。"""
 
     data = store.load(requirement_id)
@@ -169,6 +172,10 @@ def sync_requirement_review_outcome(
             if review_task is None:
                 store.touch_meta(requirement_id, status="in_progress")
                 return "Review Packet 尚未发布：缺少专用 Review 卡；Requirement 已恢复 in_progress"
+            v2 = is_v2_delivery(store, requirement_id)
+            if v2 and review_task.status == "done":
+                # V2 批准只由候选绑定的 IntegrationAuthority 消费，不能走 V1 done。
+                return None
             from .review_packet import parse_review_packet_marker
 
             marker = parse_review_packet_marker(review_task.description)
@@ -179,7 +186,9 @@ def sync_requirement_review_outcome(
                 and marker[0] == requirement_id.upper()
                 and marker[1] == published_revision
                 and marker[2] == published_fingerprint
-                and current_packet_fingerprint == published_fingerprint
+                # V2 Packet 绑定 integration candidate，不是 V1 Hook 当前 checkout。
+                # 此处仅消费当前发布卡的退回反馈；不能据此授权集成或完成。
+                and (v2 or current_packet_fingerprint == published_fingerprint)
             )
             if not valid_packet:
                 store.touch_meta(requirement_id, status="in_progress", review_packet_stale=True)
@@ -323,7 +332,7 @@ def _review_requirement_locked(
 
     if not blockers and transition:
         store.touch_meta(requirement_id, status="in_review")
-    elif data["meta"].get("status") == "in_review":
+    elif blockers and data["meta"].get("status") == "in_review":
         # 审查依据已变化时，旧的 in_review 不能继续冒充有效状态。
         store.touch_meta(requirement_id, status="in_progress")
     return ReviewResult(not blockers, tuple(blockers), intent_review.status)
@@ -341,10 +350,15 @@ def confirm_requirement_done(
 
     if not user_confirmed:
         raise WorkspaceError("必须提供用户明确确认，Requirement 才能进入 done")
+    require_delivery_completion(store, requirement_id)
     before = store.load(requirement_id)["meta"]
     require_current_review_packet(store, requirement_id, task_provider, current_packet_fingerprint)
     with store.locked(requirement_id):
+        require_delivery_completion(store, requirement_id)
         meta = store.load(requirement_id)["meta"]
+        gates = GateStore(store)
+        if gates.is_required(requirement_id):
+            gates.require_requirement_completion_ready(requirement_id)
         if meta.get("status") == "done":
             return
         if meta.get("status") != "in_review":
