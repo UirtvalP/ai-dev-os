@@ -1029,6 +1029,68 @@ def test_phase6_completion_token_is_the_only_v2_completion_bridge(tmp_path: Path
         )
 
 
+def test_completion_token_accepts_squash_main_only_for_identical_gated_tree(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True)
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+        subprocess.run(
+            ["git", "-C", str(root), "config", key, value], check=True, capture_output=True,
+        )
+    (root / "app.txt").write_text("same tree\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "app.txt"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "candidate"], check=True)
+    gate_sha = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--allow-empty", "-m", "squash identity"],
+        check=True,
+    )
+    main_sha = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    store = WorkspaceStore(root, execution_root=root)
+    requirement_id = store.create("Squash main", task_provider=None)
+    store.write_json(
+        store.path_for(requirement_id) / "phase-gates" / "phase-6.json",
+        {"status": "PASS", "commit_sha": gate_sha},
+    )
+    source_root = tmp_path / "completion-records"
+    service = DeploymentService(
+        source_root, DeploymentPolicy("prod", "v1", deployment_required=False),
+        Main(main_sha), Provider(), Authority(
+            DeploymentAuthorization("unused", requirement_id, "prod", main_sha, "merge", "post"),
+            MergeReceipt(
+                "merge", requirement_id, "request", "merged", "c" * 40, main_sha,
+                "b" * 40, "refs/heads/integration", "integration-auth", "pre", "post",
+                "2026-09-07T00:00:00+00:00",
+            ),
+        ),
+    )
+    token = service.complete(requirement_id, main_sha)
+    registry = DeploymentEnvironmentRegistry(tmp_path / "environments.json")
+    registry.register(DeploymentEnvironment(
+        "prod", "provider", "v1", deployment_required=False,
+    ))
+    assert publish_completion_token(
+        store, token, source_root=source_root, registry=registry,
+    ).is_file()
+
+    (root / "app.txt").write_text("different tree\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "app.txt"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "different"], check=True)
+    different_sha = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    different = service.complete(requirement_id, different_sha)
+    with pytest.raises(DeploymentError, match="Phase 6"):
+        publish_completion_token(
+            store, different, source_root=source_root, registry=registry,
+        )
+
+
 def test_deployment_required_e2e_publishes_completion_only_after_success(
     tmp_path: Path,
 ) -> None:
