@@ -95,6 +95,31 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
     workbench = commands.add_parser("workbench", help="由 AI Dev OS 主动创建并启动 Execution")
     workbench_commands = workbench.add_subparsers(dest="workbench_command", required=True)
+    workbench_serve = workbench_commands.add_parser(
+        "serve", help="启动以 Requirement Space 为首页的独立工作台",
+    )
+    workbench_serve.add_argument(
+        "--host", default="127.0.0.1",
+        help="监听地址；非回环地址必须同时使用 --remote-access",
+    )
+    workbench_serve.add_argument("--port", type=int, default=8765)
+    workbench_serve.add_argument(
+        "--root", type=Path, default=Path.cwd(),
+        help="当前项目目录；已接入项目会自动登记到工作台",
+    )
+    workbench_serve.add_argument(
+        "--token-file",
+        type=Path,
+        default=Path.home() / ".ai-dev-os" / "secrets" / "workbench.token",
+        help="远程访问模式的令牌文件；本机默认模式不读取或创建",
+    )
+    workbench_serve.add_argument(
+        "--no-open", action="store_true", help="启动服务但不自动打开浏览器",
+    )
+    workbench_serve.add_argument(
+        "--remote-access", action="store_true",
+        help="为局域网、公网、反向代理或隧道入口强制启用 Bearer token",
+    )
     demo = workbench_commands.add_parser("demo", help="运行不接管原生 Agent 的 P2 vertical slice")
     demo.add_argument("requirement_id")
     demo.add_argument("--task", default="TASK-P2-DEMO")
@@ -279,6 +304,36 @@ def _format_project(project: RegisteredProject) -> str:
 
 def run(args: argparse.Namespace) -> str:
     if args.command == "workbench":
+        if args.workbench_command == "serve":
+            from .remote_control import load_or_create_token
+            from .workbench_hub import WorkbenchHub, serve_workbench
+
+            candidate_root = args.root.expanduser().resolve()
+            if (candidate_root / ".ai-dev-os.json").is_file():
+                result = register_project(candidate_root)
+                _sync_registry_after_local_success(result.root, action="登记")
+            token = load_or_create_token(args.token_file) if args.remote_access else ""
+
+            def report_ready() -> None:
+                report = {
+                    "status": "serving",
+                    "url": f"http://{args.host}:{args.port}/",
+                    "authentication": "bearer" if args.remote_access else "none-loopback",
+                    "browser_opened": not args.no_open,
+                    "safety": {
+                        "listen": "remote-enabled" if args.remote_access else "loopback",
+                        "agent_sandbox": "workspace-write",
+                    },
+                }
+                if args.remote_access:
+                    report["token_file"] = str(args.token_file.expanduser().resolve())
+                print(json.dumps(report, ensure_ascii=False), flush=True)
+            serve_workbench(
+                WorkbenchHub(), token=token, host=args.host, port=args.port,
+                open_browser=not args.no_open,
+                require_token=args.remote_access, ready_callback=report_ready,
+            )
+            return ""
         if args.workbench_command == "supervise":
             from .supervisor_watchdog import RequirementWatchdog
 

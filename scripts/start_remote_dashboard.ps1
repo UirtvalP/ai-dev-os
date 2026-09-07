@@ -1,8 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$runtimeRoot = Join-Path $env:USERPROFILE '.ai-dev-os\runtime\req-020-dashboard'
-$tokenFile = Join-Path $env:USERPROFILE '.ai-dev-os\secrets\req-020-dashboard.token'
+$runtimeRoot = Join-Path $env:USERPROFILE '.ai-dev-os\runtime\workbench'
+$tokenFile = Join-Path $env:USERPROFILE '.ai-dev-os\secrets\workbench.token'
 $identityFile = Join-Path $env:USERPROFILE '.ssh\homebox-relay\id_ed25519'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $publicUrl = 'https://game.homebox2026.online/ai-dev-os/'
@@ -14,7 +14,19 @@ foreach ($path in @($python, $identityFile)) {
     }
 }
 
-$listener = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue
+$localPort = 8767
+$listener = Get-NetTCPConnection -LocalPort $localPort -State Listen -ErrorAction SilentlyContinue
+if ($listener) {
+    try {
+        $existing = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$localPort/" -TimeoutSec 3
+    } catch {
+        throw "$localPort 端口已被 PID $($listener.OwningProcess) 占用，且不是可识别的 Workbench"
+    }
+    if ($existing.Headers['Server'] -notlike 'AI-Dev-OS-Workbench/*' -or
+        $existing.Headers['X-AI-Dev-OS-Auth'] -ne 'bearer') {
+        throw "$localPort 端口已被 PID $($listener.OwningProcess) 占用，但不是启用远程认证的 Workbench"
+    }
+}
 if (-not $listener) {
     $codex = Get-ChildItem -Path "$env:LOCALAPPDATA\OpenAI\Codex\bin\*\codex.exe" -File |
         Sort-Object LastWriteTime -Descending |
@@ -25,10 +37,9 @@ if (-not $listener) {
     $env:AI_DEV_OS_CODEX = $codex.FullName
     $arguments = @(
         '-m', 'workspace_orchestrator.product_cli',
-        'dashboard', 'serve', 'REQ-020', '--new-session',
-        '--root', ('"{0}"' -f $projectRoot), '--port', '8765',
-        '--token-file', ('"{0}"' -f $tokenFile),
-        '--run-id', 'remote-req020-dedicated'
+        'workbench', 'serve', '--no-open', '--remote-access',
+        '--root', ('"{0}"' -f $projectRoot), '--port', $localPort,
+        '--token-file', ('"{0}"' -f $tokenFile)
     ) -join ' '
     Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
@@ -38,14 +49,19 @@ if (-not $listener) {
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 500
-        $listener = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue
+        $listener = Get-NetTCPConnection -LocalPort $localPort -State Listen -ErrorAction SilentlyContinue
     } until ($listener -or (Get-Date) -ge $deadline)
     if (-not $listener) {
-        throw 'Dashboard 未能在 127.0.0.1:8765 启动'
+        throw "Dashboard 未能在 127.0.0.1:$localPort 启动"
+    }
+    $started = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$localPort/" -TimeoutSec 3
+    if ($started.Headers['Server'] -notlike 'AI-Dev-OS-Workbench/*' -or
+        $started.Headers['X-AI-Dev-OS-Auth'] -ne 'bearer') {
+        throw '新启动的 Workbench 未启用远程认证，拒绝建立公网隧道'
     }
 }
 
-$reverseForward = '127.0.0.1:18765:127.0.0.1:8765'
+$reverseForward = "127.0.0.1:18765:127.0.0.1:$localPort"
 $sshProcess = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -eq 'ssh.exe' -and $_.CommandLine -match [regex]::Escape($reverseForward)
 }
@@ -66,7 +82,8 @@ if (-not $sshProcess) {
 [pscustomobject]@{
     Status = 'running'
     PublicUrl = $publicUrl
-    LocalEndpoint = 'http://127.0.0.1:8765'
+    LocalEndpoint = "http://127.0.0.1:$localPort"
     CloudEndpoint = 'http://127.0.0.1:18765'
     TokenFile = $tokenFile
+    Mode = 'Requirement Space Workbench'
 }

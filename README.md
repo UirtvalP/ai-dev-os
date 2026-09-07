@@ -52,6 +52,29 @@ ROADMAP.md                    第一版实施路线图
 
 需要 Python 3.11+。
 
+安装后，日常入口只有一条命令：
+
+```powershell
+ai-dev-os workbench serve
+```
+
+Workbench 会在本机回环地址启动并自动打开浏览器，本地访问不要求 Token。首页从 Global Project
+Registry 自动列出全部项目及其 Requirement
+Space；在已接入项目目录启动时会幂等补登记当前项目。用户可以在页面中新建 Requirement、进入任一
+Requirement Space，查看 Intent、Acceptance、Progress、Task、Execution、Agent、Verification 与 Git，
+并通过“开始 / 继续执行”明确启动项目内 `workspace-write` Runtime。默认服务只监听 loopback，审批保持拒绝；
+启用局域网、公网或隧道访问时必须显式增加 `--remote-access` 并使用 Token。
+
+```powershell
+ai-dev-os workbench serve --remote-access --port 8767 --no-open
+```
+
+开发仓库也可以直接运行：
+
+```powershell
+.\scripts\start_workbench.ps1
+```
+
 从官方 Git 仓库安装为用户级命令（推荐使用 `uv`）：
 
 ```bash
@@ -98,8 +121,9 @@ ai-dev-os init
 尚不存在时作为首次迁移来源，运行时此后只读取用户级文件。项目中会创建 `.ai-dev-os.json`，默认
 配置 `dashi` 及由项目名和绝对路径指纹确定性生成的项目 ID，并创建空的本地
 Requirement 存储目录。它不会写 `AGENTS.md`、不会创建 `.codex/hooks.json`、不会启动 Dispatcher，
-因此 Codex、Claude Code 与 Cursor 的原生生命周期保持不变。接入完成后，可使用
-`workspace new` 创建首个 Requirement，或从 Workbench 启动 Execution。
+因此 Codex、Claude Code 与 Cursor 的原生生命周期保持不变。接入完成后，直接运行
+`ai-dev-os workbench serve`，即可从 Workbench 首页创建首个 Requirement 并启动 Execution；
+`workspace new` 保留为脚本和自动化兼容入口。
 
 用户级目录同时保存长期原则与最小项目索引：
 
@@ -346,12 +370,15 @@ Windows LPAC；Linux 尚未接入同等后端时报告不可用，不降级为�
 
 Dashboard 只监听本机回环地址。当前正式入口复用已有云服务器、HTTPS 域名和 SSH 反向转发：
 `https://game.homebox2026.online/ai-dev-os/` → 云端 Nginx `127.0.0.1:18765` → 本机
-`127.0.0.1:8765`。不使用 Quick Tunnel，也不把 Dashboard 直接绑定公网地址。
+`127.0.0.1:8767`（带 Token 的独立远程监听）。本机免密入口仍为 `127.0.0.1:8765`，不会被公网隧道复用。
+不使用 Quick Tunnel，也不把 Dashboard 直接绑定公网地址。
 
-首次启动会在 `--token-file` 指定位置生成至少 32 字节的随机 token；浏览器页面本身不包含 token，
-所有状态与指令 API 都要求 `Authorization: Bearer <token>`。服务端校验同源、请求大小、字段、游标、
-Session 的 Requirement 归属，并在 HTTP 投影边界脱敏；远程 Runtime 固定使用 `read-only` sandbox
-且拒绝审批。页面可查看 Requirement/Task DAG、Agent/Session/Turn、Git、Verification Receipt 与
+本机默认入口 `ai-dev-os workbench serve` 只监听回环地址且无需 Token；浏览器可直接进入需求空间。
+局域网绑定、公网反向代理或隧道入口必须增加 `--remote-access`，此时才在 `--token-file` 指定位置生成
+至少 32 字节的随机 token，且所有状态与指令 API 要求 `Authorization: Bearer <token>`。服务端校验同源、请求大小、字段、游标、
+Session 的 Requirement 归属，并在 HTTP 投影边界脱敏。旧 `dashboard serve` 远程控制入口固定使用
+`read-only` sandbox；新 Workbench 只有在所选 Requirement 内明确提交执行指令后才使用项目级
+`workspace-write`，两者都拒绝审批。页面可查看 Requirement/Task DAG、Agent/Session/Turn、Git、Verification Receipt 与
 append-only Event 增量，并支持空闲新 Turn、运行中 steer、持久排队、取消/中断和失败显式重试。
 每个 command 都保存 ID、目标 Session、状态、投递/完成时间、结果、尝试次数与重试来源；相同 ID
 的网络重放不会重复投递。Dashboard 缓存可丢弃，重启后从 Workspace、JSONL Event Store 和命令队列
@@ -362,8 +389,9 @@ append-only Event 增量，并支持空闲新 Turn、运行中 steer、持久排
 .\scripts\stop_remote_dashboard.ps1
 ```
 
-启动脚本会优先使用 Codex 桌面应用内置的最新 CLI，幂等启动本机 Dashboard 和专用 SSH 反向转发；
-停止脚本只终止 REQ-020 Dashboard 与它的 `18765 → 8765` 转发，不影响游戏 relay 或现有
+启动脚本会优先使用 Codex 桌面应用内置的最新 CLI，幂等启动 8767 认证 Workbench 和专用 SSH 反向转发；
+停止脚本只终止该远程 Workbench 与它的 `18765 → 8767` 转发（并清理旧版 `18765 → 8765` 转发），不影响本机
+8765 免密 Workbench、游戏 relay 或现有
 `codex-cursor` Named Tunnel。
 
 ## V2 main-only Deployment Gate
