@@ -13,4 +13,3 @@ Watchdog 消费 Execution 及其原始事件、Task 状态、Acceptance、Git/Te
 - Main Agent 可以观察 Supervisor 信号并执行 Review，但 Supervisor 不负责开发。
 - Requirement Space 直接展示当前信号。
 - Watchdog 状态保存在 Requirement 内的人类可读 JSON 中，可在重启后继续判断 Acceptance stagnation。
-
