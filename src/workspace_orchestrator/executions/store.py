@@ -24,6 +24,7 @@ class ExecutionStore:
         workspace_path: Path | None = None, source: str = "workbench",
         parent_execution_id: str | None = None,
         creation_key: str | None = None,
+        execution_policy: dict[str, Any] | None = None,
     ) -> Execution:
         requirement_id = requirement_id.upper()
         creation_key = (creation_key or "").strip() or None
@@ -54,6 +55,7 @@ class ExecutionStore:
                 status="queued", created_at=timestamp, updated_at=timestamp,
                 prompt=prompt, parent_execution_id=parent_execution_id, source=source,
                 creation_key=creation_key,
+                execution_policy=dict(execution_policy or {}),
             )
             self.workspace.write_json(root / f"{execution_id}.json", execution.to_dict())
             return execution
@@ -113,6 +115,27 @@ class ExecutionStore:
             )
             self.workspace.write_json(path, updated.to_dict())
             return updated
+
+    def claim_start(
+        self, execution_id: str, *, role: str, runtime_id: str, provider: str,
+        model: str | None, reasoning_effort: str | None, workspace_path: Path,
+        prompt: str,
+    ) -> tuple[Execution, bool]:
+        """只允许一个调用者原子领取 queued Execution；其余只观察当前事实。"""
+
+        with self.workspace.locked():
+            path = self._path_for_id(execution_id.upper())
+            current = self._read_path(path)
+            if current.status != "queued":
+                return current, False
+            updated = replace(
+                current, role=role, runtime_id=runtime_id, provider=provider,
+                model=model, reasoning_effort=reasoning_effort,
+                workspace_path=str(workspace_path.resolve()), prompt=prompt,
+                status="starting", updated_at=now_iso(),
+            )
+            self.workspace.write_json(path, updated.to_dict())
+            return updated, True
 
     def _root(self, requirement_id: str) -> Path:
         return self.workspace.path_for(requirement_id) / "executions"

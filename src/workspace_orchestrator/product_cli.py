@@ -26,7 +26,7 @@ from .console import configure_standard_streams as _configure_standard_streams
 from .hook_runtime import main as hook_main
 from .orchestration.contracts import PlanningRequest
 from .project_config import load_project_config
-from .project_init import InitResult, initialize_project, migrate_project
+from .project_init import InitResult, initialize_project, migrate_project, register_project
 from .project_registry import GlobalProjectRegistry, RegisteredProject
 from .workspace import WorkspaceError, WorkspaceStore
 
@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     project = commands.add_parser("project", help="查询或取消登记全局项目索引")
     project_commands = project.add_subparsers(dest="project_command", required=True)
+    add = project_commands.add_parser("add", help="注册独立 Workbench 项目，不安装 Agent Hook")
+    add.add_argument("path", nargs="?", type=Path, default=Path.cwd())
     project_commands.add_parser("list", help="列出全部已登记项目")
     show = project_commands.add_parser("show", help="显示一个已登记项目")
     show.add_argument("project_id", help="稳定项目 ID")
@@ -78,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--root", type=Path, default=Path.cwd(), help="项目或关联 worktree 目录")
     events.add_argument("--after", type=int, default=0, help="排他事件序号（默认：0）")
     events.add_argument("--limit", type=int, default=1000, help="最多返回的事件数")
+    workbench = commands.add_parser("workbench", help="由 AI Dev OS 主动创建并启动 Execution")
+    workbench_commands = workbench.add_subparsers(dest="workbench_command", required=True)
+    demo = workbench_commands.add_parser("demo", help="运行不接管原生 Agent 的 P2 vertical slice")
+    demo.add_argument("requirement_id")
+    demo.add_argument("--task", default="TASK-P2-DEMO")
+    demo.add_argument("--root", type=Path, default=Path.cwd())
     dashboard = commands.add_parser("dashboard", help="启动带认证的本机 Dashboard 控制面")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     serve = dashboard_commands.add_parser("serve", help="在回环地址启动远程控制入口")
@@ -230,6 +238,13 @@ def _format_project(project: RegisteredProject) -> str:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "workbench":
+        from .workbench import demo_workbench
+
+        execution_root = args.root.expanduser().resolve()
+        store = WorkspaceStore(discover_project_root(execution_root), execution_root=execution_root)
+        execution = demo_workbench(store, args.requirement_id, args.task)
+        return json.dumps(execution.to_dict(), ensure_ascii=False, indent=2)
     if args.command == "integration":
         from .integration_composition import configured_integration, load_verification_commands
 
@@ -359,6 +374,10 @@ def run(args: argparse.Namespace) -> str:
         registry_message = _sync_registry_after_local_success(result.root, action="迁移")
         return _format_result(result, action="项目格式已迁移") + f"\n{registry_message}"
     if args.command == "project":
+        if args.project_command == "add":
+            result = register_project(args.path)
+            registry_message = _sync_registry_after_local_success(result.root, action="注册")
+            return _format_result(result, action="Workbench 项目已注册") + f"\n{registry_message}"
         project_registry = GlobalProjectRegistry()
         if args.project_command == "list":
             return _format_project_list(project_registry.list())

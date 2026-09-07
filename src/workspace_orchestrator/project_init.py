@@ -354,6 +354,39 @@ def initialize_project(root: Path) -> InitResult:
     return _apply_current_project_files(_resolve_project_root(root))
 
 
+def register_project(root: Path) -> InitResult:
+    """注册独立 Workbench 项目，不接管任何原生 Agent 生命周期。"""
+
+    resolved = _resolve_project_root(root)
+    targets = {
+        "PROJECT_INTENT.md": (None, None),
+        ".gitignore": (GITIGNORE_START, GITIGNORE_END),
+    }
+    for name, markers in targets.items():
+        _validate_file(resolved / name, *markers)
+    _validate_project_config(resolved / CONFIG_NAME)
+    _validate_user_principles_path()
+
+    workspace_root = resolved / ".workspace"
+    if workspace_root.exists() and not workspace_root.is_dir():
+        raise WorkspaceError(f"Requirement 存储路径不是目录：{workspace_root}")
+    workspace_outcome = "preserved" if workspace_root.exists() else "created"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    outcomes = {
+        user_config.USER_PRINCIPLES_DISPLAY_PATH: _ensure_user_principles(resolved),
+        "PROJECT_INTENT.md": _create_if_missing(resolved / "PROJECT_INTENT.md", PROJECT_INTENT),
+        ".gitignore": _ensure_gitignore(resolved / ".gitignore"),
+        CONFIG_NAME: _ensure_project_config(resolved),
+        ".workspace/": workspace_outcome,
+    }
+    return InitResult(
+        root=resolved,
+        created=tuple(name for name, outcome in outcomes.items() if outcome == "created"),
+        updated=tuple(name for name, outcome in outcomes.items() if outcome == "updated"),
+        preserved=tuple(name for name, outcome in outcomes.items() if outcome == "preserved"),
+    )
+
+
 def migrate_project(root: Path) -> InitResult:
     """只在持久格式确有变化时迁移已接入项目。"""
 
