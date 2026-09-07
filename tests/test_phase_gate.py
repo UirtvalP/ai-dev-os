@@ -2283,7 +2283,11 @@ def test_reopen_cli_requires_reason_and_derives_session(
     with pytest.raises(SystemExit):
         parser.parse_args(["phase", "reopen", "REQ-001", "--phase", "0"])
     monkeypatch.setattr(cli, "WorkspaceStore", lambda *args, **kwargs: workspace)
-    monkeypatch.setattr(cli, "GateStore", lambda store: gates)
+    monkeypatch.setattr(
+        cli,
+        "configured_phase_verification",
+        lambda store, phase: type("Configured", (), {"gates": gates})(),
+    )
     monkeypatch.setattr(cli, "require_session_id", lambda provider: "runtime-session")
     args = parser.parse_args(
         [
