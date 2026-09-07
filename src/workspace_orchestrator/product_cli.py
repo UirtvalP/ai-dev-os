@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     project_commands = project.add_subparsers(dest="project_command", required=True)
     add = project_commands.add_parser("add", help="注册独立 Workbench 项目，不安装 Agent Hook")
     add.add_argument("path", nargs="?", type=Path, default=Path.cwd())
+    isolation = project_commands.add_parser(
+        "isolation-check", help="检查项目是否会接管原生 Agent 生命周期",
+    )
+    isolation.add_argument("path", nargs="?", type=Path, default=Path.cwd())
     project_commands.add_parser("list", help="列出全部已登记项目")
     show = project_commands.add_parser("show", help="显示一个已登记项目")
     show.add_argument("project_id", help="稳定项目 ID")
@@ -378,6 +382,11 @@ def run(args: argparse.Namespace) -> str:
             result = register_project(args.path)
             registry_message = _sync_registry_after_local_success(result.root, action="注册")
             return _format_result(result, action="Workbench 项目已注册") + f"\n{registry_message}"
+        if args.project_command == "isolation-check":
+            from .native_isolation import require_native_isolation
+
+            report = require_native_isolation(args.path)
+            return json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
         project_registry = GlobalProjectRegistry()
         if args.project_command == "list":
             return _format_project_list(project_registry.list())
