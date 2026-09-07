@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Literal
 
 from ..agent_runtime.contracts import ModelDescriptor, RuntimeDescriptor
 from .contracts import (
     ExecutionPlan,
+    ExecutionPolicyResult,
+    ExecutionRecommendation,
     ModelRoute,
     PlanningRequest,
     PolicyDecision,
@@ -21,6 +23,7 @@ from .contracts import (
     commands_fingerprint,
     fingerprint,
 )
+from .ports import ModelRouterProvider
 
 
 def _decision(provider_id: str, reason: str, inputs: dict[str, Any], output: dict[str, Any]) -> PolicyDecision:
@@ -89,8 +92,8 @@ def validate_route(task: TaskSpec, route: ModelRoute, runtimes: tuple[RuntimeDes
     expected_profile = "workspace-write" if task.write_required else "read-only"
     if route.sandbox != expected_profile:
         raise PolicyError("invalid_route", "路由不能扩大只读任务权限或降低写任务隔离")
-    required = {*task.required_capabilities, "start", "events", f"profile:{expected_profile}"}
-    if not required <= set(runtime.capabilities):
+    required = {*task.required_capabilities, "start", "event_stream", f"profile:{expected_profile}"}
+    if any(not runtime.supports(capability) for capability in required):
         raise PolicyError("no_route", "所选 Runtime 未报告任务必需的能力/profile")
     model = next((item for item in runtime.models if item.id == route.model), None)
     if model is None or (route.effort is not None and route.effort not in model.reasoning_efforts):
@@ -140,6 +143,67 @@ class CapabilityModelRouter:
         reason = "根据实际 Runtime 能力/profile 筛选；尊重显式偏好，默认模型优先；effort 按任务复杂度选择"
         return route, _decision("local.capability-routing", reason,
                                 {"task": task.to_dict(), "runtimes": descriptions}, route.to_dict())
+
+
+class ExecutionRoutingPolicy:
+    """裁决 Main Agent 的软建议；真实能力、硬约束与并行上限始终优先。"""
+
+    def __init__(self, router: ModelRouterProvider | None = None) -> None:
+        self.router = router or CapabilityModelRouter()
+
+    def decide(
+        self, task: TaskSpec, runtimes: tuple[RuntimeDescriptor, ...],
+        recommendation: ExecutionRecommendation, *, max_parallelism: int = 1,
+    ) -> tuple[ExecutionPolicyResult, PolicyDecision]:
+        task.validate()
+        recommendation.validate()
+        _runtime_inputs(runtimes)
+        if type(max_parallelism) is not int or max_parallelism < 1:
+            raise PolicyError("invalid_policy", "max_parallelism 必须是正整数")
+
+        recommended_task = replace(
+            task,
+            preferred_runtime=task.preferred_runtime or recommendation.runtime_id,
+            preferred_model=task.preferred_model or recommendation.model,
+            preferred_effort=task.preferred_effort or recommendation.effort,
+        )
+        route_recommendation_supported = True
+        try:
+            route, _route_decision = self.router.route(recommended_task, runtimes)
+            # Router 可由插件替换；Policy 裁决边界必须重新验证其不可信输出。
+            validate_route(recommended_task, route, runtimes)
+        except PolicyError as error:
+            if error.code not in {"no_route", "invalid_route"}:
+                raise
+            # Recommendation 是软输入；Policy 只可回退到 Task 已声明的硬约束。
+            route, _route_decision = self.router.route(task, runtimes)
+            validate_route(task, route, runtimes)
+            route_recommendation_supported = False
+
+        parallelism = min(recommendation.parallelism, max_parallelism)
+        # V1 单写者约束仍是硬安全边界；P9 可在新的执行隔离契约下扩展。
+        if task.write_required:
+            parallelism = 1
+        recommendation_accepted = route_recommendation_supported and all((
+            recommendation.runtime_id is None or recommendation.runtime_id == route.runtime_id,
+            recommendation.model is None or recommendation.model == route.model,
+            recommendation.effort is None or recommendation.effort == route.effort,
+            recommendation.parallelism == parallelism,
+        ))
+        result = ExecutionPolicyResult(
+            route, recommendation.role, parallelism, recommendation_accepted,
+        )
+        if recommendation_accepted:
+            reason = "建议满足真实 Runtime 能力与 Policy 约束，已完整采纳"
+        elif not route_recommendation_supported:
+            reason = "路由建议不满足真实 Runtime 能力或硬约束，Policy 已安全回退"
+        else:
+            reason = "建议与 Task 硬约束或 Policy 上限冲突，Policy 已部分调整"
+        inputs = {
+            "task": task.to_dict(), "runtimes": _runtime_inputs(runtimes),
+            "recommendation": recommendation.to_dict(), "max_parallelism": max_parallelism,
+        }
+        return result, _decision("local.execution-routing-policy", reason, inputs, result.to_dict())
 
 
 class RuleVerificationPlanner:

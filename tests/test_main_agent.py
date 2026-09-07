@@ -63,6 +63,19 @@ def test_owner_loop_uses_cas_stage_and_records_structured_action(tmp_path: Path)
         owner.record_action("AskUser", "重复", {}, expected_revision=refreshed.revision)
 
 
+def test_owner_emits_provider_neutral_execution_recommendation(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Owner routing", goal="route")
+    recommendation = RequirementOwner(store, requirement_id).recommend_execution(
+        runtime_id="runtime-from-discovery", model="model-from-discovery", effort="high",
+        role="reviewer", parallelism=2, reason="风险审查",
+    )
+    assert recommendation.recommender_id == f"main-agent:{requirement_id}"
+    assert recommendation.runtime_id == "runtime-from-discovery"
+    assert recommendation.model == "model-from-discovery"
+    assert recommendation.role == "reviewer" and recommendation.parallelism == 2
+
+
 def test_owner_rejects_non_json_action_payload(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path)
     requirement_id = store.create("Owner demo", goal="ship")

@@ -93,6 +93,19 @@ def build_parser() -> argparse.ArgumentParser:
     owner = workbench_commands.add_parser("owner", help="刷新并显示 Requirement Main Agent 状态")
     owner.add_argument("requirement_id")
     owner.add_argument("--root", type=Path, default=Path.cwd())
+    route = workbench_commands.add_parser("route", help="由 Main Agent 建议、Policy Engine 裁决执行路由")
+    route.add_argument("requirement_id")
+    route.add_argument("--root", type=Path, default=Path.cwd())
+    route.add_argument("--task", default="TASK-ROUTE-DEMO")
+    route.add_argument("--prompt", default="执行结构化任务")
+    route.add_argument("--complexity", choices=("tiny", "normal", "complex"), default="normal")
+    route.add_argument("--write", action="store_true")
+    route.add_argument("--runtime")
+    route.add_argument("--model")
+    route.add_argument("--reasoning")
+    route.add_argument("--role", default="worker")
+    route.add_argument("--parallelism", type=int, default=1)
+    route.add_argument("--max-parallelism", type=int, default=1)
     dashboard = commands.add_parser("dashboard", help="启动带认证的本机 Dashboard 控制面")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     serve = dashboard_commands.add_parser("serve", help="在回环地址启动远程控制入口")
@@ -258,6 +271,37 @@ def run(args: argparse.Namespace) -> str:
                 expected_revision=requirement_owner.current_revision(),
             )
             return json.dumps(owner_state.to_dict(), ensure_ascii=False, indent=2)
+        if args.workbench_command == "route":
+            from .main_agent import RequirementOwner
+            from .orchestration.contracts import TaskSpec
+            from .orchestration.policies import ExecutionRoutingPolicy
+
+            task = TaskSpec(
+                args.task, args.task, args.prompt, complexity=args.complexity,
+                write_required=args.write,
+            )
+            execution_root = args.root.expanduser().resolve()
+            owner_store = WorkspaceStore(
+                discover_project_root(execution_root), execution_root=execution_root,
+            )
+            recommendation = RequirementOwner(
+                owner_store, args.requirement_id,
+            ).recommend_execution(
+                runtime_id=args.runtime, model=args.model, effort=args.reasoning,
+                role=args.role, parallelism=args.parallelism,
+                reason="Main Agent 基于当前 Requirement 上下文给出的执行建议",
+            )
+            routing_result, routing_decision = ExecutionRoutingPolicy().decide(
+                task, runtime_descriptors(), recommendation,
+                max_parallelism=args.max_parallelism,
+            )
+            return json.dumps(
+                {
+                    "result": routing_result.to_dict(),
+                    "policy_decision": routing_decision.to_dict(),
+                },
+                ensure_ascii=False, indent=2,
+            )
         from .workbench import demo_workbench
 
         execution_root = args.root.expanduser().resolve()

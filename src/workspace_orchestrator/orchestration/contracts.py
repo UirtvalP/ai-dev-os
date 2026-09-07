@@ -291,6 +291,56 @@ class ModelRoute(_Contract):
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionRecommendation(_Contract):
+    """Main Agent 的软建议；它不能绕过 Runtime 能力或 Policy 上限。"""
+
+    recommender_id: str
+    runtime_id: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    role: str = "worker"
+    parallelism: int = 1
+    reason: str = ""
+
+    def validate(self) -> None:
+        _Contract.validate(self)
+        _text(self.recommender_id, "recommender_id")
+        _text(self.role, "role")
+        _integer(self.parallelism, "parallelism", 1)
+        for name in ("runtime_id", "model", "effort"):
+            value = getattr(self, name)
+            if value is not None:
+                _text(value, name)
+        if not isinstance(self.reason, str) or any(ord(char) < 32 for char in self.reason):
+            raise PolicyError("invalid_contract", "reason 必须是无控制字符字符串")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPolicyResult(_Contract):
+    """Policy Engine 对路由、角色和并行度的最终裁决。"""
+
+    route: ModelRoute
+    role: str
+    parallelism: int
+    recommendation_accepted: bool
+
+    def validate(self) -> None:
+        _Contract.validate(self)
+        if not isinstance(self.route, ModelRoute):
+            raise PolicyError("invalid_contract", "route 必须是 ModelRoute")
+        self.route.validate()
+        _text(self.role, "role")
+        _integer(self.parallelism, "parallelism", 1)
+        if type(self.recommendation_accepted) is not bool:
+            raise PolicyError("invalid_contract", "recommendation_accepted 必须是布尔值")
+
+    @classmethod
+    def _decode(cls, values: dict[str, Any]) -> dict[str, Any]:
+        values["route"] = ModelRoute.from_dict(values["route"])
+        return values
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationCommand(_Contract):
     command_id: str
     argv: tuple[str, ...]

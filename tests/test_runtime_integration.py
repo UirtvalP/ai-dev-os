@@ -19,6 +19,7 @@ from workspace_orchestrator.agent_runtime.contracts import (
     AgentEvent,
     AgentRunRequest,
     AgentRunResult,
+    ModelDescriptor,
     RuntimeDescriptor,
 )
 from workspace_orchestrator.agent_runtime.cursor import CursorAcpRuntime
@@ -72,6 +73,41 @@ def test_runtime_cli_reports_unavailable_honestly(monkeypatch, capsys):
     assert product_cli.main(["runtime", "list"]) == 0
     item = json.loads(capsys.readouterr().out)[0]
     assert item["available"] is False and item["capabilities"] == []
+
+
+def test_workbench_route_cli_exposes_main_recommendation_and_policy_verdict(
+    tmp_path, monkeypatch, capsys,
+):
+    store = WorkspaceStore(tmp_path)
+    requirement_id = store.create("Routing CLI")
+    monkeypatch.setattr(product_cli, "discover_project_root", lambda root: root)
+    monkeypatch.setattr(product_cli, "runtime_descriptors", lambda: (
+        RuntimeDescriptor(
+            "fixture", "Fixture", "1", True,
+            ("start", "interactive_message", "event_stream", "profile:read-only"),
+            (ModelDescriptor("fixture-model", "Fixture Model", ("low", "high"), True),),
+        ),
+    ))
+    assert product_cli.main([
+        "workbench", "route", requirement_id, "--root", str(tmp_path), "--runtime", "fixture",
+        "--model", "fixture-model", "--reasoning", "high", "--role", "reviewer",
+        "--parallelism", "3", "--max-parallelism", "2",
+    ]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["result"]["route"]["runtime_id"] == "fixture"
+    assert output["result"]["role"] == "reviewer"
+    assert output["result"]["parallelism"] == 2
+    assert output["result"]["recommendation_accepted"] is False
+    assert output["policy_decision"]["provider_id"] == "local.execution-routing-policy"
+
+
+def test_workbench_route_cli_rejects_missing_requirement(tmp_path, monkeypatch, capsys):
+    WorkspaceStore(tmp_path)
+    monkeypatch.setattr(product_cli, "discover_project_root", lambda root: root)
+    assert product_cli.main([
+        "workbench", "route", "REQ-999", "--root", str(tmp_path),
+    ]) == 2
+    assert "REQ-999" in capsys.readouterr().err
 
 
 def test_runtime_cli_replays_ordered_events_with_cursor(tmp_path, capsys):

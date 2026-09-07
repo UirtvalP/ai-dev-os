@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
@@ -11,6 +11,8 @@ import pytest
 from workspace_orchestrator.agent_runtime.contracts import ModelDescriptor, RuntimeDescriptor
 from workspace_orchestrator.orchestration.contracts import (
     ExecutionPlan,
+    ExecutionPolicyResult,
+    ExecutionRecommendation,
     ModelRoute,
     PlanningRequest,
     PolicyDecision,
@@ -30,6 +32,7 @@ from workspace_orchestrator.orchestration.contracts import (
 from workspace_orchestrator.orchestration.policies import (
     BoundedRecoveryPolicy,
     CapabilityModelRouter,
+    ExecutionRoutingPolicy,
     RulePlanningPolicy,
     RuleVerificationPlanner,
     validate_route,
@@ -226,6 +229,108 @@ def test_replaced_router_output_must_still_satisfy_core_validation() -> None:
                   ModelRoute("runtime-a", "discovered-a", "not-reported", "read-only")):
         with pytest.raises(PolicyError):
             validate_route(task(), route, descriptors)
+
+
+def test_runtime_aliases_satisfy_canonical_route_capabilities() -> None:
+    descriptor = runtime(capabilities=("start", "interactive_message", "event_stream", "profile:read-only"))
+    route, _ = CapabilityModelRouter().route(task(), (descriptor,))
+    assert route.runtime_id == descriptor.runtime_id
+
+
+def test_execution_policy_accepts_main_agent_recommendation_without_hardcoded_models() -> None:
+    descriptors = (runtime(), runtime("runtime-b"))
+    recommendation = ExecutionRecommendation(
+        "main-agent:REQ-021", "runtime-b", "discovered-b", "ultra", "reviewer", 3,
+        "独立高风险审查",
+    )
+    result, decision = ExecutionRoutingPolicy().decide(
+        task(complexity="complex"), descriptors, recommendation, max_parallelism=2,
+    )
+    assert result == ExecutionPolicyResult(
+        ModelRoute("runtime-b", "discovered-b", "ultra", "read-only"),
+        "reviewer", 2, False,
+    )
+    assert decision.decision == result.to_dict()
+    assert decision.input_fingerprint == fingerprint({
+        "task": task(complexity="complex").to_dict(),
+        "runtimes": [asdict(item) for item in descriptors],
+        "recommendation": recommendation.to_dict(),
+        "max_parallelism": 2,
+    })
+
+
+def test_execution_policy_rejects_unavailable_soft_route_and_keeps_hard_constraints() -> None:
+    descriptors = (runtime(),)
+    recommendation = ExecutionRecommendation(
+        "main-agent:REQ-021", "missing", "invented", "ultra", "worker", 4,
+    )
+    result, decision = ExecutionRoutingPolicy().decide(
+        task(), descriptors, recommendation, max_parallelism=3,
+    )
+    assert result.route.runtime_id == "runtime-a"
+    assert result.parallelism == 3
+    assert result.recommendation_accepted is False
+    assert "安全回退" in decision.reason
+
+    hard = task(preferred_runtime="missing")
+    with pytest.raises(PolicyError, match="没有同时满足"):
+        ExecutionRoutingPolicy().decide(hard, descriptors, recommendation, max_parallelism=3)
+
+
+def test_execution_policy_enforces_single_writer_and_validates_limits() -> None:
+    descriptor = runtime(capabilities=("start", "message", "events", "profile:workspace-write"))
+    recommendation = ExecutionRecommendation("main-agent:REQ-021", role="implementer", parallelism=8)
+    result, _ = ExecutionRoutingPolicy().decide(
+        task(write_required=True), (descriptor,), recommendation, max_parallelism=4,
+    )
+    assert result.parallelism == 1
+    assert result.route.sandbox == "workspace-write"
+    for limit in (0, -1, True):
+        with pytest.raises(PolicyError, match="max_parallelism"):
+            ExecutionRoutingPolicy().decide(task(), (runtime(),), recommendation, max_parallelism=limit)
+
+
+def test_execution_policy_contracts_roundtrip_and_validate_recommendations() -> None:
+    recommendation = ExecutionRecommendation("main-agent:REQ-021", role="worker", parallelism=2)
+    assert ExecutionRecommendation.from_dict(recommendation.to_dict()) == recommendation
+    result = ExecutionPolicyResult(
+        ModelRoute("runtime-a", "discovered-a", "medium", "read-only"), "worker", 2, True,
+    )
+    assert ExecutionPolicyResult.from_dict(result.to_dict()) == result
+    for invalid in (0, -1, True):
+        with pytest.raises(PolicyError, match="parallelism"):
+            ExecutionRecommendation("main-agent:REQ-021", parallelism=invalid)
+
+
+def test_execution_policy_revalidates_replaceable_router_output() -> None:
+    class BadRouter:
+        def route(self, task, runtimes):
+            return (
+                ModelRoute("missing", "invented", None, "read-only"),
+                PolicyDecision("bad", "1", "绕过", fingerprint({}), {}),
+            )
+
+    recommendation = ExecutionRecommendation("main-agent:REQ-021")
+    with pytest.raises(PolicyError) as captured:
+        ExecutionRoutingPolicy(BadRouter()).decide(task(), (runtime(),), recommendation)
+    assert captured.value.code == "no_route"
+
+
+def test_execution_policy_revalidates_replaceable_router_sandbox() -> None:
+    class UnsafeRouter:
+        def route(self, task, runtimes):
+            return (
+                ModelRoute("runtime-a", "discovered-a", "low", "read-only"),
+                PolicyDecision("bad", "1", "降权", fingerprint({}), {}),
+            )
+
+    descriptor = runtime(capabilities=("start", "message", "events", "profile:workspace-write"))
+    recommendation = ExecutionRecommendation("main-agent:REQ-021")
+    with pytest.raises(PolicyError) as captured:
+        ExecutionRoutingPolicy(UnsafeRouter()).decide(
+            task(write_required=True), (descriptor,), recommendation,
+        )
+    assert captured.value.code == "invalid_route"
 
 
 def test_verification_plan_receipt_bind_exact_candidate_tree_commands_and_environment() -> None:
