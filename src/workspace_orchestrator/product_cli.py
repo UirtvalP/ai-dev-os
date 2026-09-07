@@ -23,10 +23,19 @@ from .automation.dispatcher import (
 from .automation.requirement_attach import discover_project_root
 from .composition import configured_executor, runtime_descriptors
 from .console import configure_standard_streams as _configure_standard_streams
+from .hook_runtime import import_codex_thread_main
 from .hook_runtime import main as hook_main
 from .orchestration.contracts import PlanningRequest
 from .project_config import load_project_config
-from .project_init import InitResult, initialize_project, migrate_project, register_project
+from .project_init import (
+    InitResult,
+    codex_hooks_status,
+    disable_codex_hooks,
+    enable_codex_hooks,
+    initialize_project,
+    migrate_project,
+    register_project,
+)
 from .project_registry import GlobalProjectRegistry, RegisteredProject
 from .workspace import WorkspaceError, WorkspaceStore
 
@@ -163,6 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--commands-file", type=Path)
         elif action == "recover-post-merge":
             command.add_argument("--recovery-id", required=True, help="本次显式恢复的稳定 ID；未知执行不可重放")
+    for action in ("enable", "disable", "integration-status"):
+        command = integration_commands.add_parser(
+            action, help="显式管理可选兼容集成；不影响 AI Dev OS 核心 Runtime",
+        )
+        command.add_argument("integration_name", choices=("codex-hooks",))
+        command.add_argument("--root", type=Path, default=Path.cwd())
     dispatcher = commands.add_parser(
         "dispatcher", help="管理 Task → Agent 自动执行 Dispatcher"
     )
@@ -204,7 +219,7 @@ def _format_upgrade_result(result: ToolUpgradeResult) -> str:
         lines.append(result.details)
     if result.result_path:
         lines.append(f"结果日志：{result.result_path}")
-    lines.append("更新完成后，后续 ai-dev-os、workspace 与项目 Hook 调用将使用新版本能力。")
+    lines.append("更新完成后，后续 ai-dev-os、workspace 与显式启用的可选集成将使用新版本能力。")
     return "\n".join(lines)
 
 
@@ -325,6 +340,18 @@ def run(args: argparse.Namespace) -> str:
         execution = demo_workbench(store, args.requirement_id, args.task)
         return json.dumps(execution.to_dict(), ensure_ascii=False, indent=2)
     if args.command == "integration":
+        if args.integration_command in {"enable", "disable", "integration-status"}:
+            if args.integration_command == "enable":
+                outcome = enable_codex_hooks(args.root)
+            elif args.integration_command == "disable":
+                outcome = disable_codex_hooks(args.root)
+            else:
+                return json.dumps(codex_hooks_status(args.root), ensure_ascii=False, indent=2)
+            return json.dumps(
+                {"integration": args.integration_name, "outcome": outcome,
+                 **codex_hooks_status(args.root)},
+                ensure_ascii=False, indent=2,
+            )
         from .integration_composition import configured_integration, load_verification_commands
 
         execution_root = args.root.expanduser().resolve()
@@ -471,16 +498,11 @@ def run(args: argparse.Namespace) -> str:
         return ""
     if args.command == "init":
         result = initialize_project(args.path)
-        registry_message = _sync_registry_after_local_success(result.root, action="接入")
-        status = start_dispatcher(
-            WorkspaceStore(result.root, execution_root=result.root)
+        registry_message = _sync_registry_after_local_success(result.root, action="注册")
+        return (
+            _format_result(result, action="Workbench 项目已注册")
+            + f"\n{registry_message}\n原生 Agent 生命周期保持不变；Dispatcher 未自动启动。"
         )
-        suffix = (
-            "\nDispatcher：已启动，dashi Task 移到 in_progress 后会自动执行。"
-            if status.get("running") or status.get("status") == "starting"
-            else f"\nDispatcher：{status.get('status', '未启动')}。"
-        )
-        return _format_result(result, action="已接入") + f"\n{registry_message}" + suffix
     if args.command == "upgrade":
         return _format_upgrade_result(UvToolInstaller().upgrade(args.source))
     if args.command == "migrate":
@@ -537,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
     effective = sys.argv[1:] if argv is None else argv
     if effective == ["hook"]:
         return hook_main()
+    if effective == ["hook", "import-codex-thread"]:
+        return import_codex_thread_main()
     try:
         args = build_parser().parse_args(effective)
         if args.command == "dispatcher" and args.dispatcher_command == "serve":

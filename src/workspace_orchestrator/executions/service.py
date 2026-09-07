@@ -101,15 +101,21 @@ class ExecutionService:
                     source="legacy-thread-binding", creation_key=creation_key,
                 )
                 result = str(session.get("result") or "")
-                status: ExecutionStatus = (
-                    "running" if result == "in_progress" else "completed"
-                )
+                status = cast(ExecutionStatus, {
+                    "in_progress": "running",
+                    "completed": "completed",
+                    "failed": "failed",
+                    "cancelled": "cancelled",
+                    "blocked": "blocked",
+                    "pending_auto_finish": "waiting",
+                    "detached": "waiting",
+                }.get(result, "waiting"))
                 if execution.status == "queued":
                     execution = self.executions.update(
                         execution.id, status=status, session_id=session_id,
                         started_at=str(session.get("started_at") or execution.created_at),
                         completed_at=(
-                            None if status == "running"
+                            None if status in {"running", "waiting", "blocked"}
                             else str(session.get("ended_at") or execution.updated_at)
                         ),
                         last_progress_at=str(

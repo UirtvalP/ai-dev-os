@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import user_config
 from .project_config import CONFIG_NAME, initialized_project_config, load_project_config
@@ -15,6 +17,12 @@ AGENTS_END = "<!-- ai-dev-os:end -->"
 GITIGNORE_START = "# ai-dev-os:start"
 GITIGNORE_END = "# ai-dev-os:end"
 HOOK_COMMAND = "ai-dev-os hook"
+OPTIONAL_CODEX_HOOK_COMMAND = "ai-dev-os hook import-codex-thread"
+_LEGACY_MODULE_COMMAND = re.compile(
+    r'(?i)(?:"[^"]*python(?:\.exe)?"|\S*python(?:\.exe)?)\s+'
+    r'(?:-m\s+workspace_orchestrator\.(?:codex_hook|hook_runtime)'
+    r'|"?[^";&|]*workspace_runtime\.py"?)\Z'
+)
 
 AGENTS_BLOCK = f"""{AGENTS_START}
 ## AI Dev OS
@@ -169,6 +177,128 @@ def _ensure_hooks(path: Path) -> str:
     return "preserved"
 
 
+def _is_managed_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    return any(_is_managed_command(str(hook.get(field, ""))) for field in (
+        "command", "commandWindows",
+    ))
+
+
+def _is_managed_command(command: str) -> bool:
+    normalized = command.strip()
+    return normalized in {HOOK_COMMAND, OPTIONAL_CODEX_HOOK_COMMAND} or bool(
+        _LEGACY_MODULE_COMMAND.fullmatch(normalized)
+    )
+
+
+def _hook_commands(payload: dict[str, Any]) -> list[str]:
+    hooks = payload.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return []
+    return [
+        str(hook.get(field, ""))
+        for event_groups in hooks.values()
+        for group in event_groups
+        for hook in group.get("hooks", [])
+        if isinstance(hook, dict)
+        for field in ("command", "commandWindows")
+        if hook.get(field)
+    ]
+
+
+def _remove_managed_hooks(path: Path) -> str:
+    """只移除 AI Dev OS Hook，保留用户和其他工具的 Hook。"""
+
+    if not path.exists():
+        return "preserved"
+    _validate_hooks(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    hooks = payload.get("hooks", {})
+    changed = False
+    for event_name in tuple(hooks):
+        filtered_groups: list[dict[str, object]] = []
+        for group in hooks[event_name]:
+            retained = [hook for hook in group.get("hooks", []) if not _is_managed_hook(hook)]
+            if len(retained) != len(group.get("hooks", [])):
+                changed = True
+            if retained:
+                filtered_groups.append({**group, "hooks": retained})
+            elif group.get("hooks"):
+                changed = True
+        if filtered_groups:
+            hooks[event_name] = filtered_groups
+        else:
+            hooks.pop(event_name, None)
+    if not changed:
+        return "preserved"
+    if not hooks and set(payload) == {"hooks"}:
+        path.unlink()
+        return "removed"
+    WorkspaceStore.write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+    return "updated"
+
+
+def enable_codex_hooks(root: Path) -> str:
+    """显式启用只导入原生 Codex Thread 的兼容 Hook。"""
+
+    resolved = _resolve_project_root(root)
+    path = resolved / ".codex" / "hooks.json"
+    _validate_hooks(path)
+    existed = path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8")) if existed else {"hooks": {}}
+    hooks = payload.setdefault("hooks", {})
+    groups = hooks.setdefault("UserPromptSubmit", [])
+    commands = _hook_commands(payload)
+    desired = {
+        "hooks": [{
+            "type": "command",
+            "command": OPTIONAL_CODEX_HOOK_COMMAND,
+            "commandWindows": OPTIONAL_CODEX_HOOK_COMMAND,
+            "statusMessage": "可选导入当前 Codex Thread",
+        }]
+    }
+    if desired in groups and not any(
+        _is_managed_command(command) and command.strip() != OPTIONAL_CODEX_HOOK_COMMAND
+        for command in commands
+    ):
+        return "preserved"
+    if any(_is_managed_command(command) for command in commands):
+        # 清除旧生命周期组，避免“启用导入”意外保留 bootstrap/finalize 行为。
+        _remove_managed_hooks(path)
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"hooks": {}}
+        hooks = payload.setdefault("hooks", {})
+        groups = hooks.setdefault("UserPromptSubmit", [])
+    groups.append(desired)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    WorkspaceStore.write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+    return "created" if not existed else "updated"
+
+
+def disable_codex_hooks(root: Path) -> str:
+    """显式关闭所有 AI Dev OS Codex Hook，不触碰其他 Hook。"""
+
+    return _remove_managed_hooks(_resolve_project_root(root) / ".codex" / "hooks.json")
+
+
+def codex_hooks_status(root: Path) -> dict[str, object]:
+    resolved = _resolve_project_root(root)
+    path = resolved / ".codex" / "hooks.json"
+    enabled = False
+    legacy = False
+    if path.is_file():
+        _validate_hooks(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        commands = _hook_commands(payload)
+        enabled = OPTIONAL_CODEX_HOOK_COMMAND in commands
+        legacy = any(
+            _is_managed_command(command)
+            and command.strip() != OPTIONAL_CODEX_HOOK_COMMAND
+            for command in commands
+        )
+    return {"enabled": enabled, "legacy_lifecycle_present": legacy, "path": str(path)}
+
+
 def _validate_project_config(path: Path) -> None:
     if not path.exists():
         return
@@ -253,6 +383,26 @@ def _append_managed_block(path: Path, block: str, start: str, end: str) -> str:
         else "\n\n"
     )
     path.write_text(f"{content}{separator}{block}", encoding="utf-8")
+    return "updated"
+
+
+def _remove_managed_block(path: Path, start: str, end: str) -> str:
+    if not path.exists():
+        return "preserved"
+    _validate_file(path, start, end)
+    content = path.read_bytes()
+    start_marker = start.encode("utf-8")
+    end_marker = end.encode("utf-8")
+    if start_marker not in content:
+        return "preserved"
+    start_index = content.index(start_marker)
+    end_index = content.index(end_marker, start_index) + len(end_marker)
+    retained = content[:start_index] + content[end_index:]
+    if not retained.decode("utf-8").strip():
+        path.unlink()
+        return "removed"
+    # 托管区块外属于用户的 AGENTS 内容必须逐字节保留，包括 CRLF 与尾空格。
+    path.write_bytes(retained)
     return "updated"
 
 
@@ -349,9 +499,9 @@ def _apply_current_project_files(resolved: Path) -> InitResult:
 
 
 def initialize_project(root: Path) -> InitResult:
-    """在不创建 Requirement Workspace 的前提下接入一个现有项目。"""
+    """注册独立 Workbench 项目；默认不改变任何原生 Agent 行为。"""
 
-    return _apply_current_project_files(_resolve_project_root(root))
+    return register_project(root)
 
 
 def register_project(root: Path) -> InitResult:
@@ -388,11 +538,60 @@ def register_project(root: Path) -> InitResult:
 
 
 def migrate_project(root: Path) -> InitResult:
-    """只在持久格式确有变化时迁移已接入项目。"""
+    """迁移旧接入面并无损映射 Session；不删除 Requirement 事实。"""
 
     resolved = _resolve_project_root(root)
     if not (resolved / CONFIG_NAME).exists():
         raise WorkspaceError(
             f"项目尚未通过 ai-dev-os init 接入，无法迁移：{resolved}"
         )
-    return _apply_current_project_files(resolved)
+    # 所有会修改的入口先统一预检，避免清理旧接入面前先写入其他目标。
+    _validate_file(resolved / "AGENTS.md", AGENTS_START, AGENTS_END)
+    _validate_hooks(resolved / ".codex" / "hooks.json")
+    _validate_project_config(resolved / CONFIG_NAME)
+    _validate_user_principles_path()
+    from .executions import ExecutionService, ExecutionStore
+
+    preflight_store = WorkspaceStore(resolved, execution_root=resolved)
+    for requirement_id in preflight_store.requirement_ids():
+        data = preflight_store.load(requirement_id)
+        sessions = data.get("sessions")
+        if not isinstance(sessions, list) or any(not isinstance(item, dict) for item in sessions):
+            raise WorkspaceError(f"{requirement_id} sessions.json 必须是对象数组")
+        ExecutionStore(preflight_store).list(requirement_id)
+    result = register_project(resolved)
+    outcomes = {
+        "AGENTS.md legacy managed block": _remove_managed_block(
+            resolved / "AGENTS.md", AGENTS_START, AGENTS_END,
+        ),
+        ".codex/hooks.json legacy lifecycle": _remove_managed_hooks(
+            resolved / ".codex" / "hooks.json",
+        ),
+    }
+    from .agent_runtime.events import RuntimeEventStore
+
+    store = WorkspaceStore(resolved, execution_root=resolved)
+    service = ExecutionService(
+        ExecutionStore(store), RuntimeEventStore(store.root / "runtime-events"),
+    )
+    mapped_before = sum(
+        1
+        for requirement_id in store.requirement_ids()
+        for execution in ExecutionStore(store).list(requirement_id)
+        if execution.source == "legacy-thread-binding"
+    )
+    mapped = 0
+    for requirement_id in store.requirement_ids():
+        mapped += len(service.map_legacy_sessions(requirement_id))
+    mapped_created = max(0, mapped - mapped_before)
+    migration_name = f"legacy sessions -> executions ({mapped})"
+    return InitResult(
+        root=resolved,
+        created=result.created,
+        updated=result.updated + tuple(
+            name for name, outcome in outcomes.items() if outcome in {"updated", "removed"}
+        ) + ((migration_name,) if mapped_created else ()),
+        preserved=result.preserved + tuple(
+            name for name, outcome in outcomes.items() if outcome == "preserved"
+        ) + ((migration_name,) if mapped and not mapped_created else ()),
+    )

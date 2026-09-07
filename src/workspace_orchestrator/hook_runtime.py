@@ -15,7 +15,7 @@ from .automation.runtime import AutomationRuntime
 from .automation.session_runtime import end_session
 from .automation.task_attach import configured_task_provider
 from .runtime_contract import hook_context
-from .workspace import WorkspaceError, WorkspaceStore
+from .workspace import WorkspaceError, WorkspaceStore, now_iso
 
 
 def _emit(event_name: str, context: str, *, system_message: str | None = None) -> None:
@@ -121,3 +121,55 @@ def main() -> int:
         return 0
     _emit(event_name, hook_context(snapshot))
     return 0
+
+
+def _import_codex_thread() -> int:
+    """可选兼容 Hook：只导入明确指向 Requirement 的 Codex Thread。"""
+
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    event = json.load(sys.stdin)
+    if not isinstance(event, dict):
+        raise TypeError("Codex Hook 输入必须是 JSON 对象")
+    session_id = str(event.get("session_id") or "").strip()
+    prompt = str(event.get("prompt") or "")
+    match = re.search(r"(?<![A-Z0-9])REQ-\d+(?![A-Z0-9])", prompt, re.IGNORECASE)
+    if not session_id or match is None:
+        _continue()
+        return 0
+    execution_root = Path(str(event.get("cwd") or Path.cwd())).resolve()
+    root = discover_project_root(execution_root)
+    requirement_id = match.group(0).upper()
+    store = WorkspaceStore(root, execution_root=execution_root)
+    from .executions import ExecutionStore
+
+    executions = ExecutionStore(store)
+    execution = executions.create(
+        requirement_id, "NATIVE-CODEX", role="external", runtime_id="codex",
+        provider="codex", prompt=prompt or "显式导入原生 Codex Thread",
+        workspace_path=execution_root, source="optional-codex-hook",
+        creation_key=f"optional-codex-thread:{requirement_id}:{session_id}",
+        execution_policy={"mode": "import-only"},
+    )
+    if execution.status == "queued":
+        execution = executions.update(
+            execution.id, status="running", session_id=session_id,
+            started_at=now_iso(), last_progress_at=now_iso(),
+            summary="已显式导入原生 Codex Thread；未接管其生命周期",
+        )
+    elif execution.session_id != session_id:
+        raise WorkspaceError("可选 Codex 导入身份冲突")
+    _continue(system_message=f"AI Dev OS 已导入 {execution.id}，未接管当前 Codex 生命周期")
+    return 0
+
+
+def import_codex_thread_main() -> int:
+    """显式兼容集成必须 fail-open，不能中断原生 Codex 使用。"""
+
+    try:
+        return _import_codex_thread()
+    except (OSError, TypeError, ValueError, UnicodeError, WorkspaceError) as exc:
+        _continue(system_message=f"AI Dev OS 可选 Thread 导入已跳过：{exc}")
+        return 0
