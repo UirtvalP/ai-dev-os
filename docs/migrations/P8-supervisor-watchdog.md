@@ -17,4 +17,3 @@ ai-dev-os workbench supervise REQ-021 --root <workspace>
 ## 回滚
 
 回滚 P8 提交后可保留或删除 `supervisor-watchdog.json`；其不参与旧调度、验证、Gate 或 Git 权威。
-
