@@ -93,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     owner = workbench_commands.add_parser("owner", help="刷新并显示 Requirement Main Agent 状态")
     owner.add_argument("requirement_id")
     owner.add_argument("--root", type=Path, default=Path.cwd())
+    supervise = workbench_commands.add_parser(
+        "supervise", help="运行一次确定性 Supervisor Watchdog 扫描",
+    )
+    supervise.add_argument("requirement_id")
+    supervise.add_argument("--root", type=Path, default=Path.cwd())
     route = workbench_commands.add_parser("route", help="由 Main Agent 建议、Policy Engine 裁决执行路由")
     route.add_argument("requirement_id")
     route.add_argument("--root", type=Path, default=Path.cwd())
@@ -259,6 +264,17 @@ def _format_project(project: RegisteredProject) -> str:
 
 def run(args: argparse.Namespace) -> str:
     if args.command == "workbench":
+        if args.workbench_command == "supervise":
+            from .supervisor_watchdog import RequirementWatchdog
+
+            execution_root = args.root.expanduser().resolve()
+            watchdog_store = WorkspaceStore(
+                discover_project_root(execution_root), execution_root=execution_root,
+            )
+            return json.dumps(
+                RequirementWatchdog(watchdog_store, args.requirement_id).scan(),
+                ensure_ascii=False, indent=2,
+            )
         if args.workbench_command == "owner":
             from .main_agent import RequirementOwner
 

@@ -249,6 +249,13 @@ class WorkspaceStore:
             yield
 
     @contextmanager
+    def watchdog_locked(self, requirement_id: str) -> Iterator[None]:
+        """串行同一 Requirement 的独立 Watchdog 扫描。"""
+
+        with _file_lock(self.root / f".{requirement_id.upper()}.watchdog.lock"):
+            yield
+
+    @contextmanager
     def finalize_locked(self, requirement_id: str) -> Iterator[None]:
         """串行同一 Requirement 的完整 finalize；进程退出时由 OS 自动释放。"""
 

@@ -12,6 +12,7 @@ from uuid import uuid4
 from .executions import Execution, ExecutionStore
 from .orchestration.contracts import ExecutionRecommendation, fingerprint
 from .orchestration.store import OrchestrationStore
+from .supervisor_watchdog import load_watchdog_state
 from .workspace import WorkspaceError, WorkspaceStore, markdown_sections, now_iso
 
 LoopStage = Literal["observe", "assess", "plan", "act", "inspect", "review", "replan"]
@@ -253,7 +254,10 @@ class RequirementOwner:
             )[-10:],
             known_risks=_bullets(state.get("Blocked", "")),
             next_actions=_bullets(state.get("Next Action", "")),
-            review_required=meta_status == "in_review",
+            review_required=(
+                meta_status == "in_review"
+                or bool(supervisor.get("watchdog", {}).get("review_required", False))
+            ),
             intent={heading: body.strip() for heading, body in intent.items()},
             acceptance_criteria=tuple(text for _checked, text in acceptance_lines),
             verification_summary=verification.get("Latest Check", "").strip(),
@@ -330,14 +334,25 @@ class RequirementOwner:
         current = self.load_optional()
         return current.revision if current else 0
 
-    def _supervisor_snapshot(self) -> dict[str, Any]:
+    def supervisor_snapshot(self) -> dict[str, Any]:
         root = self.workspace.path_for(self.requirement_id) / "orchestration" / "supervisor"
-        return OrchestrationStore(root).snapshot()
+        snapshot = OrchestrationStore(root).snapshot()
+        snapshot["watchdog"] = load_watchdog_state(
+            self.workspace, self.requirement_id,
+        ) or {}
+        return snapshot
+
+    # P6 之前的测试/扩展点保留；新调用方应使用公开 snapshot。
+    def _supervisor_snapshot(self) -> dict[str, Any]:
+        return self.supervisor_snapshot()
 
     def _supervisor_signals(self, snapshot: dict[str, Any]) -> tuple[str, ...]:
-        if snapshot.get("revision") == 0 and not snapshot.get("data"):
+        watchdog = snapshot.get("watchdog", {})
+        if snapshot.get("revision") == 0 and not snapshot.get("data") and not watchdog:
             return ()
-        result = [f"revision={snapshot['revision']}", f"fence={snapshot['fence']}"]
+        result = []
+        if snapshot.get("revision") != 0 or snapshot.get("data"):
+            result.extend([f"revision={snapshot['revision']}", f"fence={snapshot['fence']}"])
         lease = snapshot.get("lease")
         if isinstance(lease, dict):
             result.append(f"lease={lease.get('owner')}:{lease.get('fence')}")
@@ -348,6 +363,10 @@ class RequirementOwner:
                     continue
                 state = node.get("state", node.get("status", "unknown"))
                 result.append(f"node={task_id}:{state}")
+        if isinstance(watchdog, dict):
+            for signal in watchdog.get("signals", []):
+                if isinstance(signal, dict) and signal.get("kind") and signal.get("id"):
+                    result.append(f"watchdog={signal['kind']}:{signal['id']}")
         return tuple(result)
 
     @staticmethod
