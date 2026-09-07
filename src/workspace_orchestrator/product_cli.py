@@ -90,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("requirement_id")
     demo.add_argument("--task", default="TASK-P2-DEMO")
     demo.add_argument("--root", type=Path, default=Path.cwd())
+    owner = workbench_commands.add_parser("owner", help="刷新并显示 Requirement Main Agent 状态")
+    owner.add_argument("requirement_id")
+    owner.add_argument("--root", type=Path, default=Path.cwd())
     dashboard = commands.add_parser("dashboard", help="启动带认证的本机 Dashboard 控制面")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     serve = dashboard_commands.add_parser("serve", help="在回环地址启动远程控制入口")
@@ -243,6 +246,18 @@ def _format_project(project: RegisteredProject) -> str:
 
 def run(args: argparse.Namespace) -> str:
     if args.command == "workbench":
+        if args.workbench_command == "owner":
+            from .main_agent import RequirementOwner
+
+            execution_root = args.root.expanduser().resolve()
+            owner_store = WorkspaceStore(
+                discover_project_root(execution_root), execution_root=execution_root,
+            )
+            requirement_owner = RequirementOwner(owner_store, args.requirement_id)
+            owner_state = requirement_owner.observe(
+                expected_revision=requirement_owner.current_revision(),
+            )
+            return json.dumps(owner_state.to_dict(), ensure_ascii=False, indent=2)
         from .workbench import demo_workbench
 
         execution_root = args.root.expanduser().resolve()
