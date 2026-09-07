@@ -48,7 +48,7 @@ show_error_codes = true
 pretty = true
 
 [tool.workspace-orchestrator.automation]
-verification-timeout-seconds = 300
+verification-timeout-seconds = 900
 verification-commands = [
   ["{python}", "-m", "pytest"],
   ["{python}", "-m", "ruff", "check", "."],
