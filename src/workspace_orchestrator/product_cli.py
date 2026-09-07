@@ -114,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="远程访问模式的令牌文件；本机默认模式不读取或创建",
     )
     workbench_serve.add_argument(
+        "--username", default="",
+        help="启用远程账密登录时使用的用户名；密码读取自 --token-file",
+    )
+    workbench_serve.add_argument(
         "--no-open", action="store_true", help="启动服务但不自动打开浏览器",
     )
     workbench_serve.add_argument(
@@ -318,7 +322,11 @@ def run(args: argparse.Namespace) -> str:
                 report = {
                     "status": "serving",
                     "url": f"http://{args.host}:{args.port}/",
-                    "authentication": "bearer" if args.remote_access else "none-loopback",
+                    "authentication": (
+                        "basic" if args.username else (
+                            "bearer" if args.remote_access else "none-loopback"
+                        )
+                    ),
                     "browser_opened": not args.no_open,
                     "safety": {
                         "listen": "remote-enabled" if args.remote_access else "loopback",
@@ -331,7 +339,8 @@ def run(args: argparse.Namespace) -> str:
             serve_workbench(
                 WorkbenchHub(), token=token, host=args.host, port=args.port,
                 open_browser=not args.no_open,
-                require_token=args.remote_access, ready_callback=report_ready,
+                require_token=args.remote_access, username=args.username,
+                ready_callback=report_ready,
             )
             return ""
         if args.workbench_command == "supervise":

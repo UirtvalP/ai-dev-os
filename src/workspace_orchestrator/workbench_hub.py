@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import re
@@ -250,17 +251,21 @@ def serve_workbench(
     stop_event: threading.Event | None = None,
     ready_event: threading.Event | None = None,
     require_token: bool = False,
+    username: str = "",
     ready_callback: Callable[[], None] | None = None,
 ) -> None:
-    """启动 Requirement Space；本地默认免密，远程入口必须显式启用 Token。"""
+    """启动 Requirement Space；本地默认免密，远程入口使用 Bearer 或账密认证。"""
 
     loopback = host in {"127.0.0.1", "::1", "localhost"}
     if not loopback and not require_token:
         raise WorkspaceError("局域网或公网监听必须启用 --remote-access")
     if require_token and len(token.encode("utf-8")) < MIN_TOKEN_BYTES:
         raise WorkspaceError("Workbench token 至少需要 32 字节")
-    shell = WORKBENCH_HUB_HTML.replace("__AUTH_REQUIRED__", json.dumps(require_token))
-    auth_mode = "bearer" if require_token else "none-loopback"
+    if username and not require_token:
+        raise WorkspaceError("账密认证必须同时启用 --remote-access")
+    auth_mode = "basic" if username else ("bearer" if require_token else "none-loopback")
+    shell = WORKBENCH_HUB_HTML.replace("__AUTH_MODE__", json.dumps(auth_mode))
+    basic_credential = base64.b64encode(f"{username}:{token}".encode()).decode()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "AI-Dev-OS-Workbench/0.1"
@@ -337,8 +342,12 @@ def serve_workbench(
         def _guard(self) -> bool:
             if require_token:
                 supplied = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
-                    self._json(HTTPStatus.UNAUTHORIZED, {"error": "需要有效 Bearer token"})
+                expected = (
+                    f"Basic {basic_credential}" if username else f"Bearer {token}"
+                )
+                if not hmac.compare_digest(supplied.encode(), expected.encode()):
+                    message = "用户名或密码错误" if username else "需要有效 Bearer token"
+                    self._json(HTTPStatus.UNAUTHORIZED, {"error": message})
                     return False
             origin = self.headers.get("Origin")
             if origin is not None:
@@ -397,7 +406,7 @@ def serve_workbench(
         ready_callback()
     if open_browser:
         address = "127.0.0.1" if host in {"::1", "localhost"} else host
-        suffix = f"#token={quote(token, safe='')}" if require_token else ""
+        suffix = f"#token={quote(token, safe='')}" if require_token and not username else ""
         webbrowser.open(f"http://{address}:{port}/{suffix}")
     try:
         if stop_event is None:

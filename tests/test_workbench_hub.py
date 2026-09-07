@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import threading
@@ -154,7 +155,13 @@ def test_start_action_uses_real_workspace_write_runtime_boundary(
 
 
 @contextmanager
-def _server(hub: WorkbenchHub, token: str = "", *, require_token: bool = False):
+def _server(
+    hub: WorkbenchHub,
+    token: str = "",
+    *,
+    require_token: bool = False,
+    username: str = "",
+):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -169,6 +176,7 @@ def _server(hub: WorkbenchHub, token: str = "", *, require_token: bool = False):
             "stop_event": stop,
             "ready_event": ready,
             "require_token": require_token,
+            "username": username,
         },
     )
     thread.start()
@@ -211,6 +219,22 @@ def test_workbench_http_remote_mode_protects_space_api(tmp_path: Path) -> None:
     assert detail_status == 200 and detail["requirement_id"] == requirement_id
 
 
+def test_workbench_http_supports_username_and_password(tmp_path: Path) -> None:
+    hub, _, _ = _hub(tmp_path)
+    password = "p" * 48
+    with _server(hub, password, require_token=True, username="admin") as base:
+        encoded = base64.b64encode(f"admin:{password}".encode()).decode()
+        request = Request(
+            f"{base}/api/workbench", headers={"Authorization": f"Basic {encoded}"},
+        )
+        response = urlopen(request, timeout=5)
+        wrong_status, _ = _json(f"{base}/api/workbench", password)
+
+    assert response.status == 200
+    assert response.headers["X-AI-Dev-OS-Auth"] == "basic"
+    assert wrong_status == 401
+
+
 def test_workbench_http_loopback_mode_needs_no_token(tmp_path: Path) -> None:
     hub, _, _ = _hub(tmp_path)
     with _server(hub) as base:
@@ -251,6 +275,9 @@ def test_workbench_ui_exposes_core_requirement_space_actions() -> None:
         assert label in WORKBENCH_HUB_HTML
     assert "#token=" not in WORKBENCH_HUB_HTML
     assert "REQ-020" not in WORKBENCH_HUB_HTML
+    assert 'id="username"' in WORKBENCH_HUB_HTML
+    assert 'id="password"' in WORKBENCH_HUB_HTML
+    assert "AUTH_MODE==='basic'" in WORKBENCH_HUB_HTML
 
 
 def test_workbench_ui_keeps_reverse_proxy_subpath_for_api_requests() -> None:

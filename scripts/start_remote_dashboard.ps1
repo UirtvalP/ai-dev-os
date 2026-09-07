@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeRoot = Join-Path $env:USERPROFILE '.ai-dev-os\runtime\workbench'
-$tokenFile = Join-Path $env:USERPROFILE '.ai-dev-os\secrets\workbench.token'
+$tokenFile = Join-Path $env:USERPROFILE '.ai-dev-os\secrets\req-020-dashboard.token'
+$username = 'admin'
 $identityFile = Join-Path $env:USERPROFILE '.ssh\homebox-relay\id_ed25519'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $publicUrl = 'https://game.homebox2026.online/ai-dev-os/'
@@ -25,7 +26,7 @@ if ($listener) {
     $existingServer = [string]$existing.Headers['Server']
     $existingAuth = [string]$existing.Headers['X-AI-Dev-OS-Auth']
     if ($existingServer -notlike 'AI-Dev-OS-Workbench/*' -or
-        $existingAuth -ne 'bearer') {
+        $existingAuth -ne 'basic') {
         throw "$localPort 端口已被 PID $($listener.OwningProcess) 占用，但不是启用远程认证的 Workbench"
     }
 }
@@ -41,7 +42,7 @@ if (-not $listener) {
         '-m', 'workspace_orchestrator.product_cli',
         'workbench', 'serve', '--no-open', '--remote-access',
         '--root', ('"{0}"' -f $projectRoot), '--port', $localPort,
-        '--token-file', ('"{0}"' -f $tokenFile)
+        '--token-file', ('"{0}"' -f $tokenFile), '--username', $username
     ) -join ' '
     Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
@@ -60,7 +61,7 @@ if (-not $listener) {
     $startedServer = [string]$started.Headers['Server']
     $startedAuth = [string]$started.Headers['X-AI-Dev-OS-Auth']
     if ($startedServer -notlike 'AI-Dev-OS-Workbench/*' -or
-        $startedAuth -ne 'bearer') {
+        $startedAuth -ne 'basic') {
         throw '新启动的 Workbench 未启用远程认证，拒绝建立公网隧道'
     }
 }
@@ -89,5 +90,6 @@ if (-not $sshProcess) {
     LocalEndpoint = "http://127.0.0.1:$localPort"
     CloudEndpoint = 'http://127.0.0.1:18765'
     TokenFile = $tokenFile
+    Username = $username
     Mode = 'Requirement Space Workbench'
 }
