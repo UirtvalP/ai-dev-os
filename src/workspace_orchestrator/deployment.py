@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 from uuid import uuid4
 
 from .integration.contracts import MergeReceipt
+from .integration.git_workspace import GitWorkspaceError, TrustedGit
 from .workspace import WorkspaceError, WorkspaceStore, _file_lock
 
 
@@ -544,10 +545,12 @@ def publish_completion_token(
             gate = json.loads(gate_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise DeploymentError("phase6_gate_invalid", "Phase 6 Gate 损坏") from exc
-        if (
-            not isinstance(gate, dict)
-            or gate.get("status") != "PASS"
-            or gate.get("commit_sha") != token.commit_sha
+        if not isinstance(gate, dict) or gate.get("status") != "PASS":
+            raise DeploymentError("phase6_gate_stale", "CompletionToken 与 Phase 6 Gate 不一致")
+        gate_sha = gate.get("commit_sha")
+        if not isinstance(gate_sha, str) or (
+            gate_sha != token.commit_sha
+            and not _same_git_tree(store, gate_sha, token.commit_sha)
         ):
             raise DeploymentError("phase6_gate_stale", "CompletionToken 与 Phase 6 Gate 不一致")
         target = workspace / "deployment" / "completion-token.json"
@@ -563,3 +566,21 @@ def publish_completion_token(
             return target
         store.write_json(target, document)
         return target
+
+
+def _same_git_tree(store: WorkspaceStore, gate_sha: str, deployed_sha: str) -> bool:
+    """允许 PR merge 改写 commit 身份，但绝不允许改变已通过 Gate 的源码树。"""
+
+    if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in (gate_sha, deployed_sha)):
+        return False
+    try:
+        git = TrustedGit(store.working_root)
+        trees = tuple(
+            git.run("rev-parse", "--verify", "--end-of-options", sha + "^{tree}")
+            for sha in (gate_sha, deployed_sha)
+        )
+    except GitWorkspaceError:
+        return False
+    return all(re.fullmatch(r"[0-9a-f]{40}", tree) is not None for tree in trees) and (
+        trees[0] == trees[1]
+    )
